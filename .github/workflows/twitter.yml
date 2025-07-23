@@ -1,30 +1,35 @@
-name: AiCoin Twitter Bot
+name: Post News to Twitter and Telegram
 
 on:
   schedule:
-    - cron: '0 * * * *'  # каждый час (UTC)
-  workflow_dispatch:      # запуск вручную
+    - cron: "0 9 * * *"   # 09:00 UTC
+    - cron: "0 15 * * *"  # 15:00 UTC
+    - cron: "0 21 * * *"  # 21:00 UTC
+  workflow_dispatch:
 
 jobs:
-  tweet:
+  post-news:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: 3.x
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run Twitter bot
+      - name: Run news bot
         env:
           API_KEY: ${{ secrets.API_KEY }}
           API_SECRET: ${{ secrets.API_SECRET }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
-        run: |
-          python twitter_bot.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: python twitter_bot.py
