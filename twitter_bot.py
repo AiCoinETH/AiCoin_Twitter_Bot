@@ -39,7 +39,11 @@ repo = g.get_repo("AiCoinETH/AiCoin_Twitter_Bot")
 
 # === Получение CSV расписания ===
 schedule_url = "https://raw.githubusercontent.com/AiCoinETH/AiCoin_Twitter_Bot/main/date_time/content_schedule.csv"
-schedule = pd.read_csv(schedule_url)
+try:
+    schedule = pd.read_csv(schedule_url)
+except Exception as e:
+    print("❌ Ошибка загрузки расписания:", e)
+    schedule = pd.DataFrame(columns=["date", "time", "category", "topic"])
 
 # === Получение трендов из Google Trends ===
 pytrends = TrendReq(hl='en-US', tz=360)
@@ -73,11 +77,17 @@ def update_schedule_topic():
     now = datetime.datetime.now()
     now_hour = now.hour
     today = now.strftime("%Y-%m-%d")
+
+    if 'topic' not in schedule.columns:
+        schedule['topic'] = ""
+
     schedule.loc[(schedule['date'] == today) & (schedule['time'] == now_hour), 'topic'] = trending_topic
     content = schedule.to_csv(index=False)
-    file = repo.get_contents("date_time/content_schedule.csv")
-    repo.update_file("date_time/content_schedule.csv", f"Update topic {today} {now_hour}", content, file.sha)
-    print("✅ Schedule updated with new topic")
+    try:
+        file = repo.get_contents("date_time/content_schedule.csv")
+        repo.update_file("date_time/content_schedule.csv", f"Update topic {today} {now_hour}", content, file.sha)
+    except Exception as e:
+        print("❌ Ошибка обновления файла расписания:", e)
 
     # === Логирование тренда в trending_log.csv ===
     log_file_path = "date_time/trending_log.csv"
@@ -89,23 +99,27 @@ def update_schedule_topic():
         print("📁 Creating new log file")
         log_df = pd.DataFrame(columns=["date", "hour", "google_trend", "twitter_trend", "combined_topic"])
 
-    new_log = {
-        "date": today,
-        "hour": now_hour,
-        "google_trend": google_trend,
-        "twitter_trend": twitter_trending_topic,
-        "combined_topic": trending_topic
-    }
-    log_df = pd.concat([log_df, pd.DataFrame([new_log])], ignore_index=True)
-    updated_log_csv = log_df.to_csv(index=False)
-    try:
-        if 'file_log' in locals():
-            repo.update_file(log_file_path, "Update trending log", updated_log_csv, file_log.sha)
-        else:
-            repo.create_file(log_file_path, "Create trending log", updated_log_csv)
-        print("📝 Trending topic logged to trending_log.csv")
-    except Exception as e:
-        print(f"❌ Error updating trending log: {e}")
+    already_logged = log_df[(log_df['date'] == today) & (log_df['hour'] == now_hour)]
+    if already_logged.empty:
+        new_log = {
+            "date": today,
+            "hour": now_hour,
+            "google_trend": google_trend,
+            "twitter_trend": twitter_trending_topic,
+            "combined_topic": trending_topic
+        }
+        log_df = pd.concat([log_df, pd.DataFrame([new_log])], ignore_index=True)
+        updated_log_csv = log_df.to_csv(index=False)
+        try:
+            if 'file_log' in locals():
+                repo.update_file(log_file_path, "Update trending log", updated_log_csv, file_log.sha)
+            else:
+                repo.create_file(log_file_path, "Create trending log", updated_log_csv)
+            print("📝 Trending topic logged to trending_log.csv")
+        except Exception as e:
+            print(f"❌ Error updating trending log: {e}")
+    else:
+        print("⏩ Trending already logged for this hour")
 
 update_schedule_topic()
 
