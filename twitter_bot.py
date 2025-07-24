@@ -9,7 +9,6 @@ import json
 import time
 import threading
 from pytrends.request import TrendReq
-from telegram.ext import Updater, MessageHandler, Filters
 from github import Github
 
 # === Настройки из GitHub Secrets ===
@@ -30,8 +29,6 @@ twitter_api = tweepy.API(auth)
 
 # === Подключение к Telegram ===
 telegram_bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
 
 # === Подключение к GitHub ===
 g = Github(GITHUB_TOKEN)
