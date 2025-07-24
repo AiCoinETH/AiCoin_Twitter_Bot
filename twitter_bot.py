@@ -122,6 +122,3 @@ def update_schedule_topic():
         print("⏩ Trending already logged for this hour")
 
 update_schedule_topic()
-
-# === Постинг и ответы ===
-# (оставляем остальную часть кода без изменений — генерация поста, генерация изображения, ответы в Twitter и Telegram — уже реализована выше)
