@@ -1,5 +1,5 @@
 # === Модуль автопостинга и комментирования ===
-# Создаётся по техническому заданию от пользователя
+# Обновлён по заданию: 3 поста в день, 1 из них — обязательный рекламный в прайм-тайм
 
 import os
 import openai
@@ -63,44 +63,59 @@ def upload_to_pinata(image_bytes, filename):
 
 # --- Публикация в Twitter и Telegram ---
 def post_to_socials(text, image_path):
-    # Twitter
     media = twitter_api.media_upload(image_path)
     tweet = twitter_api.update_status(status=text, media_ids=[media.media_id])
-
-    # Telegram
     with open(image_path, 'rb') as img:
         telegram_bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=img, caption=text)
-
     return tweet.id_str
 
-# --- Основной обработчик ---
-def main():
+# --- Основной логический блок ---
+def should_post_now():
     now = datetime.datetime.now()
     hour = now.hour
+    return hour in [9, 14, 19]  # По времени: 9:00, 14:30, 19:00
+
+def main():
+    now = datetime.datetime.now()
     date = now.strftime("%Y-%m-%d")
+    hour = now.hour
 
-    trending_topic = "AI Coin в тренде по США, Пакистану и Нигерии"
-    hashtags = "#AiCoin #AI #CryptoNews"
-    reason = "Повышенный интерес к теме AI Coin в Google Trends и Twitter"
-    sources = "https://trends.google.com, https://twitter.com/search?q=%23AiCoin"
-
-    post_text = generate_post_text(trending_topic + ". " + reason)
-    image_bytes, image_preview_url = generate_image(trending_topic)
-    ipfs_hash = upload_to_pinata(image_bytes, f"promo_{date}_{hour}.png")
-    image_path = f"promo_{date}_{hour}.png"
-
-    # Сохраняем изображение временно
-    with open(image_path, "wb") as f:
-        f.write(image_bytes.getbuffer())
-
-    tweet_id = post_to_socials(post_text, image_path)
-    os.remove(image_path)
-
-    # --- Обновление trending_log.csv ---
+    # Загружаем trending_log.csv
     file_log = repo.get_contents("date_time/main/trending_log.csv")
     log_df = pd.read_csv(BytesIO(file_log.decoded_content))
 
-    log_df = pd.concat([log_df, pd.DataFrame([{
+    today_posts = log_df[log_df['date'] == date]
+    if len(today_posts) >= 3:
+        print("\u23f0 Достигнут дневной лимит постов")
+        return
+
+    is_promo_hour = hour == 19
+    trending_topic = "AI Coin в тренде по США, Пакистану и Нигерии"
+    reason = "Повышенный интерес к теме AI Coin в Google Trends и Twitter"
+    hashtags = "#AiCoin #AI #CryptoNews"
+    sources = "https://trends.google.com, https://twitter.com/search?q=%23AiCoin"
+
+    if not is_promo_hour and len(today_posts) >= 2:
+        print("\u23f3 Ждём рекламного поста вечером")
+        return
+
+    # Генерация текста и картинки
+    post_text = generate_post_text(trending_topic + ". " + reason)
+    image_bytes, _ = generate_image(trending_topic)
+    image_path = f"promo_{date}_{hour}.png"
+    with open(image_path, "wb") as f:
+        f.write(image_bytes.getbuffer())
+
+    # Загрузка в Pinata
+    ipfs_hash = upload_to_pinata(image_bytes, image_path)
+    ipfs_url = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
+
+    # Публикация
+    tweet_id = post_to_socials(post_text, image_path)
+    os.remove(image_path)
+
+    # Логирование
+    new_entry = pd.DataFrame([{
         "date": date,
         "hour": hour,
         "google_trend": "ai coin",
@@ -109,28 +124,17 @@ def main():
         "news_sources": sources,
         "hashtags_used": hashtags,
         "reason": reason,
-        "image_ipfs_url": f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
-    }])], ignore_index=True)
+        "image_ipfs_url": ipfs_url
+    }])
 
+    log_df = pd.concat([log_df, new_entry], ignore_index=True)
     updated_log = log_df.to_csv(index=False)
-    repo.update_file("date_time/main/trending_log.csv", f"Update trending log {date} {hour}", updated_log, file_log.sha)
+    repo.update_file("date_time/main/trending_log.csv", f"Update log {date} {hour}", updated_log, file_log.sha)
 
-    print("\U0001F4AC Пост опубликован и залогирован.")
+    print("\ud83d\udcc8 Пост опубликован: Twitter + Telegram")
 
-# --- Комментарии: обработка откликов ---
-def handle_comments(tweet_id):
-    replies = twitter_api.search_tweets(q=f'to:AiCoinETH', since_id=tweet_id)
-    for reply in replies:
-        text = reply.text.lower()
-        if any(word in text for word in ["partner", "collab", "cooperation"]):
-            twitter_api.update_status(status="Thank you! Let's discuss on our site: https://AiCoinETH.com", in_reply_to_status_id=reply.id)
-        elif any(word in text for word in ["ai", "coin", "token"]):
-            twitter_api.update_status(status="Glad you're interested! #AiCoin is the future of decentralized AI.", in_reply_to_status_id=reply.id)
-        else:
-            twitter_api.update_status(status="Thanks for your comment! Discover more about our project at https://AiCoinETH.com", in_reply_to_status_id=reply.id)
-
-# === Запуск ===
 if __name__ == "__main__":
-    main()
-    time.sleep(180)  # Ждём 3 минуты перед обработкой комментариев
-    # handle_comments(tweet_id)  # tweet_id должен быть сохранён отдельно при запуске
+    if should_post_now():
+        main()
+    else:
+        print("\u23f1 Не время для постинга")
