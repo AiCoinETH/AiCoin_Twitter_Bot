@@ -1,1 +1,6 @@
+openai>=1.0.0
 tweepy
+requests
+python-telegram-bot
+PyGithub
+pandas
