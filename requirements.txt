@@ -5,3 +5,4 @@ pytrends
 PyGithub
 pandas
 requests
+snscrape
