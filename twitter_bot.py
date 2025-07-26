@@ -12,6 +12,7 @@ from github import Github
 from io import BytesIO
 import openai
 from pytrends.request import TrendReq
+import snscrape.modules.twitter as sntwitter
 
 # --- Константы и настройки ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -23,7 +24,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 PINATA_JWT = os.getenv("PINATA_JWT")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
 # --- Авторизация ---
 auth = tweepy.OAuth1UserHandler(TWITTER_API_KEY, TWITTER_API_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
@@ -98,16 +98,17 @@ def post_to_socials(text, image_path=None, telegram_text=None):
         telegram_bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=telegram_text or text)
         return tweet.id_str
 
-# --- Поиск твитов по хештегам ---
+# --- Поиск твитов по хештегам через snscrape ---
 def get_twitter_trends_by_hashtag(hashtag):
-    headers = {"Authorization": f"Bearer {BEARER_TOKEN}"}
-    url = f"https://api.twitter.com/2/tweets/search/recent?query=%23{hashtag}&max_results=5&tweet.fields=text"
     try:
-        response = requests.get(url, headers=headers)
-        tweets = response.json().get("data", [])
-        return [tweet["text"] for tweet in tweets]
+        tweets = []
+        for i, tweet in enumerate(sntwitter.TwitterSearchScraper(f"#{hashtag}").get_items()):
+            if i >= 5:
+                break
+            tweets.append(tweet.content)
+        return tweets
     except Exception as e:
-        print(f"Ошибка получения твитов по #{hashtag}: {e}")
+        print(f"Ошибка скрейпинга твитов по #{hashtag}: {e}")
         return []
 
 # --- Комментарии к постам ---
