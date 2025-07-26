@@ -1,4 +1,4 @@
-# === Модуль автопостинга и комментирования через GitHub Actions ===
+# === Autoposting and Commenting Module via GitHub Actions ===
 
 import os
 import requests
@@ -14,7 +14,7 @@ import openai
 from pytrends.request import TrendReq
 import snscrape.modules.twitter as sntwitter
 
-# --- Константы и настройки ---
+# --- Constants and Configuration ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
 TWITTER_API_KEY = os.getenv("API_KEY")
 TWITTER_API_SECRET = os.getenv("API_SECRET")
@@ -25,17 +25,17 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 PINATA_JWT = os.getenv("PINATA_JWT")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# --- Авторизация ---
+# --- Authentication ---
 auth = tweepy.OAuth1UserHandler(TWITTER_API_KEY, TWITTER_API_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
 twitter_api = tweepy.API(auth)
 telegram_bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 github = Github(GITHUB_TOKEN)
 repo = github.get_repo("AiCoinETH/AiCoin_Twitter_Bot")
 
-# --- Хештеги для анализа ---
+# --- Hashtags for Analysis ---
 TWITTER_HASHTAGS = ["AiCoin", "AI", "OpenAI", "xAI", "AICrypto", "AIToken"]
 
-# --- Google Trends: связанный запрос ---
+# --- Google Trends: related query ---
 def get_google_related_query():
     pytrends = TrendReq(hl='en-US', tz=360)
     pytrends.build_payload(["Ai coin"], cat=0, timeframe='now 7-d')
@@ -44,9 +44,9 @@ def get_google_related_query():
         return related.iloc[0]['query']
     return "AI coin"
 
-# --- Генерация короткого твита ---
+# --- Generate short tweet ---
 def generate_post_text(topic):
-    prompt = f"Сделай короткий твит (до 280 символов) на тему '{topic}' с привязкой к криптопроекту AiCoin. Добавь хештеги #AiCoin #AI."
+    prompt = f"Write a short tweet (under 280 characters) about the topic '{topic}' with a reference to the crypto project AiCoin. Include hashtags #AiCoin #AI."
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
@@ -55,9 +55,9 @@ def generate_post_text(topic):
     )
     return response.choices[0].message["content"].strip()[:275]
 
-# --- Генерация сообщения для Telegram (без хештегов) ---
+# --- Generate Telegram message (without hashtags) ---
 def generate_telegram_text(topic):
-    prompt = f"Напиши короткое сообщение без хештегов на тему '{topic}' с привязкой к криптопроекту AiCoin."
+    prompt = f"Write a short Telegram message (no hashtags) about the topic '{topic}' with a reference to the crypto project AiCoin."
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
@@ -66,7 +66,7 @@ def generate_telegram_text(topic):
     )
     return response.choices[0].message["content"].strip()
 
-# --- Генерация изображения ---
+# --- Generate image ---
 def generate_image(prompt):
     response = openai.Image.create(
         prompt=prompt,
@@ -77,7 +77,7 @@ def generate_image(prompt):
     image_data = requests.get(image_url).content
     return BytesIO(image_data), image_url
 
-# --- Загрузка в Pinata ---
+# --- Upload to Pinata ---
 def upload_to_pinata(image_bytes, filename):
     url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
     headers = {"Authorization": f"Bearer {PINATA_JWT}"}
@@ -85,7 +85,7 @@ def upload_to_pinata(image_bytes, filename):
     response = requests.post(url, files=files, headers=headers)
     return response.json()['IpfsHash']
 
-# --- Публикация в Twitter и Telegram ---
+# --- Post to Twitter and Telegram ---
 def post_to_socials(text, image_path=None, telegram_text=None):
     if image_path:
         media = twitter_api.media_upload(image_path)
@@ -98,7 +98,7 @@ def post_to_socials(text, image_path=None, telegram_text=None):
         telegram_bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=telegram_text or text)
         return tweet.id_str
 
-# --- Поиск твитов по хештегам через snscrape ---
+# --- Search tweets by hashtag via snscrape ---
 def get_twitter_trends_by_hashtag(hashtag):
     try:
         tweets = []
@@ -108,10 +108,10 @@ def get_twitter_trends_by_hashtag(hashtag):
             tweets.append(tweet.content)
         return tweets
     except Exception as e:
-        print(f"Ошибка скрейпинга твитов по #{hashtag}: {e}")
+        print(f"Error scraping tweets for #{hashtag}: {e}")
         return []
 
-# --- Комментарии к постам ---
+# --- Comment handling ---
 def handle_comments(tweet_id):
     replies = twitter_api.search_tweets(q=f'to:AiCoinETH', since_id=tweet_id)
     for reply in replies:
@@ -123,12 +123,12 @@ def handle_comments(tweet_id):
         else:
             twitter_api.update_status(status="Thanks for the comment! Learn more about our project at https://getaicoin.com/", in_reply_to_status_id=reply.id)
 
-# --- Проверка времени ---
+# --- Check post time ---
 def should_post_now():
     now = datetime.datetime.now()
     return now.hour in [9, 14, 22]
 
-# --- Главная функция ---
+# --- Main logic ---
 def main():
     now = datetime.datetime.now()
     date = now.strftime("%Y-%m-%d")
@@ -141,7 +141,7 @@ def main():
     if hour == 9:
         topic = get_google_related_query()
         if topic in log_df['google_trend'].values:
-            print("🟡 Уже публиковалось: Google Trends")
+            print("🟡 Already posted: Google Trends")
             return
         text = generate_post_text(topic)
         tg_text = generate_telegram_text(topic)
@@ -153,14 +153,14 @@ def main():
             all_trends.extend(get_twitter_trends_by_hashtag(tag))
         twitter_trend = all_trends[0] if all_trends else "#AiCoin"
         if twitter_trend in log_df['twitter_trend'].values:
-            print("🟡 Уже публиковалось: Twitter")
+            print("🟡 Already posted: Twitter")
             return
         text = generate_post_text(twitter_trend)
         tg_text = generate_telegram_text(twitter_trend)
         tweet_id = post_to_socials(text, telegram_text=tg_text)
 
     elif hour == 22:
-        promo_topic = "AiCoin и будущее AI в Web3"
+        promo_topic = "AiCoin and the future of AI in Web3"
         text = generate_post_text(promo_topic)
         tg_text = generate_telegram_text(promo_topic)
         image_bytes, _ = generate_image(promo_topic)
@@ -172,7 +172,7 @@ def main():
         tweet_id = post_to_socials(text, image_path=image_path, telegram_text=tg_text)
         os.remove(image_path)
     else:
-        print("⏱ Не время для постинга")
+        print("⏱ Not posting time")
         return
 
     new_entry = pd.DataFrame([{
@@ -183,15 +183,16 @@ def main():
         "combined_topic": promo_topic if hour == 22 else "",
         "news_sources": "https://trends.google.com" if hour == 9 else "https://twitter.com" if hour == 14 else "GPT promo",
         "hashtags_used": "#AiCoin #AI",
-        "reason": "Автоматический постинг по тренду",
-        "image_ipfs_url": ipfs_url if hour == 22 else ""
+        "reason": "Automated posting by trend",
+        "image_ipfs_url": ipfs_url if hour == 22 else "",
+        "tweet_id": tweet_id
     }])
 
     log_df = pd.concat([log_df, new_entry], ignore_index=True)
     updated_log = log_df.to_csv(index=False)
     repo.update_file("date_time/main/trending_log.csv", f"Update log {date} {hour}", updated_log, file_log.sha)
 
-    print("📢 Пост опубликован")
+    print("📢 Post published")
     time.sleep(180)
     handle_comments(tweet_id)
 
@@ -199,4 +200,4 @@ if __name__ == "__main__":
     if should_post_now():
         main()
     else:
-        print("⏱ Не время для постинга")
+        print("⏱ Not posting time")
