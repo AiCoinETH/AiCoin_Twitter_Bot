@@ -1,6 +1,7 @@
-openai>=1.0.0
+openai
 tweepy
-requests
 python-telegram-bot
+pytrends
 PyGithub
 pandas
+requests
