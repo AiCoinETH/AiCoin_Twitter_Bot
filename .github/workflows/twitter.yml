@@ -1,11 +1,11 @@
-name: twitter_bot.py Twitter & Telegram AutoPost
+name: Twitter & Telegram AutoPost
 
 on:
   schedule:
-    # Запуск 3 раза в день: 09:00, 14:00, 22:00 по Киеву (UTC+3) => 06:00, 11:00, 19:00 UTC
-    - cron: '0 6 * * *'     # 09:00 по Киеву
-    - cron: '0 11 * * *'    # 14:00 по Киеву
-    - cron: '0 19 * * *'    # 22:00 по Киеву
+    # 09:00, 14:00, 22:00 по Киеву (UTC+3) = 06:00, 11:00, 19:00 UTC
+    - cron: '0 6 * * *'    # Google Trends
+    - cron: '0 11 * * *'   # Twitter Trends
+    - cron: '0 19 * * *'   # Promo пост
   workflow_dispatch:
 
 jobs:
@@ -37,5 +37,4 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           PINATA_JWT: ${{ secrets.PINATA_JWT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
         run: python twitter_bot.py
