@@ -131,70 +131,109 @@ def should_post_now():
 # --- Main logic ---
 def main():
     now = datetime.datetime.now()
+    print(f"🔍 MAIN STARTED at {now}")
     date = now.strftime("%Y-%m-%d")
     hour = now.hour
+    print(f"🕒 Current hour: {hour}")
 
-    file_log = repo.get_contents("date_time/main/trending_log.csv")
-    log_df = pd.read_csv(BytesIO(file_log.decoded_content))
-    today_posts = log_df[log_df['date'] == date]
-
-    if hour == 9:
-        topic = get_google_related_query()
-        if topic in log_df['google_trend'].values:
-            print("🟡 Already posted: Google Trends")
-            return
-        text = generate_post_text(topic)
-        tg_text = generate_telegram_text(topic)
-        tweet_id = post_to_socials(text, telegram_text=tg_text)
-
-    elif hour == 14:
-        all_trends = []
-        for tag in TWITTER_HASHTAGS:
-            all_trends.extend(get_twitter_trends_by_hashtag(tag))
-        twitter_trend = all_trends[0] if all_trends else "#AiCoin"
-        if twitter_trend in log_df['twitter_trend'].values:
-            print("🟡 Already posted: Twitter")
-            return
-        text = generate_post_text(twitter_trend)
-        tg_text = generate_telegram_text(twitter_trend)
-        tweet_id = post_to_socials(text, telegram_text=tg_text)
-
-    elif hour == 22:
-        promo_topic = "AiCoin and the future of AI in Web3"
-        text = generate_post_text(promo_topic)
-        tg_text = generate_telegram_text(promo_topic)
-        image_bytes, _ = generate_image(promo_topic)
-        image_path = f"promo_{date}_{hour}.png"
-        with open(image_path, "wb") as f:
-            f.write(image_bytes.getbuffer())
-        ipfs_hash = upload_to_pinata(image_bytes, image_path)
-        ipfs_url = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
-        tweet_id = post_to_socials(text, image_path=image_path, telegram_text=tg_text)
-        os.remove(image_path)
-    else:
-        print("⏱ Not posting time")
+    try:
+        file_log = repo.get_contents("date_time/main/trending_log.csv")
+        log_df = pd.read_csv(BytesIO(file_log.decoded_content))
+    except Exception as e:
+        print(f"❌ Failed to load trending_log.csv: {e}")
         return
 
-    new_entry = pd.DataFrame([{
-        "date": date,
-        "hour": hour,
-        "google_trend": topic if hour == 9 else "",
-        "twitter_trend": twitter_trend if hour == 14 else "",
-        "combined_topic": promo_topic if hour == 22 else "",
-        "news_sources": "https://trends.google.com" if hour == 9 else "https://twitter.com" if hour == 14 else "GPT promo",
-        "hashtags_used": "#AiCoin #AI",
-        "reason": "Automated posting by trend",
-        "image_ipfs_url": ipfs_url if hour == 22 else "",
-        "tweet_id": tweet_id
-    }])
+    today_posts = log_df[log_df['date'] == date]
 
-    log_df = pd.concat([log_df, new_entry], ignore_index=True)
-    updated_log = log_df.to_csv(index=False)
-    repo.update_file("date_time/main/trending_log.csv", f"Update log {date} {hour}", updated_log, file_log.sha)
+    try:
+        if hour == 9:
+            print("🧭 Block: Google Trends")
+            topic = get_google_related_query()
+            print(f"📈 Google trend topic: {topic}")
 
-    print("📢 Post published")
-    time.sleep(180)
-    handle_comments(tweet_id)
+            if topic in log_df['google_trend'].values:
+                print("🟡 Already posted: Google Trends")
+                return
+
+            text = generate_post_text(topic)
+            tg_text = generate_telegram_text(topic)
+            tweet_id = post_to_socials(text, telegram_text=tg_text)
+
+        elif hour == 14:
+            print("🧭 Block: Twitter Trends")
+            all_trends = []
+            for tag in TWITTER_HASHTAGS:
+                print(f"🔍 Scraping: #{tag}")
+                all_trends.extend(get_twitter_trends_by_hashtag(tag))
+
+            twitter_trend = all_trends[0] if all_trends else "#AiCoin"
+            print(f"🐦 Twitter trend topic: {twitter_trend}")
+
+            if twitter_trend in log_df['twitter_trend'].values:
+                print("🟡 Already posted: Twitter")
+                return
+
+            text = generate_post_text(twitter_trend)
+            tg_text = generate_telegram_text(twitter_trend)
+            tweet_id = post_to_socials(text, telegram_text=tg_text)
+
+        elif hour == 22:
+            print("🧭 Block: Promo Post with image")
+            promo_topic = "AiCoin and the future of AI in Web3"
+            text = generate_post_text(promo_topic)
+            tg_text = generate_telegram_text(promo_topic)
+
+            print("🖼 Generating image...")
+            image_bytes, _ = generate_image(promo_topic)
+            image_path = f"promo_{date}_{hour}.png"
+            with open(image_path, "wb") as f:
+                f.write(image_bytes.getbuffer())
+
+            print("📦 Uploading to Pinata...")
+            ipfs_hash = upload_to_pinata(image_bytes, image_path)
+            ipfs_url = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
+
+            print("🚀 Posting to socials...")
+            tweet_id = post_to_socials(text, image_path=image_path, telegram_text=tg_text)
+            os.remove(image_path)
+        else:
+            print("⏱ Not posting time")
+            return
+
+    except Exception as e:
+        print(f"❌ Error during posting block: {e}")
+        return
+
+    try:
+        print("💾 Updating trending_log.csv...")
+        new_entry = pd.DataFrame([{
+            "date": date,
+            "hour": hour,
+            "google_trend": topic if hour == 9 else "",
+            "twitter_trend": twitter_trend if hour == 14 else "",
+            "combined_topic": promo_topic if hour == 22 else "",
+            "news_sources": "https://trends.google.com" if hour == 9 else "https://twitter.com" if hour == 14 else "GPT promo",
+            "hashtags_used": "#AiCoin #AI",
+            "reason": "Automated posting by trend",
+            "image_ipfs_url": ipfs_url if hour == 22 else "",
+            "tweet_id": tweet_id
+        }])
+
+        log_df = pd.concat([log_df, new_entry], ignore_index=True)
+        updated_log = log_df.to_csv(index=False)
+        repo.update_file("date_time/main/trending_log.csv", f"Update log {date} {hour}", updated_log, file_log.sha)
+    except Exception as e:
+        print(f"❌ Failed to update CSV log: {e}")
+        return
+
+    print("📢 Post published successfully")
+
+    try:
+        time.sleep(180)
+        print("💬 Checking replies...")
+        handle_comments(tweet_id)
+    except Exception as e:
+        print(f"❌ Error in handle_comments: {e}")
 
 if __name__ == "__main__":
     if should_post_now():
