@@ -37,4 +37,11 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           PINATA_JWT: ${{ secrets.PINATA_JWT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python twitter_bot.py
+        run: |
+          python twitter_bot.py | tee output.log
+
+      - name: Upload Logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: bot-logs
+          path: output.log
