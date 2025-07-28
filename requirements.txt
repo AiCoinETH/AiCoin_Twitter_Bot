@@ -1,8 +1,8 @@
 openai
-tweepy
-python-telegram-bot
-pytrends
-PyGithub
 pandas
+pytrends
+PyGithub>=1.55
+python-telegram-bot>=13.0,<14.0
 requests
 snscrape
+tweepy>=4.0.0
