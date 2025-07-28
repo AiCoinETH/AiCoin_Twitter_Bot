@@ -137,3 +137,52 @@ def handle_comments(tweet_id):
             twitter_api.update_status(status="Great thoughts! Check out #AiCoin — future of decentralized AI. Learn more at https://getaicoin.com/", in_reply_to_status_id=reply.id)
         else:
             twitter_api.update_status(status="Thanks for the comment! Learn more about our project at https://getaicoin.com/", in_reply_to_status_id=reply.id)
+
+# --- Time check ---
+def should_post_now():
+    now = datetime.datetime.now()
+    return now.hour in [9, 14, 22]
+
+# --- Main automation function ---
+def main():
+    if not should_post_now():
+        print("⏰ Not time to post yet.")
+        return
+
+    print("📊 Getting related query from Google Trends...")
+    related_query = get_google_related_query()
+
+    print("🧐 Generating promo topic...")
+    topic = get_random_promo_topic()
+
+    print("✍️ Generating post text...")
+    tweet_text = generate_post_text(topic)
+    telegram_text = generate_telegram_text(topic)
+
+    print("📤 Posting to Twitter...")
+    try:
+        tweet = twitter_api.update_status(tweet_text)
+    except Exception as e:
+        print(f"Error posting to Twitter: {e}")
+        return
+
+    print("📣 Posting to Telegram...")
+    try:
+        telegram_bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=telegram_text)
+    except Exception as e:
+        print(f"Error posting to Telegram: {e}")
+
+    print("📊 Logging trend...")
+    log_data = pd.DataFrame([[datetime.datetime.now(), related_query, topic, tweet_text]],
+                             columns=["timestamp", "related_query", "topic", "tweet"])
+    log_file = "trending_log.csv"
+    if os.path.exists(log_file):
+        log_data.to_csv(log_file, mode='a', header=False, index=False)
+    else:
+        log_data.to_csv(log_file, index=False)
+
+    print("💬 Handling comments...")
+    handle_comments(tweet.id)
+
+if __name__ == "__main__":
+    main()
