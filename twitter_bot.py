@@ -56,9 +56,9 @@ def send_post_for_approval(context):
     approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=image_url,
-        caption=f"🧠 *Новая новость (русский вариант)*
+        caption=f"""🧠 *Новая новость (русский вариант)*
 
-{text}",
+{text}""",
         parse_mode="Markdown",
         reply_markup=build_keyboard()
     )
@@ -140,9 +140,9 @@ def handle_message(update: Update, context):
         approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=image,
-            caption=f"📝 Сгенерировано по твоей теме:
+            caption=f"""📝 Сгенерировано по твоей теме:
 
-{text}",
+{text}""",
             parse_mode="Markdown",
             reply_markup=build_keyboard()
         )
