@@ -138,14 +138,14 @@ def handle_message(update: Update, context):
         )["choices"][0]["message"]["content"].strip()
         state["generated"] = {"topic": topic, "text": text, "image": image}
         approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=image,
-            caption=f"📝 Сгенерировано по твоей теме:
+    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+    photo=image,
+    caption=f"""📝 Сгенерировано по твоей теме:
 
-{text}",
-            parse_mode="Markdown",
-            reply_markup=build_keyboard()
-        )
+{text}""",
+    parse_mode="Markdown",
+    reply_markup=build_keyboard()
+)
         state["mode"] = None
     elif state["mode"] == "chat":
         prompt = update.message.text
