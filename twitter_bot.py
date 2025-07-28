@@ -16,6 +16,14 @@ import snscrape.modules.twitter as sntwitter
 import random
 
 # --- Constants and Configuration ---
+REQUIRED_ENV_VARS = [
+    "OPENAI_API_KEY", "API_KEY", "API_SECRET", "ACCESS_TOKEN", "ACCESS_SECRET",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "PINATA_JWT", "GITHUB_TOKEN"
+]
+for var in REQUIRED_ENV_VARS:
+    if not os.getenv(var):
+        raise EnvironmentError(f"Missing required environment variable: {var}")
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
 TWITTER_API_KEY = os.getenv("API_KEY")
 TWITTER_API_SECRET = os.getenv("API_SECRET")
@@ -138,17 +146,8 @@ def handle_comments(tweet_id):
         else:
             twitter_api.update_status(status="Thanks for the comment! Learn more about our project at https://getaicoin.com/", in_reply_to_status_id=reply.id)
 
-# --- Time check ---
-def should_post_now():
-    now = datetime.datetime.now()
-    return now.hour in [9, 14, 22]
-
 # --- Main automation function ---
 def main():
-    if not should_post_now():
-        print("⏰ Not time to post yet.")
-        return
-
     print("📊 Getting related query from Google Trends...")
     related_query = get_google_related_query()
 
@@ -175,7 +174,7 @@ def main():
     print("📊 Logging trend...")
     log_data = pd.DataFrame([[datetime.datetime.now(), related_query, topic, tweet_text]],
                              columns=["timestamp", "related_query", "topic", "tweet"])
-    log_file = "trending_log.csv"
+    log_file = os.path.join(os.path.dirname(__file__), "trending_log.csv")
     if os.path.exists(log_file):
         log_data.to_csv(log_file, mode='a', header=False, index=False)
     else:
