@@ -58,9 +58,7 @@ def send_post_for_approval(context):
         photo=image_url,
         caption=f"""🧠 *Новая новость (русский вариант)*
 
-{text}"""
-
-{text}",
+{text}""",
         parse_mode="Markdown",
         reply_markup=build_keyboard()
     )
