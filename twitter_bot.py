@@ -1,4 +1,3 @@
-
 import os
 import time
 import openai
@@ -82,10 +81,7 @@ def post_final(context, auto=False):
         max_tokens=300
     )["choices"][0]["message"]["content"].strip()
 
-    short_text = translated[:240] + "
-
-More: t.me/AiCoin_ETH
-#AiCoin #AI"
+    short_text = translated[:240] + "\n\nMore: t.me/AiCoin_ETH\n#AiCoin #AI"
     img_data = requests.get(image_url).content
     img_bytes = BytesIO(img_data)
 
