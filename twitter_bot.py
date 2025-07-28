@@ -56,9 +56,9 @@ def send_post_for_approval(context):
     approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=image_url,
-        caption=f"""🧠 *Новая новость (русский вариант)*
+        caption=f"🧠 *Новая новость (русский вариант)*
 
-{text}""",
+{text}",
         parse_mode="Markdown",
         reply_markup=build_keyboard()
     )
@@ -75,9 +75,9 @@ def post_final(context, auto=False):
     image_url = data["image"]
     translated = openai.ChatCompletion.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": f"Переведи новость на английский язык:
+        messages=[{"role": "user", "content": f"""Переведи новость на английский язык:
 
-{full_text}"}],
+{full_text}"""}],
         max_tokens=300
     )["choices"][0]["message"]["content"].strip()
 
@@ -140,9 +140,9 @@ def handle_message(update: Update, context):
         approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=image,
-            caption=f"""📝 Сгенерировано по твоей теме:
+            caption=f"📝 Сгенерировано по твоей теме:
 
-{text}""",
+{text}",
             parse_mode="Markdown",
             reply_markup=build_keyboard()
         )
