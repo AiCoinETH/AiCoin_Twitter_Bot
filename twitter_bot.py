@@ -44,6 +44,11 @@ repo = github.get_repo("AiCoinETH/AiCoin_Twitter_Bot")
 # --- Hashtags for Analysis ---
 TWITTER_HASHTAGS = ["AiCoin", "AI", "OpenAI", "xAI", "AICrypto", "AIToken"]
 
+# --- Time check function ---
+def should_post_now():
+    current_hour = datetime.datetime.now().hour
+    return current_hour in [9, 14, 22]
+
 # --- Google Trends: related query ---
 def get_google_related_query():
     pytrends = TrendReq(hl='en-US', tz=360)
@@ -148,10 +153,14 @@ def handle_comments(tweet_id):
 
 # --- Main automation function ---
 def main():
+    if not should_post_now():
+        print("⏰ Not posting now. Outside of scheduled hours.")
+        return
+
     print("📊 Getting related query from Google Trends...")
     related_query = get_google_related_query()
 
-    print("🧐 Generating promo topic...")
+    print("🤔 Generating promo topic...")
     topic = get_random_promo_topic()
 
     print("✍️ Generating post text...")
