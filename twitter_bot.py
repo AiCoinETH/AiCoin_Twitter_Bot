@@ -2,37 +2,45 @@ import os
 import openai
 import asyncio
 import json
+import hashlib
+import requests
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters, CommandHandler
 
+# Загрузка переменных окружения
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
-TELEGRAM_PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID")
+TELEGRAM_PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 POST_HISTORY_FILE = "post_history.json"
-openai.api_key = OPENAI_API_KEY
 
+openai.api_key = OPENAI_API_KEY
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
+
+# Данные поста
 post_data = {
-    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют. Это может изменить правила игры на рынке.",
-    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction. This could reshape the market.",
+    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют.",
+    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction.",
     "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "timestamp": None
 }
 
+# Состояния
 pending_post = {"active": False, "timer": None}
 in_dialog = {"active": False}
 do_not_disturb = {"active": False}
 
+# Кнопки
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
     [InlineKeyboardButton("♻️ Еще один", callback_data="regenerate")],
     [InlineKeyboardButton("🖼️ Картинку", callback_data="new_image")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel"), InlineKeyboardButton("✅ Завершить диалог", callback_data="end_dialog")]
+    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel"), InlineKeyboardButton("✅ Завершить диалог", callback_data="end_dialog")],
+    [InlineKeyboardButton("🧪 Тест пост", callback_data="test_publish")]
 ])
 
 ru_variants = [
@@ -42,6 +50,7 @@ ru_variants = [
 ]
 variant_index = 0
 
+# История публикаций
 def load_post_history():
     if not os.path.exists(POST_HISTORY_FILE):
         return []
@@ -52,9 +61,6 @@ def load_post_history():
     with open(POST_HISTORY_FILE, "w") as file:
         json.dump(history, file)
     return history
-
-import hashlib
-import requests
 
 def get_image_hash(image_url):
     try:
@@ -74,12 +80,11 @@ def is_duplicate(text, image_url=None):
     history = load_post_history()
     image_hash = get_image_hash(image_url) if image_url else None
     for entry in history:
-        if entry["text"] == text:
-            return True
-        if image_hash and entry.get("image_hash") == image_hash:
+        if entry["text"] == text or (image_hash and entry.get("image_hash") == image_hash):
             return True
     return False
 
+# Отправка на модерацию
 async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
     if do_not_disturb["active"]:
         return
@@ -106,23 +111,38 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
 
     asyncio.create_task(update_countdown(countdown_msg.message_id))
 
+# Публикация поста
 async def publish_post():
+    print("▶️ Публикую пост...")
+    print("🆔 TELEGRAM_PUBLIC_CHANNEL_ID:", TELEGRAM_PUBLIC_CHANNEL_ID)
+    print("🖼️ Картинка:", post_data["image_url"])
+    print("📝 Текст:", post_data["text_ru"])
+
     save_post_to_history(post_data["text_ru"])
+    
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
         caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
     )
+
     twitter_text = post_data["text_en"][:220] + "... Продолжение в Telegram: t.me/AiCoin_ETH или на https://getaicoin.com/ #AiCoin $Ai"
-    print("Twitter пост:", twitter_text)
+    print("🐦 Twitter пост:", twitter_text)
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/\n\n#AiCoin $Ai"
-        )
+        try:
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+                photo=post_data["image_url"],
+                caption=post_data["text_ru"] + "\n\n👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/\n\n#AiCoin $Ai"
+            )
+            print("✅ Опубликовано в канал!")
+        except Exception as e:
+            print("❌ Ошибка при публикации:", e)
+    else:
+        print("⚠️ Не задан TELEGRAM_PUBLIC_CHANNEL_ID")
 
+# Обработка кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global variant_index
     query = update.callback_query
@@ -132,8 +152,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "end_dialog":
         in_dialog["active"] = False
         await send_post_for_approval()
-        return
-    if action == "approve":
+    elif action == "approve":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
         pending_post["active"] = False
         await publish_post()
@@ -156,10 +175,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif action == "chat":
         in_dialog["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена. Введите любое сообщение.", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена.", reply_markup=keyboard)
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен. Бот не будет отправлять уведомления.", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.", reply_markup=keyboard)
     elif action == "cancel":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.", reply_markup=keyboard)
         pending_post["active"] = False
@@ -167,17 +186,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд", reply_markup=keyboard)
         pending_post["timer"] = datetime.now()
         pending_post["active"] = True
+    elif action == "test_publish":
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🚀 Пробую опубликовать пост в канал...")
+        await publish_post()
 
+# Таймер автоотправки
 async def check_timer():
     while True:
         await asyncio.sleep(5)
         if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             elapsed = datetime.now() - pending_post["timer"]
             if elapsed > timedelta(seconds=60):
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время истекло. Публикую автоматически.")
                 await publish_post()
                 pending_post["active"] = False
 
+# Обработка сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text.lower() == "/end":
         in_dialog["active"] = False
@@ -185,7 +209,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
-    await update.message.reply_text("🔁 Заглушка: генерация отключена. Введите /end для завершения.", reply_markup=keyboard)
+    await update.message.reply_text("🔁 Заглушка. Введите /end для завершения.", reply_markup=keyboard)
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
