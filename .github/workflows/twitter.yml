@@ -1,13 +1,30 @@
-name: Twitter & Telegram AutoPost
+from pathlib import Path
+
+# Создаём тестовый GitHub Actions workflow для ручного запуска
+test_workflow = """
+name: Test Twitter Bot
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-twitter-bot:
+  test-bot:
     runs-on: ubuntu-latest
+
+    env:
+      TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
+      TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
+      TELEGRAM_APPROVAL_USER_ID: ${{ secrets.TELEGRAM_APPROVAL_USER_ID }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      API_KEY: ${{ secrets.API_KEY }}
+      API_SECRET: ${{ secrets.API_SECRET }}
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Set up Python
@@ -16,7 +33,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run Twitter Bot
-        run: python twitter_bot.py
+      - name: Run bot manually (test)
+        run: |
+          echo "Running twitter_bot.py"
+          python twitter_bot.py
+"""
+
+# Сохраняем workflow-файл
+workflow_path = Path("/mnt/data/twitter_test.yml")
+workflow_path.write_text(test_workflow.strip(), encoding="utf-8")
+
+workflow_path.name
