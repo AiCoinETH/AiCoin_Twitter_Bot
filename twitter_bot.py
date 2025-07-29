@@ -158,7 +158,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
-    app.add_handler(CommandHandler("start", send_post_for_approval))
+    app.job_queue.run_once(lambda context: app.create_task(send_post_for_approval(None, context)), 1)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
