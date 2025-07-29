@@ -116,6 +116,27 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
     asyncio.create_task(update_countdown(countdown_msg.message_id))
 
 async def publish_post():
+    # Укороченная версия для Twitter (и модерации)
+    full_text = post_data["text_en"]
+    footer = "... Продолжение на сайте https://getaicoin.com/ или телеграм канале t.me/AiCoin_ETH #AiCoin $Ai"
+    max_length = 280 - len(footer)
+    short_text = full_text[:max_length].rstrip() + " " + footer
+
+    # Отправка короткой версии на согласование
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="🇬🇧 Английская версия:
+" + short_text
+    )
+
+    # Публикация полной версии в Telegram-канале (на английском)
+    if TELEGRAM_PUBLIC_CHANNEL_ID:
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
+        )
+
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
