@@ -33,7 +33,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot manually (test)
-        run: |
-          echo "Running twitter_bot.py"
-          python twitter_bot.py
+      - name: Run Telegram Bot
+        run: python twitter_bot.py
