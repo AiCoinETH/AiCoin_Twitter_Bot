@@ -69,6 +69,15 @@ async def save_post_to_history(text, image_url=None):
         )
         await db.commit()
 
+async 
+def get_image_hash(image_url):
+    try:
+        import requests, hashlib
+        response = requests.get(image_url)
+        return hashlib.sha256(response.content).hexdigest()
+    except Exception:
+        return None
+
 async def is_duplicate(text, image_url=None):
     image_hash = get_image_hash(image_url) if image_url else None
     async with aiosqlite.connect(DB_FILE) as db:
@@ -79,19 +88,6 @@ async def is_duplicate(text, image_url=None):
             async for row in cursor:
                 if row[0] == text or (image_hash and row[1] == image_hash):
                     return True
-    return False
-
-import requests
-
-def get_image_hash(image_url):
-    try:
-        response = requests.get(image_url)
-        return hashlib.sha256(response.content).hexdigest()
-    except Exception:
-        return None
-
-
-            return True
     return False
 
 async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
@@ -146,8 +142,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "end_dialog":
         in_dialog["active"] = False
         await send_post_for_approval()
-        return
-    if action == "approve":
+    elif action == "approve":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
         pending_post["active"] = False
         await publish_post()
@@ -170,10 +165,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif action == "chat":
         in_dialog["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена. Введите любое сообщение.", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка. Введите любое сообщение.", reply_markup=keyboard)
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен. Бот не будет отправлять уведомления.", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.", reply_markup=keyboard)
     elif action == "cancel":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.", reply_markup=keyboard)
         pending_post["active"] = False
@@ -199,10 +194,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
-    await update.message.reply_text("🔁 Заглушка: генерация отключена. Введите /end для завершения.", reply_markup=keyboard)
+    await update.message.reply_text("🔁 Заглушка. Введите /end для завершения.", reply_markup=keyboard)
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
+    await init_db()
     await send_post_for_approval()
     asyncio.create_task(check_timer())
 
