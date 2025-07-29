@@ -69,7 +69,6 @@ async def save_post_to_history(text, image_url=None):
         )
         await db.commit()
 
-async 
 def get_image_hash(image_url):
     try:
         import requests, hashlib
