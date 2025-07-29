@@ -15,8 +15,12 @@ openai.api_key = OPENAI_API_KEY
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 post_data = {
-    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют. Это может изменить правила игры на рынке.\n\nКакую роль в этом сыграет $Ai? Обсуждаем в нашем канале.",
-    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction. This could reshape the market.\n\nWhat role will $Ai play? Let’s discuss on Telegram!",
+    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют. Это может изменить правила игры на рынке.
+
+Какую роль в этом сыграет $Ai? Обсуждаем в нашем канале.",
+    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction. This could reshape the market.
+
+What role will $Ai play? Let’s discuss on Telegram!",
     "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "timestamp": None
 }
@@ -38,6 +42,7 @@ def load_post_history():
         return []
     with open(POST_HISTORY_FILE, "r") as file:
         history = json.load(file)
+    # Удаляем записи старше 30 дней
     threshold = datetime.now() - timedelta(days=30)
     history = [entry for entry in history if datetime.fromisoformat(entry["timestamp"]) > threshold]
     with open(POST_HISTORY_FILE, "w") as file:
@@ -113,7 +118,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         twitter_core = "... Read more: t.me/AiCoin_ETH #AiCoin $Ai"
         try:
             response = openai.ChatCompletion.create(
-                model="gpt-4",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": "Сформируй короткий пост на английском до 280 символов, включая ссылку и хештеги, на тему: " + post_data["text_ru"]}]
             )
             post_data["text_en"] = response.choices[0].message.content.strip()
@@ -150,6 +155,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     if user_message.lower() == "/end":
         in_dialog["active"] = False
+
+        # Генерация поста на английском для Twitter (ограничение по символам)
         twitter_core = "... Read more: t.me/AiCoin_ETH #AiCoin $Ai"
         try:
             response = openai.ChatCompletion.create(
