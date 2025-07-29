@@ -92,12 +92,15 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         reply_markup=keyboard
     )
     countdown_msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд")
-    for i in range(59, -1, -1):
-        await asyncio.sleep(1)
-        try:
-            await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=countdown_msg.message_id, text=f"⏳ Таймер: {i} секунд")
-        except:
-            pass
+    async def update_countdown(message_id):
+        for i in range(59, -1, -1):
+            await asyncio.sleep(1)
+            try:
+                await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=message_id, text=f"⏳ Таймер: {i} секунд")
+            except:
+                pass
+
+    asyncio.create_task(update_countdown(countdown_msg.message_id))
     if do_not_disturb["active"]:
         return
     post_data["timestamp"] = datetime.now()
