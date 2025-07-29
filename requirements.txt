@@ -6,3 +6,4 @@ pandas
 pytrends
 snscrape
 PyGithub
+aiosqlite
