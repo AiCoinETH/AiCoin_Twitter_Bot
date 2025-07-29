@@ -90,6 +90,18 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         caption=post_data["text_ru"],
         reply_markup=keyboard
     )
+    pending_post["timer"] = datetime.now()
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 30 секунд до автопубликации")
+    if do_not_disturb["active"]:
+        return
+    post_data["timestamp"] = datetime.now()
+    pending_post["active"] = True
+    await approval_bot.send_photo(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        photo=post_data["image_url"],
+        caption=post_data["text_ru"],
+        reply_markup=keyboard
+    )
 
 async def publish_post():
     save_post_to_history(post_data["text_ru"])
@@ -147,16 +159,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
         pending_post["active"] = False
     elif action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 30 секунд")
         pending_post["timer"] = datetime.now()
         pending_post["active"] = True
 
 async def check_timer():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(5)
         if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             elapsed = datetime.now() - pending_post["timer"]
-            if elapsed > timedelta(minutes=5):
+            if elapsed > timedelta(seconds=30):
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
                 await publish_post()
                 pending_post["active"] = False
