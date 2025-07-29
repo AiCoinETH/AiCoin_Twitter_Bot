@@ -156,15 +156,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif action == "chat":
         in_dialog["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена. Введите любое сообщение.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена. Введите любое сообщение.", reply_markup=keyboard)
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен. Бот не будет отправлять уведомления.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен. Бот не будет отправлять уведомления.", reply_markup=keyboard)
     elif action == "cancel":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.", reply_markup=keyboard)
         pending_post["active"] = False
     elif action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд", reply_markup=keyboard)
         pending_post["timer"] = datetime.now()
         pending_post["active"] = True
 
@@ -185,7 +185,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
-    await update.message.reply_text("🔁 Заглушка: генерация отключена. Введите /end для завершения.")
+    await update.message.reply_text("🔁 Заглушка: генерация отключена. Введите /end для завершения.", reply_markup=keyboard)
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
