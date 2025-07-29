@@ -84,6 +84,24 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         return
     post_data["timestamp"] = datetime.now()
     pending_post["active"] = True
+    pending_post["timer"] = datetime.now()
+    msg = await approval_bot.send_photo(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        photo=post_data["image_url"],
+        caption=post_data["text_ru"],
+        reply_markup=keyboard
+    )
+    countdown_msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд")
+    for i in range(59, -1, -1):
+        await asyncio.sleep(1)
+        try:
+            await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=countdown_msg.message_id, text=f"⏳ Таймер: {i} секунд")
+        except:
+            pass
+    if do_not_disturb["active"]:
+        return
+    post_data["timestamp"] = datetime.now()
+    pending_post["active"] = True
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
@@ -91,7 +109,7 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         reply_markup=keyboard
     )
     pending_post["timer"] = datetime.now()
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 30 секунд до автопубликации")
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд до автопубликации")
     if do_not_disturb["active"]:
         return
     post_data["timestamp"] = datetime.now()
@@ -110,7 +128,7 @@ async def publish_post():
         photo=post_data["image_url"],
         caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
     )
-    twitter_text = post_data["text_en"][:240] + "... Read more: t.me/AiCoin_ETH #AiCoin $Ai"
+    twitter_text = post_data["text_en"][:220] + "... Продолжение в Telegram: t.me/AiCoin_ETH или на https://getaicoin.com/ #AiCoin $Ai"
     print("Twitter пост:", twitter_text)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,7 +177,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
         pending_post["active"] = False
     elif action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 30 секунд")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд")
         pending_post["timer"] = datetime.now()
         pending_post["active"] = True
 
@@ -168,7 +186,7 @@ async def check_timer():
         await asyncio.sleep(5)
         if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             elapsed = datetime.now() - pending_post["timer"]
-            if elapsed > timedelta(seconds=30):
+            if elapsed > timedelta(seconds=60):
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
                 await publish_post()
                 pending_post["active"] = False
