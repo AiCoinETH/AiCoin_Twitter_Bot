@@ -6,7 +6,7 @@ import requests
 from io import BytesIO
 from datetime import datetime
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 import tweepy
 
 # === Константы и переменные окружения ===
@@ -34,12 +34,12 @@ def generate_ai_post():
     img_prompt = f"futuristic ai crypto coin, glowing neural circuits, cyberpunk style, concept of {topic}"
     text_prompt = f"Напиши новость на русском языке о популярности AI токенов, включая $Ai Coin, в 2025 году. Сделай её информативной, но краткой, как новость или обзор."
 
-    image = openai.Image.create(prompt=img_prompt, n=1, size="1024x1024")["data"][0]["url"]
-    text = openai.ChatCompletion.create(
+    image = openai.images.generate(prompt=img_prompt, n=1, size="1024x1024").data[0].url
+    text = openai.chat.completions.create(
         model="gpt-4",
         messages=[{"role": "user", "content": text_prompt}],
         max_tokens=300
-    )["choices"][0]["message"]["content"].strip()
+    ).choices[0].message.content.strip()
     return topic, text, image
 
 def build_keyboard():
@@ -50,10 +50,10 @@ def build_keyboard():
         [InlineKeyboardButton("🖼 Новая картинка", callback_data="regen_image")]
     ])
 
-def send_post_for_approval(context):
+async def send_post_for_approval(context: ContextTypes.DEFAULT_TYPE):
     topic, text, image_url = generate_ai_post()
     state["generated"] = {"topic": topic, "text": text, "image": image_url}
-    approval_bot.send_photo(
+    await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=image_url,
         caption=f"""🧠 *Новая новость (русский вариант)*
@@ -64,22 +64,22 @@ def send_post_for_approval(context):
     )
     context.job_queue.run_once(timeout_autopost, 180)
 
-def timeout_autopost(context):
-    post_final(context, auto=True)
+async def timeout_autopost(context: ContextTypes.DEFAULT_TYPE):
+    await post_final(context)
 
-def post_final(context, auto=False):
+async def post_final(context: ContextTypes.DEFAULT_TYPE, auto=False):
     data = state["generated"]
     if not data:
         return
     full_text = data["text"]
     image_url = data["image"]
-    translated = openai.ChatCompletion.create(
+    translated = openai.chat.completions.create(
         model="gpt-4",
         messages=[{"role": "user", "content": f"""Переведи новость на английский язык:
 
 {full_text}"""}],
         max_tokens=300
-    )["choices"][0]["message"]["content"].strip()
+    ).choices[0].message.content.strip()
 
     short_text = translated[:240] + "\n\nMore: t.me/AiCoin_ETH\n#AiCoin #AI"
     img_data = requests.get(image_url).content
@@ -88,79 +88,80 @@ def post_final(context, auto=False):
     try:
         twitter_api.update_status_with_media(filename="post.png", file=img_bytes, status=short_text)
     except Exception as e:
-        approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}")
     try:
-        approval_bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=img_bytes, caption=translated)
+        await approval_bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=img_bytes, caption=translated)
     except Exception as e:
-        approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка Telegram-публикации: {e}")
-    approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка Telegram-публикации: {e}")
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
 
-def handle_callback(update: Update, context):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     if user_id != TELEGRAM_APPROVAL_USER_ID:
-        query.answer("⛔ Только администратор может подтверждать посты.", show_alert=True)
+        await query.answer("⛔ Только администратор может подтверждать посты.", show_alert=True)
         return
 
     data = query.data
     if data == "approve":
-        post_final(context)
+        await post_final(context)
     elif data == "reject":
-        query.message.reply_text("❌ Пост отклонён. Обсуждаем дальше...")
+        await query.message.reply_text("❌ Пост отклонён. Обсуждаем дальше...")
     elif data == "wait":
-        query.message.reply_text("🕐 Ожидаю дальше. У тебя есть ещё 3 минуты.")
+        await query.message.reply_text("🕐 Ожидаю дальше. У тебя есть ещё 3 минуты.")
     elif data == "regen":
-        send_post_for_approval(context)
+        await send_post_for_approval(context)
     elif data == "custom":
         state["mode"] = "custom"
-        query.message.reply_text("📝 Введи тему, по которой сгенерировать новость:")
+        await query.message.reply_text("📝 Введи тему, по которой сгенерировать новость:")
     elif data == "chat":
         state["mode"] = "chat"
-        query.message.reply_text("🤖 Готов обсудить. Напиши что-нибудь.")
+        await query.message.reply_text("🤖 Готов обсудить. Напиши что-нибудь.")
     elif data == "regen_image":
         topic = state["generated"].get("topic", "AI and crypto")
-        image = openai.Image.create(prompt=topic, n=1, size="1024x1024")["data"][0]["url"]
+        image = openai.images.generate(prompt=topic, n=1, size="1024x1024").data[0].url
         state["generated"]["image"] = image
-        approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption="🖼 Новое изображение для текущего текста")
+        await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption="🖼 Новое изображение для текущего текста")
 
-def handle_message(update: Update, context):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
     if state["mode"] == "custom":
         topic = update.message.text
         text_prompt = f"Напиши новость на русском языке на тему: {topic}"
         img_prompt = topic
-        image = openai.Image.create(prompt=img_prompt, n=1, size="1024x1024")["data"][0]["url"]
-        text = openai.ChatCompletion.create(
+        image = openai.images.generate(prompt=img_prompt, n=1, size="1024x1024").data[0].url
+        text = openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": text_prompt}],
             max_tokens=300
-        )["choices"][0]["message"]["content"].strip()
+        ).choices[0].message.content.strip()
         state["generated"] = {"topic": topic, "text": text, "image": image}
-        approval_bot.send_photo(
-    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-    photo=image,
-    caption=f"""📝 Сгенерировано по твоей теме:
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=image,
+            caption=f"""📝 Сгенерировано по твоей теме:
 
 {text}""",
-    parse_mode="Markdown",
-    reply_markup=build_keyboard()
-)
+            parse_mode="Markdown",
+            reply_markup=build_keyboard()
+        )
         state["mode"] = None
     elif state["mode"] == "chat":
         prompt = update.message.text
-        reply = openai.ChatCompletion.create(
+        reply = openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300
-        )["choices"][0]["message"]["content"].strip()
-        update.message.reply_text(reply)
+        ).choices[0].message.content.strip()
+        await update.message.reply_text(reply)
 
 def main():
-    updater = Updater(token=TELEGRAM_BOT_TOKEN_APPROVAL, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", send_post_for_approval))
-    dp.add_handler(CallbackQueryHandler(handle_callback))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    updater.start_polling()
-    updater.idle()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
+    app.add_handler(CommandHandler("start", send_post_for_approval))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
