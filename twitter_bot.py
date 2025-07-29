@@ -44,19 +44,19 @@ def generate_ai_post():
 
 def build_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ OK", callback_data="approve"), InlineKeyboardButton("❌ Отказ", callback_data="reject")],
-        [InlineKeyboardButton("🕐 Подумать", callback_data="wait"), InlineKeyboardButton("🔁 Заново", callback_data="regen")],
-        [InlineKeyboardButton("📝 Задать тему", callback_data="custom"), InlineKeyboardButton("🤖 Поговорить", callback_data="chat")],
-        [InlineKeyboardButton("🖼 Новая картинка", callback_data="regen_image")]
+        [InlineKeyboardButton("OK", callback_data="approve"), InlineKeyboardButton("Отказ", callback_data="reject")],
+        [InlineKeyboardButton("Подумать", callback_data="wait"), InlineKeyboardButton("Заново", callback_data="regen")],
+        [InlineKeyboardButton("Задать тему", callback_data="custom"), InlineKeyboardButton("Поговорить", callback_data="chat")],
+        [InlineKeyboardButton("Новая картинка", callback_data="regen_image")]
     ])
 
-async def send_post_for_approval(context: ContextTypes.DEFAULT_TYPE):
+async def send_post_for_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic, text, image_url = generate_ai_post()
     state["generated"] = {"topic": topic, "text": text, "image": image_url}
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=image_url,
-        caption=f"""🧠 *Новая новость (русский вариант)*
+        caption=f"""*Новая новость (русский вариант)*
 
 {text}""",
         parse_mode="Markdown",
@@ -88,40 +88,40 @@ async def post_final(context: ContextTypes.DEFAULT_TYPE, auto=False):
     try:
         twitter_api.update_status_with_media(filename="post.png", file=img_bytes, status=short_text)
     except Exception as e:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"Ошибка при публикации в Twitter: {e}")
     try:
         await approval_bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=img_bytes, caption=translated)
     except Exception as e:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка Telegram-публикации: {e}")
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"Ошибка Telegram-публикации: {e}")
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Пост опубликован.")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     if user_id != TELEGRAM_APPROVAL_USER_ID:
-        await query.answer("⛔ Только администратор может подтверждать посты.", show_alert=True)
+        await query.answer("Только администратор может подтверждать посты.", show_alert=True)
         return
 
     data = query.data
     if data == "approve":
         await post_final(context)
     elif data == "reject":
-        await query.message.reply_text("❌ Пост отклонён. Обсуждаем дальше...")
+        await query.message.reply_text("Пост отклонён. Обсуждаем дальше...")
     elif data == "wait":
-        await query.message.reply_text("🕐 Ожидаю дальше. У тебя есть ещё 3 минуты.")
+        await query.message.reply_text("Ожидаю дальше. У тебя есть ещё 3 минуты.")
     elif data == "regen":
-        await send_post_for_approval(context)
+        await send_post_for_approval(update, context)
     elif data == "custom":
         state["mode"] = "custom"
-        await query.message.reply_text("📝 Введи тему, по которой сгенерировать новость:")
+        await query.message.reply_text("Введи тему, по которой сгенерировать новость:")
     elif data == "chat":
         state["mode"] = "chat"
-        await query.message.reply_text("🤖 Готов обсудить. Напиши что-нибудь.")
+        await query.message.reply_text("Готов обсудить. Напиши что-нибудь.")
     elif data == "regen_image":
         topic = state["generated"].get("topic", "AI and crypto")
         image = openai.images.generate(prompt=topic, n=1, size="1024x1024").data[0].url
         state["generated"]["image"] = image
-        await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption="🖼 Новое изображение для текущего текста")
+        await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption="Новое изображение для текущего текста")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
@@ -140,7 +140,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=image,
-            caption=f"""📝 Сгенерировано по твоей теме:
+            caption=f"""Сгенерировано по твоей теме:
 
 {text}""",
             parse_mode="Markdown",
