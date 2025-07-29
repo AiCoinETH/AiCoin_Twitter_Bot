@@ -3,12 +3,13 @@ import openai
 import asyncio
 import json
 from datetime import datetime, timedelta
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, InputMediaPhoto
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters, CommandHandler
 
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
+TELEGRAM_PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 POST_HISTORY_FILE = "post_history.json"
 openai.api_key = OPENAI_API_KEY
@@ -85,13 +86,16 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
     post_data["timestamp"] = datetime.now()
     pending_post["active"] = True
     pending_post["timer"] = datetime.now()
+
     msg = await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
         caption=post_data["text_ru"],
         reply_markup=keyboard
     )
+
     countdown_msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд")
+
     async def update_countdown(message_id):
         for i in range(59, -1, -1):
             await asyncio.sleep(1)
@@ -101,28 +105,6 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
                 pass
 
     asyncio.create_task(update_countdown(countdown_msg.message_id))
-    if do_not_disturb["active"]:
-        return
-    post_data["timestamp"] = datetime.now()
-    pending_post["active"] = True
-    await approval_bot.send_photo(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        photo=post_data["image_url"],
-        caption=post_data["text_ru"],
-        reply_markup=keyboard
-    )
-    pending_post["timer"] = datetime.now()
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд до автопубликации")
-    if do_not_disturb["active"]:
-        return
-    post_data["timestamp"] = datetime.now()
-    pending_post["active"] = True
-    await approval_bot.send_photo(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        photo=post_data["image_url"],
-        caption=post_data["text_ru"],
-        reply_markup=keyboard
-    )
 
 async def publish_post():
     save_post_to_history(post_data["text_ru"])
@@ -134,6 +116,13 @@ async def publish_post():
     twitter_text = post_data["text_en"][:220] + "... Продолжение в Telegram: t.me/AiCoin_ETH или на https://getaicoin.com/ #AiCoin $Ai"
     print("Twitter пост:", twitter_text)
 
+    if TELEGRAM_PUBLIC_CHANNEL_ID:
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_ru"] + "\n\n👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/\n\n#AiCoin $Ai"
+        )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global variant_index
     query = update.callback_query
@@ -144,11 +133,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         in_dialog["active"] = False
         await send_post_for_approval()
         return
-    global variant_index
-    query = update.callback_query
-    await query.answer()
-    action = query.data
-
     if action == "approve":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
         pending_post["active"] = False
