@@ -158,10 +158,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
-    app.job_queue.run_once(lambda context: app.create_task(send_post_for_approval(None, context)), 1)
+    ), 1)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    
+import asyncio
+
+async def startup(app):
+    await send_post_for_approval(None, app)
+
+app.post_init = lambda _: asyncio.create_task(startup(app))
+
+app.run_polling()
 
 if __name__ == "__main__":
     main()
