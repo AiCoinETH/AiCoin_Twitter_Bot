@@ -23,14 +23,15 @@ post_data = {
 
 pending_post = {"active": False, "timer": None}
 in_dialog = {"active": False}
+do_not_disturb = {"active": False}
 
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
     [InlineKeyboardButton("♻️ Еще один", callback_data="regenerate")],
     [InlineKeyboardButton("🖼️ Картинку", callback_data="new_image")],
-    [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("📤 Завершить", callback_data="end_dialog")],
-    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]
+    [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
+    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel"), InlineKeyboardButton("✅ Завершить диалог", callback_data="end_dialog")]
 ])
 
 ru_variants = [
@@ -79,6 +80,8 @@ def is_duplicate(text, image_url=None):
     return False
 
 async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
+    if do_not_disturb["active"]:
+        return
     post_data["timestamp"] = datetime.now()
     pending_post["active"] = True
     await approval_bot.send_photo(
@@ -104,6 +107,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     action = query.data
 
+    if action == "end_dialog":
+        in_dialog["active"] = False
+        await send_post_for_approval()
+        return
+    global variant_index
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+
     if action == "approve":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
         pending_post["active"] = False
@@ -111,22 +123,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "regenerate":
         variant_index = (variant_index + 1) % len(ru_variants)
         post_data["text_ru"] = ru_variants[variant_index]
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="♻️ Новый вариант поста:")
-        await send_post_for_approval()
-    elif action == "new_image":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🖼️ Генерирую новую картинку...")
-    elif action == "chat":
-        in_dialog["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Переход в режим диалога. Напишите сообщение.")
-    elif action == "end_dialog":
-        in_dialog["active"] = False
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
-            caption=post_data["text_ru"],
+            caption="♻️ Новый пост: " + post_data["text_ru"],
             reply_markup=keyboard
         )
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Диалог завершен. Пост сформирован и отправлен на согласование.")
+    elif action == "new_image":
+        post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption="🖼️ Новый пост: Заглушка",
+            reply_markup=keyboard
+        )
+    elif action == "chat":
+        in_dialog["active"] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Заглушка: генерация пока отключена. Введите любое сообщение.")
+    elif action == "do_not_disturb":
+        do_not_disturb["active"] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен. Бот не будет отправлять уведомления.")
     elif action == "cancel":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
         pending_post["active"] = False
@@ -138,7 +154,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_timer():
     while True:
         await asyncio.sleep(60)
-        if pending_post["active"] and pending_post["timer"]:
+        if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             elapsed = datetime.now() - pending_post["timer"]
             if elapsed > timedelta(minutes=5):
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
@@ -146,10 +162,13 @@ async def check_timer():
                 pending_post["active"] = False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.lower() == "/end":
+        in_dialog["active"] = False
+        await send_post_for_approval()
+        return
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
-    user_message = update.message.text
-    await update.message.reply_text("Пока генерация через OpenAI отключена. Введите /end для возврата к кнопкам.")
+    await update.message.reply_text("🔁 Заглушка: генерация отключена. Введите /end для завершения.")
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
