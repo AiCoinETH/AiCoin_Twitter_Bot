@@ -15,8 +15,8 @@ openai.api_key = OPENAI_API_KEY
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 post_data = {
-    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют. Это может изменить правила игры на рынке.\n\nКакую роль в этом сыграет $Ai? Обсуждаем в нашем канале.",
-    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction. This could reshape the market.\n\nWhat role will $Ai play? Let’s discuss on Telegram!",
+    "text_ru": "Майнинговые токены снова в фокусе: интерес инвесторов растет на фоне появления новых AI-алгоритмов оптимизации добычи криптовалют. Это может изменить правила игры на рынке.",
+    "text_en": "Mining tokens are gaining attention again as investors react to emerging AI algorithms optimizing crypto extraction. This could reshape the market.",
     "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "timestamp": None
 }
