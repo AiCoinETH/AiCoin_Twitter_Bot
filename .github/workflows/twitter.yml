@@ -1,7 +1,3 @@
-from pathlib import Path
-
-# Создаём тестовый GitHub Actions workflow для ручного запуска
-test_workflow = """
 name: Test Twitter Bot
 
 on:
@@ -41,10 +37,3 @@ jobs:
         run: |
           echo "Running twitter_bot.py"
           python twitter_bot.py
-"""
-
-# Сохраняем workflow-файл
-workflow_path = Path("/mnt/data/twitter_test.yml")
-workflow_path.write_text(test_workflow.strip(), encoding="utf-8")
-
-workflow_path.name
