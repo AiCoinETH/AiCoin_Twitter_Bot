@@ -1,3 +1,4 @@
+
 import os
 import openai
 import asyncio
@@ -28,14 +29,11 @@ keyboard = InlineKeyboardMarkup([
 ])
 
 async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
-    try:
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=post_data["text"],
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при отправке поста: {e}")
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text=post_data["text"],
+        reply_markup=keyboard
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -44,7 +42,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
-        # Здесь будет логика публикации
+        # здесь вставляется публикация в Twitter и Telegram
     elif action == "regenerate":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="♻️ Генерирую новый пост...")
         await send_post_for_approval()
@@ -59,7 +57,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_post["active"] = True
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
     else:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❓ Неизвестная команда: {action}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"Неизвестная команда: {action}")
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
