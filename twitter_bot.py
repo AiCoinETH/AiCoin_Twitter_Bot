@@ -61,7 +61,6 @@ async def send_post_for_approval(update: Update, context: ContextTypes.DEFAULT_T
 {text}""",
         parse_mode="Markdown",
         reply_markup=build_keyboard()
-    )
     context.job_queue.run_once(timeout_autopost, 180)
 
 async def timeout_autopost(context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +144,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 {text}""",
             parse_mode="Markdown",
             reply_markup=build_keyboard()
-        )
         state["mode"] = None
     elif state["mode"] == "chat":
         prompt = update.message.text
@@ -158,7 +156,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
-    ), 1)
+    
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
