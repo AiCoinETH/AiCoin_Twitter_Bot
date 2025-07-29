@@ -33,6 +33,13 @@ keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]
 ])
 
+ru_variants = [
+    "Майнинговые токены снова в фокусе...",
+    "Инвесторы проявляют повышенный интерес к майнинговым токенам...",
+    "Новые AI-алгоритмы меняют подход к добыче криптовалют..."
+]
+variant_index = 0
+
 def load_post_history():
     if not os.path.exists(POST_HISTORY_FILE):
         return []
@@ -92,6 +99,7 @@ async def publish_post():
     print("Twitter пост:", twitter_text)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global variant_index
     query = update.callback_query
     await query.answer()
     action = query.data
@@ -101,7 +109,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_post["active"] = False
         await publish_post()
     elif action == "regenerate":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="♻️ Генерирую новый пост...")
+        variant_index = (variant_index + 1) % len(ru_variants)
+        post_data["text_ru"] = ru_variants[variant_index]
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="♻️ Новый вариант поста:")
         await send_post_for_approval()
     elif action == "new_image":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🖼️ Генерирую новую картинку...")
@@ -110,22 +120,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Переход в режим диалога. Напишите сообщение.")
     elif action == "end_dialog":
         in_dialog["active"] = False
-        twitter_core = "... Read more: t.me/AiCoin_ETH #AiCoin $Ai"
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": "Сформируй короткий пост на английском до 280 символов, включая ссылку и хештеги, на тему: " + post_data["text_ru"]}]
-            )
-            post_data["text_en"] = response.choices[0].message.content.strip()
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_ru"],
-                reply_markup=keyboard
-            )
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Диалог завершен. Пост сформирован и отправлен на согласование.")
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"Ошибка при генерации поста: {e}")
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_ru"],
+            reply_markup=keyboard
+        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Диалог завершен. Пост сформирован и отправлен на согласование.")
     elif action == "cancel":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
         pending_post["active"] = False
@@ -148,34 +149,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
     user_message = update.message.text
-    if user_message.lower() == "/end":
-        in_dialog["active"] = False
-        twitter_core = "... Read more: t.me/AiCoin_ETH #AiCoin $Ai"
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": "Сформируй короткий пост на английском до 280 символов, включая ссылку и хештеги, на тему: " + post_data["text_ru"]}]
-            )
-            post_data["text_en"] = response.choices[0].message.content.strip()
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_ru"],
-                reply_markup=keyboard
-            )
-            await update.message.reply_text("Диалог завершен. Пост сформирован и отправлен на согласование.")
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка при генерации поста: {e}")
-        return
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": user_message}]
-        )
-        answer = response.choices[0].message.content.strip()
-        await update.message.reply_text(answer)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при обращении к OpenAI: {e}")
+    await update.message.reply_text("Пока генерация через OpenAI отключена. Введите /end для возврата к кнопкам.")
 
 async def delayed_start(app: Application):
     await asyncio.sleep(2)
