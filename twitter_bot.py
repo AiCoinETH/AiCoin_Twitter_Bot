@@ -153,9 +153,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = image_variants[image_index]
         await send_post_for_approval()
     elif action == "new_post":
-        # Заглушка для новой генерации
-        post_data["text_ru"] = "[Заглушка] Новый пост."
-        post_data["text_en"] = "[Placeholder] New post."
+        variant_index = (variant_index + 1) % len(ru_variants)
+        image_index = (image_index + 1) % len(image_variants)
+        post_data["text_ru"] = ru_variants[variant_index]
+        post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
         post_data["image_url"] = image_variants[image_index]
         await send_post_for_approval()
     elif action == "chat":
@@ -171,6 +172,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_post["active"] = False
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
     elif action == "think":
+        pending_post["active"] = True
+        pending_post["timer"] = datetime.now()
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
         await send_post_for_approval()
 
