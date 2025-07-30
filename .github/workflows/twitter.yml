@@ -8,8 +8,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Бот для модерации (группа)
       TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
       TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
+      # Бот для публикации (канал)
+      TELEGRAM_BOT_TOKEN_CHANNEL: ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
       TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
       # Используйте только username (если канал публичный)!
 
