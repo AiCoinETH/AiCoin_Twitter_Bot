@@ -80,11 +80,20 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-pending_post         = {"active": False, "timer": None}
+# ========== ТАЙМЕРЫ ==========
+TIMER_PUBLISH_DEFAULT = 180    # 3 минуты после отправки на модерацию
+TIMER_PUBLISH_EXTEND  = 900    # 15 минут после любого нажатия кнопки
+
+pending_post         = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb       = {"active": False}
 last_action_time     = {}
 approval_message_ids = {"photo": None}
 DB_FILE = "post_history.db"
+
+def reset_timer(timeout=None):
+    pending_post["timer"] = datetime.now()
+    if timeout:
+        pending_post["timeout"] = timeout
 
 # ========== КЛАВИАТУРЫ ==========
 keyboard = InlineKeyboardMarkup([
@@ -144,7 +153,19 @@ def publish_post_to_twitter(text, image_url=None):
         logging.info("Пост успешно опубликован в Twitter!")
         return True
     except Exception as e:
+        pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
+        # Информируем пользователя (асинхронно)
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Twitter: {e}\n"
+                 "Проверьте:\n"
+                 "- Действительность ключей/токенов\n"
+                 "- Лимиты публикации (Twitter API)\n"
+                 "- Формат медиа\n"
+                 "- Права доступа\n"
+                 "Пост не будет опубликован повторно автоматически."
+        ))
         return False
 
 # ========== ИНИЦИАЛИЗАЦИЯ БД ==========
@@ -188,7 +209,11 @@ async def send_post_for_approval():
         return
 
     post_data["timestamp"] = datetime.now()
-    pending_post.update({"active": True, "timer": datetime.now()})
+    pending_post.update({
+        "active": True,
+        "timer": datetime.now(),
+        "timeout": TIMER_PUBLISH_DEFAULT
+    })
     try:
         photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -215,18 +240,21 @@ async def publish_post_to_channel():
             text=f"✅ Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}!\n\nСсылка: https://t.me/{TELEGRAM_CHANNEL_USERNAME_ID.lstrip('@')}/{msg.message_id}"
         )
     except telegram.error.Forbidden as e:
+        pending_post["active"] = False
         logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="❌ Не удалось опубликовать пост: у бота нет прав или он не в канале!"
         )
     except telegram.error.BadRequest as e:
+        pending_post["active"] = False
         logging.error(f"BadRequest: Проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"❌ Ошибка: проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}!"
         )
     except Exception as e:
+        pending_post["active"] = False
         logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -239,24 +267,36 @@ async def publish_post_to_channel():
 # ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
-        await asyncio.sleep(0.3)
-        if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
-            try:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text="⌛ Время ожидания истекло. Публикую автоматически."
-                )
-            except Exception:
-                pass
-            await publish_post_to_channel()
-            twitter_text = build_twitter_post(post_data["text_en"])
-            publish_post_to_twitter(twitter_text, post_data["image_url"])
-            pending_post["active"] = False
+        await asyncio.sleep(0.5)
+        if pending_post["active"] and pending_post.get("timer"):
+            passed = (datetime.now() - pending_post["timer"]).total_seconds()
+            if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
+                try:
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="⌛ Время ожидания истекло. Публикую автоматически."
+                    )
+                    await publish_post_to_channel()
+                    twitter_text = build_twitter_post(post_data["text_en"])
+                    publish_post_to_twitter(twitter_text, post_data["image_url"])
+                    logging.info("Автоматическая публикация произведена.")
+                except Exception as e:
+                    pending_post["active"] = False
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text=f"❌ Ошибка при автопубликации: {e}\nВозможные действия: проверьте ключи, лимиты, права бота, лимиты Twitter/Telegram."
+                    )
+                    logging.error(f"Ошибка при автопубликации: {e}")
+                pending_post["active"] = False  # Остановить все таймеры этого поста
 
 # ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data
     await update.callback_query.answer()
+    # --- Если пост не опубликован, продлеваем таймер на 15 минут ---
+    if pending_post["active"]:
+        reset_timer(TIMER_PUBLISH_EXTEND)
+
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
@@ -310,34 +350,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = context.user_data.get("publish_mode", "twitter")
         twitter_text = build_twitter_post(post_data["text_en"])
         twitter_success = False
+        telegram_success = False
         if mode == "twitter":
             twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+            pending_post["active"] = False
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
                 reply_markup=keyboard
             )
         elif mode == "telegram":
-            await channel_bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
-            )
+            try:
+                await channel_bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
+                )
+                telegram_success = True
+            except Exception as e:
+                logging.error(f"Ошибка при публикации в Telegram: {e}")
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Не удалось отправить в Telegram: {e}"
+                )
+            pending_post["active"] = False
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="✅ Успешно отправлено в Telegram!",
+                text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
                 reply_markup=keyboard
             )
         elif mode == "both":
-            await channel_bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
-            )
+            try:
+                await channel_bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
+                )
+                telegram_success = True
+            except Exception as e:
+                logging.error(f"Ошибка при публикации в Telegram: {e}")
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Не удалось отправить в Telegram: {e}"
+                )
             twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+            pending_post["active"] = False
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="✅ Успешно отправлено в Telegram!",
+                text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
                 reply_markup=keyboard
             )
             await approval_bot.send_message(
@@ -345,10 +405,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
                 reply_markup=keyboard
             )
-        await send_post_for_approval()
+        # После публикации повторное согласование не вызываем!
         return
     if action == "cancel_to_main":
-        await send_post_for_approval()
+        # Только если пост еще не опубликован:
+        if pending_post["active"]:
+            await send_post_for_approval()
         return
     if action == "cancel_to_choice":
         twitter_text = build_twitter_post(post_data["text_en"])
@@ -362,20 +424,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Все остальные действия ---
     if action == 'think':
-        pending_post["timer"] = datetime.now()
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=keyboard)
     elif action == 'regenerate':
         post_data["text_ru"] = f"Новый тестовый текст #{post_data['post_id'] + 1}"
         post_data["post_id"] += 1
-        await send_post_for_approval()
+        if pending_post["active"]:
+            await send_post_for_approval()
     elif action == "new_image":
         post_data["image_url"] = random.choice([img for img in test_images if img != post_data["image_url"]])
-        await send_post_for_approval()
+        if pending_post["active"]:
+            await send_post_for_approval()
     elif action == "new_post":
         post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
-        await send_post_for_approval()
+        if pending_post["active"]:
+            await send_post_for_approval()
     elif action == "chat":
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -393,7 +457,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "restore_previous":
         post_data.update(prev_data)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=keyboard)
-        await send_post_for_approval()
+        if pending_post["active"]:
+            await send_post_for_approval()
     elif action == "end_day":
         pending_post["active"] = False
         do_not_disturb["active"] = True
