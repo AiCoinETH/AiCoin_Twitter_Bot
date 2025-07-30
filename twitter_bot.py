@@ -7,29 +7,72 @@ import re
 from datetime import datetime, timedelta
 from pytz import timezone
 
+import requests
+import tempfile
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import aiosqlite
 import telegram.error
+import tweepy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
+# === TELEGRAM CONFIG ===
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
 
-if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_BOT_TOKEN_CHANNEL or not TELEGRAM_CHANNEL_USERNAME_ID:
-    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID, BOT_TOKEN_CHANNEL или CHANNEL_USERNAME_ID)")
-    exit(1)
-
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
-
 KIEV_TZ = timezone('Europe/Kyiv')
 
-# ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
+# === TWITTER CONFIG ===
+TWITTER_API_KEY = os.getenv("API_KEY")
+TWITTER_API_SECRET = os.getenv("API_SECRET")
+TWITTER_ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+TWITTER_ACCESS_SECRET = os.getenv("ACCESS_SECRET")
+
+def get_twitter_client():
+    auth = tweepy.OAuth1UserHandler(
+        TWITTER_API_KEY, TWITTER_API_SECRET,
+        TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
+    )
+    return tweepy.API(auth)
+
+# === PINATA CONFIG ===
+PINATA_JWT = os.getenv("PINATA_JWT")
+
+def download_image(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
+    tmp_file.write(resp.content)
+    tmp_file.close()
+    return tmp_file.name
+
+def upload_to_pinata(image_path):
+    url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+    headers = {"Authorization": f"Bearer {PINATA_JWT}"}
+    with open(image_path, "rb") as file:
+        files = {'file': file}
+        response = requests.post(url, files=files, headers=headers)
+        response.raise_for_status()
+        cid = response.json()["IpfsHash"]
+        return f"https://gateway.pinata.cloud/ipfs/{cid}"
+
+def publish_tweet_with_pinata(text, image_url):
+    img_path = download_image(image_url)
+    ipfs_url = upload_to_pinata(img_path)
+    api = get_twitter_client()
+    media = api.media_upload(img_path)
+    tweet_text = text + f"\nIPFS: {ipfs_url}"
+    api.update_status(status=tweet_text, media_ids=[media.media_id])
+    os.remove(img_path)
+    return ipfs_url
+
+# === TEST DATA ===
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -54,7 +97,8 @@ approval_message_ids = {"photo": None}
 user_generating      = {}
 DB_FILE = "post_history.db"
 
-# ========== КЛАВИАТУРЫ ==========
+# ========== UI ==========
+
 def build_keyboard(show_back):
     kb = [
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -88,7 +132,7 @@ def post_action_keyboard():
         [InlineKeyboardButton("Отмена", callback_data="cancel_to_choice")]
     ])
 
-# ========== АНТИ-ДУБЛИКАТ (только текст) ==========
+# ========== АНТИ-ДУБЛИКАТ ==========
 def clean_text(text):
     return re.sub(r'\W+', '', text.lower()).strip()
 
@@ -113,23 +157,18 @@ async def save_post_to_history(text, image_url=None):
         )
         await db.commit()
 
-# ========== ФУНКЦИИ ДЛЯ ПОСТРОЕНИЯ ТЕКСТА ==========
-def build_twitter_post(text_en: str) -> str:
-    signature = (
-        "\nRead more on Telegram: t.me/AiCoin_ETH or on the website: https://getaicoin.com/ "
-        "#AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
-    )
-    max_length = 280
-    reserve = max_length - len(signature)
-    if len(text_en) > reserve:
-        main_part = text_en[:reserve - 3].rstrip() + "..."
-    else:
-        main_part = text_en
-    return main_part + signature
+def get_image_hash(url: str) -> str | None:
+    try:
+        r = requests.get(url, timeout=3)
+        r.raise_for_status()
+        return hashlib.sha256(r.content).hexdigest()
+    except Exception as e:
+        logging.warning(f"Не удалось получить хеш изображения: {e}")
+        return None
 
-# ========== ИИ-ЗАГЛУШКИ ==========
+# ========== ГЕНЕРАЦИИ ==========
 async def ai_generate_text():
-    await asyncio.sleep(0.6)  # имитируем работу AI
+    await asyncio.sleep(0.6)
     return f"✨ [AI] Новый сгенерированный текст поста. #{random.randint(1,9999)}"
 
 async def ai_generate_image():
@@ -139,7 +178,6 @@ async def ai_generate_image():
 async def ai_generate_full():
     return await ai_generate_text(), await ai_generate_image()
 
-# ========== АВТО-ГЕНЕРАЦИЯ УНИКАЛЬНОГО ТЕКСТА ==========
 async def generate_unique_text(max_attempts=10):
     attempts = 0
     while attempts < max_attempts:
@@ -158,6 +196,20 @@ async def generate_unique_full(max_attempts=10):
         attempts += 1
     raise Exception("Не удалось сгенерировать уникальный пост за 10 попыток!")
 
+# ========== TWITTER/TG ПОДПИСЬ ==========
+def build_twitter_post(text_en: str) -> str:
+    signature = (
+        "\nRead more on Telegram: t.me/AiCoin_ETH or on the website: https://getaicoin.com/ "
+        "#AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
+    )
+    max_length = 280
+    reserve = max_length - len(signature)
+    if len(text_en) > reserve:
+        main_part = text_en[:reserve - 3].rstrip() + "..."
+    else:
+        main_part = text_en
+    return main_part + signature
+
 # ========== ИНИЦИАЛИЗАЦИЯ БД ==========
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -173,17 +225,6 @@ async def init_db():
             """
         )
         await db.commit()
-    logging.info("База данных инициализирована.")
-
-def get_image_hash(url: str) -> str | None:
-    try:
-        import requests
-        r = requests.get(url, timeout=3)
-        r.raise_for_status()
-        return hashlib.sha256(r.content).hexdigest()
-    except Exception as e:
-        logging.warning(f"Не удалось получить хеш изображения: {e}")
-        return None
 
 # ========== РЕЖИМЫ ==========
 def is_do_not_disturb_active():
@@ -197,7 +238,7 @@ def is_do_not_disturb_active():
 # ========== ОТПРАВКА НА МОДЕРАЦИЮ ==========
 async def send_post_for_approval(show_back=None):
     post_data["timestamp"] = datetime.now()
-    pending_post.update({"active": True, "timer": datetime.now()})  # Важно: стартуем таймер только после показа поста!
+    pending_post.update({"active": True, "timer": datetime.now()})
     if is_do_not_disturb_active():
         if do_not_disturb["reason"] == "auto":
             await auto_publish_everywhere(post_data)
@@ -210,7 +251,6 @@ async def send_post_for_approval(show_back=None):
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="🚫 Сегодня публикаций не будет (режим 'Завершить')."
             )
-        # Сразу сбрасываем таймер
         pending_post["active"] = False
         pending_post["timer"] = None
         return
@@ -225,25 +265,27 @@ async def send_post_for_approval(show_back=None):
             reply_markup=build_keyboard(show_back)
         )
         approval_message_ids["photo"] = photo_msg.message_id
-        logging.info("Пост отправлен на согласование.")
     except Exception as e:
         logging.error(f"Ошибка при отправке на согласование: {e}")
 
-# ========== ПУБЛИКАЦИЯ В КАНАЛ И TWITTER (заглушка) ==========
+# ========== ПУБЛИКАЦИЯ В TG, TWITTER, PINATA ==========
 async def auto_publish_everywhere(post_data):
+    # Telegram
     await channel_bot.send_photo(
         chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
         photo=post_data["image_url"],
         caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
     )
-    twitter_text = build_twitter_post(post_data["text_en"])
-    logging.info(f"[TWITTER] Опубликовано: {twitter_text}")
+    # Twitter + Pinata
+    tweet_text = build_twitter_post(post_data["text_en"])
+    ipfs_url = publish_tweet_with_pinata(tweet_text, post_data["image_url"])
+    logging.info(f"[TWITTER] Опубликовано: {tweet_text}\nIPFS: {ipfs_url}")
 
-# ========== ТАЙМЕР МОДЕРАЦИИ И АВТОВЫКЛЮЧЕНИЕ ==========
+# ========== ТАЙМЕР ==========
+
 async def check_timer():
     while True:
         await asyncio.sleep(5)
-        # Авто-выключение режимов после полуночи
         if do_not_disturb["active"] and do_not_disturb["until"]:
             now = datetime.now(KIEV_TZ)
             if now > do_not_disturb["until"]:
@@ -252,7 +294,6 @@ async def check_timer():
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text="Режим дня завершён. Согласование снова включено."
                 )
-        # Авто-публикация по истечении 15 минут после показа поста на модерации
         if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(minutes=15):
             try:
                 await approval_bot.send_message(
@@ -271,7 +312,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     user_id = update.effective_user.id
 
-    # --- Проверка: идёт ли генерация? ---
     if user_generating.get(user_id, False):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -290,12 +330,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
-
-    # ====== Сброс таймера по ЛЮБОЙ кнопке ======
     pending_post["active"] = False
     pending_post["timer"] = None
 
-    # ====== РЕЖИМЫ ======
     if is_do_not_disturb_active():
         if do_not_disturb["reason"] == "auto":
             await auto_publish_everywhere(post_data)
@@ -310,7 +347,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # --- "✅ Пост" ---
     if action == 'approve':
         twitter_text = build_twitter_post(post_data["text_en"])
         await approval_bot.send_photo(
@@ -353,7 +389,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "post_en":
         mode = context.user_data.get("publish_mode", "twitter")
         if mode == "twitter":
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!")
+            ipfs_url = publish_tweet_with_pinata(post_data["text_en"], post_data["image_url"])
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"✅ Успешно отправлено в Twitter!\nIPFS: {ipfs_url}")
             await asyncio.sleep(1.5)
             await send_post_for_approval(show_back=bool(post_history))
         elif mode == "telegram":
@@ -366,13 +403,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1.5)
             await send_post_for_approval(show_back=bool(post_history))
         elif mode == "both":
+            ipfs_url = publish_tweet_with_pinata(post_data["text_en"], post_data["image_url"])
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"✅ Успешно отправлено в Twitter!\nIPFS: {ipfs_url}")
             await channel_bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
             )
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!")
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!")
             await asyncio.sleep(2)
             await send_post_for_approval(show_back=bool(post_history))
         return
@@ -389,7 +427,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Генерации через ИИ ---
     if action == 'regenerate':
         user_generating[user_id] = True
         post_history.append(post_data.copy())
@@ -437,7 +474,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval(show_back=bool(post_history))
         return
 
-    # --- Поговорить (чат режим) ---
     if action == "chat":
         context.user_data["chat_mode"] = True
         await approval_bot.send_message(
@@ -450,7 +486,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Режим "Не беспокоить" ---
     if action == "do_not_disturb":
         now = datetime.now(KIEV_TZ)
         end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -462,7 +497,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Завершить день ---
     if action == "end_day":
         now = datetime.now(KIEV_TZ)
         end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -474,7 +508,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Снова включить модерацию/публикации ---
     if action == "enable_moderation":
         do_not_disturb.update({"active": False, "until": None, "reason": None})
         await approval_bot.send_message(
@@ -484,7 +517,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# ========== ЧАТ-МОД РЕАЛИЗАЦИЯ ==========
+# ========== ЧАТ-МОД ==========
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("chat_mode"):
         user_text = update.message.text
@@ -493,7 +526,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_text.strip().lower() in ['завершить', 'end', 'стоп', 'готово']:
             context.user_data["chat_mode"] = False
             post_history.append(post_data.copy())
-            post_data["text_ru"] = f"📝 [AI Chat] Итоговый пост: {user_text}"  # Можно подставить результат диалога
+            post_data["text_ru"] = f"📝 [AI Chat] Итоговый пост: {user_text}"
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Беседа завершена. Новый пост создан!")
             await send_post_for_approval(show_back=True)
 
@@ -502,10 +535,8 @@ async def delayed_start(app: Application):
     await init_db()
     await send_post_for_approval(show_back=False)
     asyncio.create_task(check_timer())
-    logging.info("Бот запущен и готов к работе.")
 
 def main():
-    logging.info("Старт Telegram бота модерации и публикации…")
     app = Application.builder()\
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)\
         .post_init(delayed_start)\
