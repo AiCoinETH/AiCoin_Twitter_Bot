@@ -196,6 +196,8 @@ def is_do_not_disturb_active():
 
 # ========== ОТПРАВКА НА МОДЕРАЦИЮ ==========
 async def send_post_for_approval(show_back=None):
+    post_data["timestamp"] = datetime.now()
+    pending_post.update({"active": True, "timer": datetime.now()})  # Важно: стартуем таймер только после показа поста!
     if is_do_not_disturb_active():
         if do_not_disturb["reason"] == "auto":
             await auto_publish_everywhere(post_data)
@@ -208,12 +210,13 @@ async def send_post_for_approval(show_back=None):
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="🚫 Сегодня публикаций не будет (режим 'Завершить')."
             )
+        # Сразу сбрасываем таймер
+        pending_post["active"] = False
+        pending_post["timer"] = None
         return
 
     if show_back is None:
         show_back = bool(post_history)
-    post_data["timestamp"] = datetime.now()
-    pending_post.update({"active": True, "timer": datetime.now()})
     try:
         photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -240,6 +243,7 @@ async def auto_publish_everywhere(post_data):
 async def check_timer():
     while True:
         await asyncio.sleep(5)
+        # Авто-выключение режимов после полуночи
         if do_not_disturb["active"] and do_not_disturb["until"]:
             now = datetime.now(KIEV_TZ)
             if now > do_not_disturb["until"]:
@@ -248,16 +252,18 @@ async def check_timer():
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text="Режим дня завершён. Согласование снова включено."
                 )
-        if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
+        # Авто-публикация по истечении 15 минут после показа поста на модерации
+        if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(minutes=15):
             try:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text="⌛ Время ожидания истекло. Публикую автоматически."
+                    text="⌛ Время ожидания истекло (15 минут). Публикую автоматически."
                 )
             except Exception:
                 pass
             await auto_publish_everywhere(post_data)
             pending_post["active"] = False
+            pending_post["timer"] = None
 
 # ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,6 +290,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
+
+    # ====== Сброс таймера по ЛЮБОЙ кнопке ======
+    pending_post["active"] = False
+    pending_post["timer"] = None
 
     # ====== РЕЖИМЫ ======
     if is_do_not_disturb_active():
