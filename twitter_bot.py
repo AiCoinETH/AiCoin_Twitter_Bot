@@ -172,11 +172,9 @@ async def publish_post():
     text_in_progress = image_in_progress = full_in_progress = chat_in_progress = False
 
 async def check_timer():
--    while True:
--        await asyncio.sleep(5)
-+    while True:
-+        await asyncio.sleep(1)
-        if pending_post["active"] and pending_post["timer"] and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
+    while True:
+        await asyncio.sleep(1)
+        if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
             try:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -201,7 +199,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Публикую...")
         await publish_post()
     elif action == 'think':
-        if countdown_task and not countdown_task.done(): countdown_task.cancel()
+        if countdown_task and not countdown_task.done():
+            countdown_task.cancel()
         pending_post["timer"] = datetime.now()
         await send_timer_message()
     # ... другие обработки действий ...
@@ -218,6 +217,5 @@ if __name__ == "__main__":
         .post_init(delayed_start)\
         .build()
     app.add_handler(CallbackQueryHandler(button_handler))
--    app.run_polling()
-+    # Чаще опрашиваем сервер (Long Polling) для более быстрой реакции
-+    app.run_polling(poll_interval=0.5, timeout=1)
+    # Чаще опрашиваем сервер (Long Polling) для быстрой реакции
+    app.run_polling(poll_interval=0.5, timeout=1)
