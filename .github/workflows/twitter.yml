@@ -8,8 +8,10 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}                # токен бота
-      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_username_ID }}     # username канала, например '@AiCoin_ETH'
+      TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
+      TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
+      TELEGRAM_APPROVAL_USER_ID: ${{ secrets.TELEGRAM_APPROVAL_USER_ID }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PINATA_JWT: ${{ secrets.PINATA_JWT }}
       API_KEY: ${{ secrets.API_KEY }}
