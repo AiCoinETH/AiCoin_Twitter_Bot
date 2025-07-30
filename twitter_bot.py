@@ -179,8 +179,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "think":
         pending_post["active"] = True
         pending_post["timer"] = datetime.now()
-        post_data["post_id"] += 1
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
         await send_post_for_approval()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
