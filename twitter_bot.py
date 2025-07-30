@@ -113,7 +113,7 @@ async def publish_post():
     max_length = 280 - len(footer)
     short_text = full_text[:max_length].rstrip() + " " + footer
 
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text)
 " + short_text)
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
