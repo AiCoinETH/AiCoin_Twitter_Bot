@@ -114,13 +114,16 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
     
         )
 
-    countdown_msg = try:
+    try:
+        countdown_msg = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
+        )
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
         )
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        await approval_bot.send_message(
+        countdown_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
         )
 
