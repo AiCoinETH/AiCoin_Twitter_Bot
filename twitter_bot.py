@@ -13,15 +13,11 @@ import random
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # <-- Для публикации в канал
-
-# Проверка переменных
-print("TELEGRAM_BOT_TOKEN_APPROVAL:", str(TELEGRAM_BOT_TOKEN_APPROVAL)[:10] if TELEGRAM_BOT_TOKEN_APPROVAL else None)
-print("TELEGRAM_APPROVAL_CHAT_ID:", TELEGRAM_APPROVAL_CHAT_ID)
-print("TELEGRAM_CHANNEL_ID:", TELEGRAM_CHANNEL_ID)
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # <-- для публикаций
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
+# Список тестовых картинок
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -141,17 +137,20 @@ async def send_timer_message():
     countdown_task = asyncio.create_task(update_countdown_reset(approval_message_ids["timer"]))
 
 async def publish_post():
-    print("ПУБЛИКАЦИЯ В КАНАЛ:", TELEGRAM_CHANNEL_ID)
     if TELEGRAM_CHANNEL_ID:
         try:
-            msg = await approval_bot.send_photo(
+            await approval_bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_ru"]
             )
-            print("УСПЕШНО отправлено! Message id:", msg.message_id)
-        except Exception as e:
-            print("ОШИБКА ПРИ ПУБЛИКАЦИИ:", e)
+        except telegram.error.RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                photo=post_data["image_url"],
+                caption=post_data["text_ru"]
+            )
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     pending_post["active"] = False
 
@@ -185,6 +184,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         action = query.data
+
         if action != 'approve':
             pending_post["timer"] = datetime.now()
 
@@ -201,6 +201,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
             await publish_post()
         elif action == 'regenerate':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации нового текста
             text_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация нового текста (тест)...")
@@ -212,6 +213,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 text_in_progress = False
         elif action == 'new_image':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации новой картинки
             image_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация новой картинки (тест)...")
@@ -224,6 +226,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 image_in_progress = False
         elif action == 'new_post':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации всего поста
             full_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация полного поста и картинки (тест)...")
