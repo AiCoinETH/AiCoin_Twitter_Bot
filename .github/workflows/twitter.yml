@@ -11,6 +11,7 @@ jobs:
       TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
       TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      # Не используйте одновременно переменные для username и id! Достаточно одной.
 
       # Дополнительные переменные — раскомментируйте если нужны:
       # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
