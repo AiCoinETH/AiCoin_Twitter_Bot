@@ -30,13 +30,20 @@ ru_variants = [
     "Инвесторы проявляют повышенный интерес к майнинговым токенам...",
     "Новые AI-алгоритмы меняют подход к добыче криптовалют..."
 ]
+image_variants = [
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/June_odd-eyed-cat.jpg/440px-June_odd-eyed-cat.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0a/Cat_03.jpg/480px-Cat_03.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5e/Sleeping_cat_on_her_back.jpg/480px-Sleeping_cat_on_her_back.jpg"
+]
 variant_index = 0
+image_index = 0
 DB_FILE = "post_history.db"
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
-    [InlineKeyboardButton("♻️ Еще один", callback_data="regenerate")],
-    [InlineKeyboardButton("🖼️ Картинку", callback_data="new_image")],
+    [InlineKeyboardButton("📝 Новый текст", callback_data="regenerate")],
+    [InlineKeyboardButton("🖼️ Новая картинка", callback_data="new_image")],
+    [InlineKeyboardButton("🆕 Пост целиком", callback_data="new_post")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
     [InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]
 ])
@@ -128,7 +135,7 @@ async def publish_post():
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global variant_index
+    global variant_index, image_index
     query = update.callback_query
     await query.answer()
     action = query.data
@@ -142,7 +149,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["text_ru"] = ru_variants[variant_index]
         await send_post_for_approval()
     elif action == "new_image":
-        post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+        image_index = (image_index + 1) % len(image_variants)
+        post_data["image_url"] = image_variants[image_index]
+        await send_post_for_approval()
+    elif action == "new_post":
+        # Заглушка для новой генерации
+        post_data["text_ru"] = "[Заглушка] Новый пост."
+        post_data["text_en"] = "[Placeholder] New post."
+        post_data["image_url"] = image_variants[image_index]
         await send_post_for_approval()
     elif action == "chat":
         in_dialog["active"] = True
