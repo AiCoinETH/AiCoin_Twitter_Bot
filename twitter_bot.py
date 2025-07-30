@@ -1,3 +1,4 @@
+
 # Исправленный и очищенный файл telegram-бота для публикации и модерации постов
 import os
 import openai
@@ -9,7 +10,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters, CommandHandler
 import aiosqlite
 
-# Переменные окружения
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
@@ -17,7 +17,6 @@ TELEGRAM_PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
-# Объекты и данные
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 post_data = {
     "text_ru": "Майнинговые токены снова в фокусе...",
@@ -41,10 +40,9 @@ keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("♻️ Еще один", callback_data="regenerate")],
     [InlineKeyboardButton("🖼️ Картинку", callback_data="new_image")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel"), InlineKeyboardButton("✅ Завершить диалог", callback_data="end_dialog")]
+    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]
 ])
 
-# Работа с базой данных
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -83,7 +81,6 @@ async def is_duplicate(text, image_url=None):
                     return True
     return False
 
-# Логика публикации и модерации
 async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
     if do_not_disturb["active"]:
         return
@@ -116,30 +113,38 @@ async def publish_post():
     max_length = 280 - len(footer)
     short_text = full_text[:max_length].rstrip() + " " + footer
 
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия:\n" + short_text)
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия:
+" + short_text)
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
         await approval_bot.send_photo(
             chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
             photo=post_data["image_url"],
-            caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
+            caption=post_data["text_en"] + "
+
+📎 Читайте нас также на сайте: https://getaicoin.com/"
         )
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
+        caption=post_data["text_ru"] + "
+
+Полный текст: " + post_data["text_en"]
     )
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
         await approval_bot.send_photo(
             chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
             photo=post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/\n\n#AiCoin $Ai"
+            caption=post_data["text_ru"] + "
+
+👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/
+
+#AiCoin $Ai"
         )
 
-# Обработчики событий
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global variant_index
     query = update.callback_query
@@ -172,13 +177,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "cancel":
         pending_post["active"] = False
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
-    elif action == "end_dialog":
-        in_dialog["active"] = False
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="📤 [Заглушка] Генерирую пост и изображение после завершения диалога..."
-        )
-        await send_post_for_approval()
     elif action == "think":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд")
         pending_post["timer"] = datetime.now()
