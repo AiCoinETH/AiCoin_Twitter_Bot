@@ -72,6 +72,7 @@ async def save_post_to_history(text, image_url=None):
 
 def get_image_hash(image_url):
     try:
+        pass
         import requests
         response = requests.get(image_url)
         return hashlib.sha256(response.content).hexdigest()
@@ -95,7 +96,8 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
     pending_post["timer"] = datetime.now()
 
     try:
-            await approval_bot.send_photo(
+        pass
+        await approval_bot.send_photo(
             
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
@@ -115,6 +117,7 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         )
 
     try:
+        pass
         countdown_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
         )
@@ -131,7 +134,8 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         for i in range(59, -1, -1):
             await asyncio.sleep(1)
             try:
-                    await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=message_id, text=f"⏳ Таймер: {i} секунд")
+                pass
+                await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=message_id, text=f"⏳ Таймер: {i} секунд")
             except:
                 pass
 
@@ -144,7 +148,8 @@ async def publish_post():
     short_text = full_text[:max_length].rstrip() + " " + footer
 
     try:
-            await approval_bot.send_message(
+        pass
+        await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
         )
     except telegram.error.RetryAfter as e:
@@ -175,7 +180,8 @@ async def publish_post():
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     try:
-            await approval_bot.send_photo(
+        pass
+        await approval_bot.send_photo(
             
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
