@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import logging
 import random
+import re
 from datetime import datetime, timedelta
 from pytz import timezone
 
@@ -50,6 +51,7 @@ pending_post         = {"active": False, "timer": None}
 do_not_disturb       = {"active": False, "until": None, "reason": None}
 last_action_time     = {}
 approval_message_ids = {"photo": None}
+user_generating      = {}
 DB_FILE = "post_history.db"
 
 # ========== КЛАВИАТУРЫ ==========
@@ -86,6 +88,31 @@ def post_action_keyboard():
         [InlineKeyboardButton("Отмена", callback_data="cancel_to_choice")]
     ])
 
+# ========== АНТИ-ДУБЛИКАТ (только текст) ==========
+def clean_text(text):
+    return re.sub(r'\W+', '', text.lower()).strip()
+
+def text_hash(text):
+    cleaned = clean_text(text)
+    return hashlib.sha256(cleaned.encode('utf-8')).hexdigest()
+
+async def is_duplicate_text(text):
+    hash_text_val = text_hash(text)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT 1 FROM posts WHERE text_hash = ? LIMIT 1", (hash_text_val,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+async def save_post_to_history(text, image_url=None):
+    hash_text_val = text_hash(text)
+    image_hash = get_image_hash(image_url) if image_url else None
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO posts (text, text_hash, timestamp, image_hash) VALUES (?, ?, ?, ?)",
+            (text, hash_text_val, datetime.now().isoformat(), image_hash)
+        )
+        await db.commit()
+
 # ========== ФУНКЦИИ ДЛЯ ПОСТРОЕНИЯ ТЕКСТА ==========
 def build_twitter_post(text_en: str) -> str:
     signature = (
@@ -102,13 +129,34 @@ def build_twitter_post(text_en: str) -> str:
 
 # ========== ИИ-ЗАГЛУШКИ ==========
 async def ai_generate_text():
+    await asyncio.sleep(0.6)  # имитируем работу AI
     return f"✨ [AI] Новый сгенерированный текст поста. #{random.randint(1,9999)}"
 
 async def ai_generate_image():
+    await asyncio.sleep(0.4)
     return random.choice(test_images)
 
 async def ai_generate_full():
     return await ai_generate_text(), await ai_generate_image()
+
+# ========== АВТО-ГЕНЕРАЦИЯ УНИКАЛЬНОГО ТЕКСТА ==========
+async def generate_unique_text(max_attempts=10):
+    attempts = 0
+    while attempts < max_attempts:
+        new_text = await ai_generate_text()
+        if not await is_duplicate_text(new_text):
+            return new_text
+        attempts += 1
+    raise Exception("Не удалось сгенерировать уникальный текст за 10 попыток!")
+
+async def generate_unique_full(max_attempts=10):
+    attempts = 0
+    while attempts < max_attempts:
+        new_text, new_image = await ai_generate_full()
+        if not await is_duplicate_text(new_text):
+            return new_text, new_image
+        attempts += 1
+    raise Exception("Не удалось сгенерировать уникальный пост за 10 попыток!")
 
 # ========== ИНИЦИАЛИЗАЦИЯ БД ==========
 async def init_db():
@@ -118,6 +166,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
+                text_hash TEXT,
                 timestamp TEXT NOT NULL,
                 image_hash TEXT
             )
@@ -135,16 +184,6 @@ def get_image_hash(url: str) -> str | None:
     except Exception as e:
         logging.warning(f"Не удалось получить хеш изображения: {e}")
         return None
-
-async def save_post_to_history(text, image_url=None):
-    image_hash = get_image_hash(image_url) if image_url else None
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
-            (text, datetime.now().isoformat(), image_hash)
-        )
-        await db.commit()
-    logging.info("Пост сохранён в историю.")
 
 # ========== РЕЖИМЫ ==========
 def is_do_not_disturb_active():
@@ -189,22 +228,18 @@ async def send_post_for_approval(show_back=None):
 
 # ========== ПУБЛИКАЦИЯ В КАНАЛ И TWITTER (заглушка) ==========
 async def auto_publish_everywhere(post_data):
-    # Telegram
     await channel_bot.send_photo(
         chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
         photo=post_data["image_url"],
         caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
     )
-    # Twitter — заглушка!
     twitter_text = build_twitter_post(post_data["text_en"])
-    # Здесь может быть ваш вызов API Twitter
     logging.info(f"[TWITTER] Опубликовано: {twitter_text}")
 
 # ========== ТАЙМЕР МОДЕРАЦИИ И АВТОВЫКЛЮЧЕНИЕ ==========
 async def check_timer():
     while True:
         await asyncio.sleep(5)
-        # Автоматически сбрасываем режимы после полуночи
         if do_not_disturb["active"] and do_not_disturb["until"]:
             now = datetime.now(KIEV_TZ)
             if now > do_not_disturb["until"]:
@@ -229,10 +264,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data
     await update.callback_query.answer()
     user_id = update.effective_user.id
-    now = datetime.now()
-    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=build_keyboard(bool(post_history)))
+
+    # --- Проверка: идёт ли генерация? ---
+    if user_generating.get(user_id, False):
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⏳ Идёт генерация. Пожалуйста, дождитесь завершения предыдущей операции."
+        )
         return
+
+    now = datetime.now()
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 1:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⏳ Не нажимайте слишком часто!"
+        )
+        return
+
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
@@ -333,21 +381,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Генерации через ИИ ---
     if action == 'regenerate':
+        user_generating[user_id] = True
         post_history.append(post_data.copy())
-        post_data["text_ru"] = await ai_generate_text()
-        # Тут можно добавить генерацию английского (если надо)
-        await send_post_for_approval(show_back=True)
+        try:
+            post_data["text_ru"] = await generate_unique_text()
+            await send_post_for_approval(show_back=True)
+        except Exception as e:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"⚠️ Не удалось сгенерировать уникальный текст (возможно проблема с генерацией или все варианты уже были). Попробуйте позже или перезапустите бота.\nОшибка: {e}"
+            )
+        user_generating[user_id] = False
         return
-    if action == 'new_image':
-        post_history.append(post_data.copy())
-        post_data["image_url"] = await ai_generate_image()
-        await send_post_for_approval(show_back=True)
-        return
+
     if action == 'new_post':
+        user_generating[user_id] = True
         post_history.append(post_data.copy())
-        post_data["text_ru"], post_data["image_url"] = await ai_generate_full()
-        await send_post_for_approval(show_back=True)
+        try:
+            post_data["text_ru"], post_data["image_url"] = await generate_unique_full()
+            await send_post_for_approval(show_back=True)
+        except Exception as e:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"⚠️ Не удалось сгенерировать уникальный пост (возможно проблема с генерацией или все варианты уже были). Попробуйте позже или перезапустите бота.\nОшибка: {e}"
+            )
+        user_generating[user_id] = False
         return
+
+    if action == 'new_image':
+        user_generating[user_id] = True
+        post_history.append(post_data.copy())
+        try:
+            post_data["image_url"] = await ai_generate_image()
+            await send_post_for_approval(show_back=True)
+        except Exception as e:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"⚠️ Не удалось сгенерировать картинку: {e}\nПопробуйте позже или перезапустите бота."
+            )
+        user_generating[user_id] = False
+        return
+
     if action == "restore_previous" and post_history:
         post_data.update(post_history.pop())
         await send_post_for_approval(show_back=bool(post_history))
@@ -403,7 +477,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== ЧАТ-МОД РЕАЛИЗАЦИЯ ==========
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("chat_mode"):
-        # Пример простой логики (можно GPT ответ)
         user_text = update.message.text
         answer = f"🤖 [AI] Ответ на: {user_text}\n(Тут будет генерация от ИИ)"
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=answer)
