@@ -6,7 +6,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
-import openai
+import random
 
 # AI-инструменты и документация: https://gptonline.ai/
 
@@ -14,14 +14,20 @@ TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
 TELEGRAM_PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
+# Список тестовых картинок
+test_images = [
+    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
+    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
+]
+
 post_data = {
     "text_ru": "Майнинговые токены снова в фокусе...",
-    "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+    "image_url": test_images[0],
     "timestamp": None,
     "post_id": 0
 }
@@ -180,7 +186,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сброс таймера автопубликации на ЛЮБУЮ кнопку (кроме одобрения/публикации)
         action = query.data
 
-        # НЕ обновляем таймер только при явном подтверждении публикации!
         if action != 'approve':
             pending_post["timer"] = datetime.now()
 
@@ -197,14 +202,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
             await publish_post()
         elif action == 'regenerate':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации нового текста
             text_in_progress = True
             try:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация нового текста...")
-                resp = await openai.ChatCompletion.acreate(
-                    model='gpt-3.5-turbo',
-                    messages=[{'role':'system','content':'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
-                )
-                post_data['text_ru'] = resp.choices[0].message.content.strip()
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация нового текста (тест)...")
+                post_data['text_ru'] = f"Тестовый новый текст {post_data['post_id'] + 1}"
                 post_data['post_id'] += 1
                 await send_post_for_approval()
             except Exception as e:
@@ -212,10 +214,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 text_in_progress = False
         elif action == 'new_image':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации новой картинки
             image_in_progress = True
             try:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация новой картинки...")
-                post_data['image_url'] = post_data['image_url']  # заглушка
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация новой картинки (тест)...")
+                new_image = random.choice([img for img in test_images if img != post_data['image_url']])
+                post_data['image_url'] = new_image
                 post_data['post_id'] += 1
                 await send_post_for_approval()
             except Exception as e:
@@ -223,16 +227,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 image_in_progress = False
         elif action == 'new_post':
+            # ТЕСТОВАЯ ЗАГЛУШКА генерации всего поста
             full_in_progress = True
             try:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация полного поста и картинки...")
-                text_resp = await openai.ChatCompletion.acreate(
-                    model='gpt-3.5-turbo',
-                    messages=[{'role':'system','content':'Сгенерируй полный новостной пост о криптовалютах на русском.'}]
-                )
-                post_data['text_ru'] = text_resp.choices[0].message.content.strip()
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация полного поста и картинки (тест)...")
+                post_data['text_ru'] = f"Тестовый новый пост {post_data['post_id'] + 1}"
+                new_image = random.choice([img for img in test_images if img != post_data['image_url']])
+                post_data['image_url'] = new_image
                 post_data['post_id'] += 1
-                post_data['image_url'] = post_data['image_url']  # заглушка
                 await send_post_for_approval()
             except Exception as e:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
@@ -248,7 +250,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text='💬 [Заглушка] Начало чата с OpenAI\n' + post_data['text_ru']
+                    text='💬 [Заглушка] Начало чата\n' + post_data['text_ru']
                 )
             finally:
                 chat_in_progress = False
