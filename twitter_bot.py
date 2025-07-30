@@ -95,6 +95,7 @@ async def send_post_for_approval():
             caption=post_data["text_ru"],
             reply_markup=keyboard
         )
+    # Запуск обратного отсчёта 60 секунд
     try:
         countdown_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
@@ -145,6 +146,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global text_in_progress, image_in_progress, full_in_progress, chat_in_progress
     query = update.callback_query
     await query.answer()
+    # Если бот занят, сообщаем
     if text_in_progress or image_in_progress or full_in_progress or chat_in_progress:
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -179,7 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data['post_id'] += 1
             await send_post_for_approval()
         except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVALCHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
         finally:
             image_in_progress = False
     elif action == 'new_post':
@@ -197,10 +199,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
         finally:
-            full_in_progress = False
+            full_in-progress = False
     elif action == 'think':
-        # Think лишь обновляет пост и таймер, генерации не выполняется
-        await send_post_for_approval()
+        # Обновляем таймер обратного отсчёта без повторной отправки фото
+        pending_post['timer'] = datetime.now()
+        # Отправляем новое сообщение с таймером и клавиатурой
+        countdown_msg = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⏳ Таймер обновлён: 60 секунд",
+            reply_markup=keyboard
+        )
+        async def update_countdown_reset(message_id):
+            for i in range(59, -1, -1):
+                await asyncio.sleep(1)
+                try:
+                    await approval_bot.edit_message_text(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        message_id=message_id,
+                        text=f"⏳ Таймер: {i} секунд",
+                        reply_markup=keyboard
+                    )
+                except:
+                    pass
+        asyncio.create_task(update_countdown_reset(countdown_msg.message_id))
     elif action == 'chat':
         chat_in_progress = True
         try:
