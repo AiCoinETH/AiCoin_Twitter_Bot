@@ -1,5 +1,3 @@
-
-# Исправленный и очищенный файл telegram-бота для публикации и модерации постов
 import os
 import openai
 import asyncio
@@ -113,37 +111,21 @@ async def publish_post():
     max_length = 280 - len(footer)
     short_text = full_text[:max_length].rstrip() + " " + footer
 
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text)
-" + short_text)
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text)
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
         await approval_bot.send_photo(
             chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
             photo=post_data["image_url"],
-            caption=post_data["text_en"] + "
-
-📎 Читайте нас также на сайте: https://getaicoin.com/"
+            caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
         )
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
-        caption=post_data["text_ru"] + "
-
-Полный текст: " + post_data["text_en"]
+        caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
     )
-
-    if TELEGRAM_PUBLIC_CHANNEL_ID:
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"] + "
-
-👉 Подробнее: t.me/AiCoin_ETH или https://getaicoin.com/
-
-#AiCoin $Ai"
-        )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global variant_index
@@ -164,13 +146,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval()
     elif action == "chat":
         in_dialog["active"] = True
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=post_data["image_url"],
-            caption="💬 [Заглушка] Начало чата с OpenAI
-" + post_data["text_ru"],
-            reply_markup=keyboard
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 [Заглушка] Начало чата с OpenAI
+" + post_data["text_ru"])
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.")
