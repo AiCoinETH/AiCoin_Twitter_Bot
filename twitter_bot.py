@@ -1,13 +1,14 @@
 import os
-import openai
 import asyncio
-import json
 import hashlib
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters, CommandHandler
 import aiosqlite
 import telegram.error
+import openai
+
+# AI-инструменты и документация: https://gptonline.ai/
 
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
@@ -17,30 +18,23 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
-post_data = {
-    "text_ru": "Майнинговые токены снова в фокусе...",
-    "text_en": "Mining tokens are gaining attention again...",
-    "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-    "timestamp": None,
-    "post_id": 0
-}
+
+# Данные поста и история для восстановления
+post_data = {"text_ru": "Майнинговые токены снова в фокусе...",
+             "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+             "timestamp": None, "post_id": 0}
+prev_data = post_data.copy()
+
+# Флаги состояния
 pending_post = {"active": False, "timer": None}
-last_actions = {}  # хранит последние действия пользователей
-in_dialog = {"active": False}
+text_in_progress = False
+image_in_progress = False
+full_in_progress = False
+chat_in_progress = False
+
 do_not_disturb = {"active": False}
-ru_variants = [
-    "Майнинговые токены снова в фокусе...",
-    "Инвесторы проявляют повышенный интерес к майнинговым токенам...",
-    "Новые AI-алгоритмы меняют подход к добыче криптовалют..."
-]
-image_variants = [
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/June_odd-eyed-cat.jpg/440px-June_odd-eyed-cat.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0a/Cat_03.jpg/480px-Cat_03.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5e/Sleeping_cat_on_her_back.jpg/480px-Sleeping_cat_on_her_back.jpg"
-]
-variant_index = 0
-image_index = 0
-DB_FILE = "post_history.db"
+
+# Клавиатура
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
@@ -51,50 +45,41 @@ keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
 ])
 
+DB_FILE = "post_history.db"
+
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """CREATE TABLE IF NOT EXISTS posts (
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 image_hash TEXT
-            )"""
-        )
+            )
+        """)
         await db.commit()
 
 async def save_post_to_history(text, image_url=None):
-    image_hash = get_image_hash(image_url) if image_url else None
+    def get_hash(url):
+        try:
+            import requests
+            r = requests.get(url)
+            return hashlib.sha256(r.content).hexdigest()
+        except:
+            return None
+    h = get_hash(image_url) if image_url else None
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
-            (text, datetime.now().isoformat(), image_hash)
+            (text, datetime.now().isoformat(), h)
         )
         await db.commit()
 
-def get_image_hash(image_url):
-    try:
-        import requests
-        response = requests.get(image_url)
-        return hashlib.sha256(response.content).hexdigest()
-    except Exception:
-        return None
-
-async def is_duplicate(text, image_url=None):
-    image_hash = get_image_hash(image_url) if image_url else None
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT text, image_hash FROM posts WHERE timestamp > ?", ((datetime.now() - timedelta(days=30)).isoformat(),)) as cursor:
-            async for row in cursor:
-                if row[0] == text or (image_hash and row[1] == image_hash):
-                    return True
-    return False
-
-async def send_post_for_approval(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
-    if do_not_disturb["active"]:
+async def send_post_for_approval():
+    if do_not_disturb["active"] or pending_post["active"]:
         return
     post_data["timestamp"] = datetime.now()
-    pending_post["active"] = True
-    pending_post["timer"] = datetime.now()
+    pending_post.update({"active": True, "timer": datetime.now()})
     try:
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -110,7 +95,6 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
             caption=post_data["text_ru"],
             reply_markup=keyboard
         )
-
     try:
         countdown_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
@@ -120,203 +104,152 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         countdown_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
         )
-
     async def update_countdown(message_id):
         for i in range(59, -1, -1):
             await asyncio.sleep(1)
             try:
-                await approval_bot.edit_message_text(chat_id=TELEGRAM_APPROVAL_CHAT_ID, message_id=message_id, text=f"⏳ Таймер: {i} секунд")
+                await approval_bot.edit_message_text(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    message_id=message_id,
+                    text=f"⏳ Таймер: {i} секунд"
+                )
             except:
                 pass
-
+        pending_post["active"] = False
     asyncio.create_task(update_countdown(countdown_msg.message_id))
 
 async def publish_post():
-    full_text = post_data["text_en"]
-    footer = "... Продолжение на сайте https://getaicoin.com/ или телеграм канале t.me/AiCoin_ETH #AiCoin $Ai"
-    max_length = 280 - len(footer)
-    short_text = full_text[:max_length].rstrip() + " " + footer
-
-    try:
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
-        )
-    except telegram.error.RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
-        )
-
     if TELEGRAM_PUBLIC_CHANNEL_ID:
         try:
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
-            )
+            await approval_bot.send_photo(chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+                photo=post_data["image_url"], caption=post_data["text_ru"] )
         except telegram.error.RetryAfter as e:
             await asyncio.sleep(e.retry_after)
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
-            )
-
+            await approval_bot.send_photo(chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+                photo=post_data["image_url"], caption=post_data["text_ru"] )
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
+    pending_post["active"] = False
 
 async def check_timer():
     while True:
         await asyncio.sleep(5)
-        if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
+        if pending_post["active"] and pending_post["timer"]:
             if datetime.now() - pending_post["timer"] > timedelta(seconds=60):
-                try:
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
-                    )
-                except telegram.error.RetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
-                    )
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="⌛ Время ожидания истекло. Публикую автоматически."
+                )
                 await publish_post()
-                pending_post["active"] = False
-
-async def delayed_start(app: Application):
-    try:
-        await asyncio.sleep(2)
-        await init_db()
-        await send_post_for_approval()
-    except Exception as e:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                                         text=f"❌ Ошибка генерации поста: {e}")
-    finally:
-        full_post_generation_in_progress = False
-    asyncio.create_task(check_timer())
-image_generation_in_progress = False
-full_post_generation_in_progress = False
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global variant_index, image_index, text_generation_in_progress, image_generation_in_progress, full_post_generation_in_progress
+    global text_in_progress, image_in_progress, full_in_progress, chat_in_progress
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    action = query.data
-
-    now = datetime.now()
-    if user_id in last_actions and (now - last_actions[user_id]['time']).total_seconds() < 10:
-        if last_actions[user_id]['action'] == action:
-            await query.edit_message_text('⏳ Вы уже нажали эту кнопку. Подождите, идет обработка...')
-            return
-    last_actions[user_id] = {'time': now, 'action': action}
-
-    try:
-        if action == 'approve':
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Обработка...')
-            await asyncio.sleep(1)
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='✅ Пост опубликован.')
-            pending_post['active'] = False
-            await publish_post()
-
-        elif action == 'regenerate':
-            if text_generation_in_progress:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация текста уже выполняется. Подождите...')
-                return
-            text_generation_in_progress = True
-            post_data['text_ru'] = (await openai.ChatCompletion.acreate(
-                model='gpt-3.5-turbo',
-                messages=[{'role': 'system', 'content': 'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
-            )).choices[0].message.content.strip()
-
-            post_data['text_en'] = (await openai.ChatCompletion.acreate(
-                model='gpt-3.5-turbo',
-                messages=[{'role': 'system', 'content': 'Translate this crypto post to English in a news headline style.'},
-                          {'role': 'user', 'content': post_data['text_ru']}]
-            )).choices[0].message.content.strip()
-            post_data['post_id'] += 1
-            await send_post_for_approval()
-
-        elif action == 'new_image':
-            if image_generation_in_progress:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация картинки уже выполняется. Подождите...')
-                return
-            image_generation_in_progress = True
-            image_index = (image_index + 1) % len(image_variants)
-            post_data['image_url'] = image_variants[image_index]
-            post_data['post_id'] += 1
-            await send_post_for_approval()
-
-        elif action == 'new_post':
-            if full_post_generation_in_progress:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация поста уже выполняется. Подождите...')
-                return
-            full_post_generation_in_progress = True
-            post_data['text_ru'] = (await openai.ChatCompletion.acreate(
-                model='gpt-3.5-turbo',
-                messages=[{'role': 'system', 'content': 'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
-            )).choices[0].message.content.strip()
-            post_data['text_en'] = (await openai.ChatCompletion.acreate(
-                model='gpt-3.5-turbo',
-                messages=[{'role': 'system', 'content': 'Translate this crypto post to English in a news headline style.'},
-                          {'role': 'user', 'content': post_data['text_ru']}]
-            )).choices[0].message.content.strip()
-            post_data['image_url'] = image_variants[image_index]
-            post_data['post_id'] += 1
-            await send_post_for_approval()
-
-        elif action == 'chat':
-            in_dialog['active'] = True
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text='💬 [Заглушка] Начало чата с OpenAI\n' + post_data['text_ru'])
-
-        elif action == 'do_not_disturb':
-            do_not_disturb['active'] = True
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🌙 Режим "Не беспокоить" включен.')
-
-        elif action == 'end_day':
-            pending_post['active'] = False
-            do_not_disturb['active'] = True
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🔚 Сегодняшняя публикация завершена.')
-
-        elif action == 'restore_previous':
-            post_data['text_ru'] = post_data.get('prev_text_ru', post_data['text_ru'])
-            post_data['text_en'] = post_data.get('prev_text_en', post_data['text_en'])
-            post_data['image_url'] = post_data.get('prev_image_url', post_data['image_url'])
-            await send_post_for_approval()
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='↩️ Восстановлен предыдущий вариант поста.')
-
-    except Exception as e:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f'❌ Ошибка: {e}')
-    finally:
-        text_generation_in_progress = False
-        image_generation_in_progress = False
-        full_post_generation_in_progress = False
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_dialog['active'] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
+    if text_in_progress or image_in_progress or full_in_progress or chat_in_progress:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⏳ Бот выполняет задачу, подождите..."
+        )
         return
-    if update.message.text.lower() == '/end':
-        in_dialog['active'] = False
+    action = query.data
+    prev_data.update(post_data)
+    if action == 'approve':
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
+        await publish_post()
+    elif action == 'regenerate':
+        text_in_progress = True
         try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация нового текста...")
+            resp = await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role':'system','content':'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
+            )
+            post_data['text_ru'] = resp.choices[0].message.content.strip()
+            post_data['post_id'] += 1
             await send_post_for_approval()
         except Exception as e:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=f'❌ Ошибка генерации поста: {e}'
-            )
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
         finally:
-            text_generation_in_progress = False
-            image_generation_in_progress = False
-            full_post_generation_in_progress = False
+            text_in_progress = False
+    elif action == 'new_image':
+        image_in_progress = True
+        try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация новой картинки...")
+            post_data['image_url'] = post_data['image_url']  # заглушка
+            post_data['post_id'] += 1
+            await send_post_for_approval()
+        except Exception as e:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVALCHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
+        finally:
+            image_in_progress = False
+    elif action == 'new_post':
+        full_in_progress = True
+        try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация полного поста и картинки...")
+            text_resp = await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role':'system','content':'Сгенерируй полный новостной пост о криптовалютах на русском.'}]
+            )
+            post_data['text_ru'] = text_resp.choices[0].message.content.strip()
+            post_data['post_id'] += 1
+            post_data['image_url'] = post_data['image_url']  # заглушка
+            await send_post_for_approval()
+        except Exception as e:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
+        finally:
+            full_in_progress = False
+    elif action == 'think':
+        # Think лишь обновляет пост и таймер, генерации не выполняется
+        await send_post_for_approval()
+    elif action == 'chat':
+        chat_in_progress = True
+        try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Общение с AI...")
+            resp = await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role':'user','content':post_data['text_ru']}]
+            )
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=resp.choices[0].message.content)
+        except Exception as e:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка в чате: {e}")
+        finally:
+            chat_in_progress = False
+    elif action == 'do_not_disturb':
+        do_not_disturb['active'] = not do_not_disturb['active']
+        status = 'включен' if do_not_disturb['active'] else 'выключен'
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим 'Не беспокоить' {status}.")
+    elif action == 'restore_previous':
+        post_data.update(prev_data)
+        await send_post_for_approval()
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант поста.")
+    elif action == 'end_day':
+        pending_post['active'] = False
+        do_not_disturb['active'] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Сегодняшняя публикация завершена.")
     else:
-        await update.message.reply_text('🔁 Обсуждаем... Введите /end для завершения.')
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Неизвестная команда.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
+        return
+    text = update.message.text.strip().lower()
+    if text == '/end':
+        await send_post_for_approval()
+    else:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Функция временно недоступна.")
+
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(delayed_start).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("end", handle_message))
+
+    asyncio.get_event_loop().create_task(init_db())
+    asyncio.get_event_loop().create_task(send_post_for_approval())
+    asyncio.get_event_loop().create_task(check_timer())
+
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
