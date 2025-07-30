@@ -38,6 +38,7 @@ chat_in_progress = False
 do_not_disturb = {"active": False}
 countdown_task = None
 last_action_time = {}
+approval_message_ids = {"photo": None, "timer": None}
 
 # Клавиатура
 keyboard = InlineKeyboardMarkup([
@@ -87,37 +88,35 @@ async def send_post_for_approval():
         return
     post_data["timestamp"] = datetime.now()
     pending_post.update({"active": True, "timer": datetime.now()})
+    # Отправляем только картинку с caption и кнопками
     try:
-        await approval_bot.send_photo(
+        photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
             caption=post_data["text_ru"],
             reply_markup=keyboard
         )
+        approval_message_ids["photo"] = photo_msg.message_id
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        await approval_bot.send_photo(
+        photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
             caption=post_data["text_ru"],
             reply_markup=keyboard
         )
-    # Запуск обратного отсчёта
-    try:
-        countdown_msg = await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="⏳ Таймер: 60 секунд",
-            reply_markup=keyboard
-        )
-    except telegram.error.RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        countdown_msg = await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="⏳ Таймер: 60 секунд",
-            reply_markup=keyboard
-        )
+        approval_message_ids["photo"] = photo_msg.message_id
 
-    async def update_countdown(message_id):
+async def send_timer_message():
+    # Отправляем таймер отдельным сообщением с кнопками
+    countdown_msg = await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="⏳ Таймер: 60 секунд",
+        reply_markup=keyboard
+    )
+    approval_message_ids["timer"] = countdown_msg.message_id
+
+    async def update_countdown_reset(message_id):
         for i in range(59, -1, -1):
             await asyncio.sleep(1)
             try:
@@ -134,7 +133,7 @@ async def send_post_for_approval():
     global countdown_task
     if countdown_task is not None and not countdown_task.done():
         countdown_task.cancel()
-    countdown_task = asyncio.create_task(update_countdown(countdown_msg.message_id))
+    countdown_task = asyncio.create_task(update_countdown_reset(approval_message_ids["timer"]))
 
 async def publish_post():
     if TELEGRAM_PUBLIC_CHANNEL_ID:
@@ -235,28 +234,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 full_in_progress = False
         elif action == 'think':
-            # отменяем предыдущий таймер
+            # Таймер появляется только после нажатия "Подумать"
             if countdown_task is not None and not countdown_task.done():
                 countdown_task.cancel()
             pending_post['timer'] = datetime.now()
-            countdown_msg = await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="⏳ Таймер обновлён: 60 секунд",
-                reply_markup=keyboard
-            )
-            async def update_countdown_reset(message_id):
-                for i in range(59, -1, -1):
-                    await asyncio.sleep(1)
-                    try:
-                        await approval_bot.edit_message_text(
-                            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                            message_id=message_id,
-                            text=f"⏳ Таймер: {i} секунд",
-                            reply_markup=keyboard
-                        )
-                    except:
-                        pass
-            countdown_task = asyncio.create_task(update_countdown_reset(countdown_msg.message_id))
+            await send_timer_message()
         elif action == 'chat':
             chat_in_progress = True
             try:
