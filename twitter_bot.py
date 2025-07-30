@@ -47,7 +47,7 @@ keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("🖼️ Новая картинка", callback_data="new_image")],
     [InlineKeyboardButton("🆕 Пост целиком", callback_data="new_post")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-    [InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]
+    [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
 ])
 
 async def init_db():
@@ -181,230 +181,139 @@ async def check_timer():
                 pending_post["active"] = False
 
 async def delayed_start(app: Application):
-    await asyncio.sleep(2)
-    await init_db()
-    await send_post_for_approval()
-                except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
-                finally:
-            full_post_generation_in_progress = False
-                except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
-                finally:
-            image_generation_in_progress = False
-                except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
-                finally:
-            text_generation_in_progress = False
+    try:
+        await asyncio.sleep(2)
+        await init_db()
+        await send_post_for_approval()
+    except Exception as e:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                                         text=f"❌ Ошибка генерации поста: {e}")
+    finally:
+        full_post_generation_in_progress = False
     asyncio.create_task(check_timer())
-
-last_actions = {}
-text_generation_in_progress = False
 image_generation_in_progress = False
 full_post_generation_in_progress = False
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global variant_index, image_index
+    global variant_index, image_index, text_generation_in_progress, image_generation_in_progress, full_post_generation_in_progress
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     action = query.data
 
     now = datetime.now()
-    if user_id in last_actions and (now - last_actions[user_id]["time"]).total_seconds() < 10:
-        if last_actions[user_id]["action"] == action:
-            await query.edit_message_text("⏳ Вы уже нажали эту кнопку. Подождите, идет обработка...")
+    if user_id in last_actions and (now - last_actions[user_id]['time']).total_seconds() < 10:
+        if last_actions[user_id]['action'] == action:
+            await query.edit_message_text('⏳ Вы уже нажали эту кнопку. Подождите, идет обработка...')
             return
-    last_actions[user_id] = {"time": now, "action": action}
+    last_actions[user_id] = {'time': now, 'action': action}
 
-    if action == "approve":
-        try:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка..."
-            )
+    try:
+        if action == 'approve':
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Обработка...')
             await asyncio.sleep(1)
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
-            )
-        except telegram.error.RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
-            )
-        pending_post["active"] = False
-        await publish_post()
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='✅ Пост опубликован.')
+            pending_post['active'] = False
+            await publish_post()
 
-    elif action == "regenerate":
-        global text_generation_in_progress
-        if text_generation_in_progress:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация текста уже выполняется. Подождите...")
-            return
-        text_generation_in_progress = True
-        try:
-            post_data["text_ru"] = (await openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "system", "content": "Придумай новостной заголовок в сфере криптовалюты на русском."}]
+        elif action == 'regenerate':
+            if text_generation_in_progress:
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация текста уже выполняется. Подождите...')
+                return
+            text_generation_in_progress = True
+            post_data['text_ru'] = (await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role': 'system', 'content': 'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
             )).choices[0].message.content.strip()
 
-            post_data["text_en"] = (await openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "system", "content": "Translate this crypto post to English in a news headline style."},
-                          {"role": "user", "content": post_data["text_ru"]}]
+            post_data['text_en'] = (await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role': 'system', 'content': 'Translate this crypto post to English in a news headline style.'},
+                          {'role': 'user', 'content': post_data['text_ru']}]
             )).choices[0].message.content.strip()
-            post_data["post_id"] += 1
+            post_data['post_id'] += 1
             await send_post_for_approval()
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
-        finally:
-            text_generation_in_progress = False
-    elif action == "new_image":
-        global image_generation_in_progress
-        if image_generation_in_progress:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация картинки уже выполняется. Подождите...")
-            return
-        image_generation_in_progress = True
-        try:
-        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед следующей генерацией картинки.")
-        else:
+
+        elif action == 'new_image':
+            if image_generation_in_progress:
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация картинки уже выполняется. Подождите...')
+                return
+            image_generation_in_progress = True
             image_index = (image_index + 1) % len(image_variants)
-            post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b6/Image_created_with_a_mobile_phone.png/480px-Image_created_with_a_mobile_phone.png"
-            post_data["post_id"] += 1
+            post_data['image_url'] = image_variants[image_index]
+            post_data['post_id'] += 1
             await send_post_for_approval()
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
-        finally:
-            full_post_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
-        finally:
-            image_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
-        finally:
-            text_generation_in_progress = False
 
-    elif action == "new_post":
-        global full_post_generation_in_progress
-        if full_post_generation_in_progress:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация поста уже выполняется. Подождите...")
-            return
-        full_post_generation_in_progress = True
-        try:
-        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед созданием нового поста.")
-        else:
-            import random
-            post_data["text_ru"] = (await openai.ChatCompletion.acreate(
-    model="gpt-3.5-turbo",
-    messages=[{"role": "system", "content": "Придумай новостной заголовок в сфере криптовалюты на русском."}]
-)).choices[0].message.content.strip()
-            post_data["text_ru"] = (await openai.ChatCompletion.acreate(
-    model="gpt-3.5-turbo",
-    messages=[{"role": "system", "content": "Придумай новостной заголовок в сфере криптовалюты на русском."}]
-)).choices[0].message.content.strip()
-
-    post_data["text_en"] = (await openai.ChatCompletion.acreate(
-    model="gpt-3.5-turbo",
-    messages=[{"role": "system", "content": "Translate this crypto post to English in a news headline style."},
-              {"role": "user", "content": post_data["text_ru"]}]
-)).choices[0].message.content.strip()
-            post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b6/Image_created_with_a_mobile_phone.png/480px-Image_created_with_a_mobile_phone.png"
-            post_data["post_id"] += 1
+        elif action == 'new_post':
+            if full_post_generation_in_progress:
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Генерация поста уже выполняется. Подождите...')
+                return
+            full_post_generation_in_progress = True
+            post_data['text_ru'] = (await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role': 'system', 'content': 'Придумай новостной заголовок в сфере криптовалюты на русском.'}]
+            )).choices[0].message.content.strip()
+            post_data['text_en'] = (await openai.ChatCompletion.acreate(
+                model='gpt-3.5-turbo',
+                messages=[{'role': 'system', 'content': 'Translate this crypto post to English in a news headline style.'},
+                          {'role': 'user', 'content': post_data['text_ru']}]
+            )).choices[0].message.content.strip()
+            post_data['image_url'] = image_variants[image_index]
+            post_data['post_id'] += 1
             await send_post_for_approval()
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
-        finally:
-            full_post_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
-        finally:
-            image_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
-        finally:
-            text_generation_in_progress = False
 
-    elif action == "chat":
-        in_dialog["active"] = True
-        try:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
-            )
-        except telegram.error.RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
-            )
+        elif action == 'chat':
+            in_dialog['active'] = True
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text='💬 [Заглушка] Начало чата с OpenAI\n' + post_data['text_ru'])
 
-    elif action == "do_not_disturb":
-        do_not_disturb["active"] = True
-        try:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
-            )
-        except telegram.error.RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
-            )
+        elif action == 'do_not_disturb':
+            do_not_disturb['active'] = True
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🌙 Режим "Не беспокоить" включен.')
 
-    elif action == "cancel":
-        pending_post["active"] = False
-        try:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
-            )
-        except telegram.error.RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
-            )
 
-    elif action == "think":
-        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед повторной отправкой поста.")
-        else:
-            pending_post["active"] = True
-            pending_post["timer"] = datetime.now()
+        elif action == 'end_day':
+            pending_post['active'] = False
+            do_not_disturb['active'] = True
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🔚 Сегодняшняя публикация завершена.')
+
+        elif action == 'restore_previous':
+            post_data['text_ru'] = post_data.get('prev_text_ru', post_data['text_ru'])
+            post_data['text_en'] = post_data.get('prev_text_en', post_data['text_en'])
+            post_data['image_url'] = post_data.get('prev_image_url', post_data['image_url'])
             await send_post_for_approval()
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
-        finally:
-            full_post_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
-        finally:
-            image_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
-        finally:
-            text_generation_in_progress = False
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='↩️ Восстановлен предыдущий вариант поста.')
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Подождите немного перед повторной отправкой поста.')
+            else:
+                pending_post['active'] = True
+                pending_post['timer'] = datetime.now()
+                await send_post_for_approval()
 
+    except Exception as e:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f'❌ Ошибка: {e}')
+    finally:
+        text_generation_in_progress = False
+        image_generation_in_progress = False
+        full_post_generation_in_progress = False
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
+    if not in_dialog['active'] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
         return
-    if update.message.text.lower() == "/end":
-        in_dialog["active"] = False
-        await send_post_for_approval()
+    if update.message.text.lower() == '/end':
+        in_dialog['active'] = False
+        try:
+            await send_post_for_approval()
         except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
-        finally:
-            full_post_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
-        finally:
-            image_generation_in_progress = False
-        except Exception as e:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f'❌ Ошибка генерации поста: {e}'
+            )
         finally:
             text_generation_in_progress = False
+            image_generation_in_progress = False
+            full_post_generation_in_progress = False
     else:
-        await update.message.reply_text("🔁 Обсуждаем... Введите /end для завершения.")
-
+        await update.message.reply_text('🔁 Обсуждаем... Введите /end для завершения.')
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(delayed_start).build()
     app.add_handler(CallbackQueryHandler(button_handler))
