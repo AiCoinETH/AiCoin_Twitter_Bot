@@ -8,21 +8,17 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Бот для модерации (группа)
+      # Telegram bot settings (оставьте если нужно)
       TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
       TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
-      # Бот для публикации (канал)
       TELEGRAM_BOT_TOKEN_CHANNEL: ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
       TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
-      # Используйте только username (если канал публичный)!
 
-      # Дополнительные переменные — раскомментируйте если нужны:
-      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # PINATA_JWT: ${{ secrets.PINATA_JWT }}
-      # API_KEY: ${{ secrets.API_KEY }}
-      # API_SECRET: ${{ secrets.API_SECRET }}
-      # ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-      # ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
+      # Twitter API keys (ВАЖНО! Эти строки должны быть без #)
+      API_KEY: ${{ secrets.API_KEY }}
+      API_SECRET: ${{ secrets.API_SECRET }}
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
 
     steps:
       - name: Checkout repository
@@ -38,5 +34,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Telegram Bot
+      - name: Run Twitter Bot
         run: python twitter_bot.py
