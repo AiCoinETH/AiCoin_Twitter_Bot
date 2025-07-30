@@ -172,8 +172,10 @@ async def publish_post():
     text_in_progress = image_in_progress = full_in_progress = chat_in_progress = False
 
 async def check_timer():
-    while True:
-        await asyncio.sleep(5)
+-    while True:
+-        await asyncio.sleep(5)
++    while True:
++        await asyncio.sleep(1)
         if pending_post["active"] and pending_post["timer"] and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
             try:
                 await approval_bot.send_message(
@@ -202,20 +204,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if countdown_task and not countdown_task.done(): countdown_task.cancel()
         pending_post["timer"] = datetime.now()
         await send_timer_message()
-    elif action == 'regenerate':
-        text_in_progress = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Новый текст...")
-        post_data['text_ru'] = f"Тестовый текст {post_data['post_id']+1}"
-        post_data['post_id'] += 1
-        await send_post_for_approval()
-        text_in_progress = False
-    elif action == 'new_image':
-        image_in_progress = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Новая картинка...")
-        post_data['image_url'] = random.choice([img for img in test_images if img != post_data['image_url']])
-        post_data['post_id'] += 1
-        await send_post_for_approval()
-        image_in_progress = False
-    elif action == 'new_post':
-        full_in_progress = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT
+    # ... другие обработки действий ...
+
+async def delayed_start(app: Application):
+    await init_db()
+    await send_post_for_approval()
+    asyncio.create_task(check_timer())
+    logging.info("Бот запущен и готов к работе.")
+
+if __name__ == "__main__":
+    app = Application.builder()\
+        .token(TELEGRAM_BOT_TOKEN_APPROVAL)\
+        .post_init(delayed_start)\
+        .build()
+    app.add_handler(CallbackQueryHandler(button_handler))
+-    app.run_polling()
++    # Чаще опрашиваем сервер (Long Polling) для более быстрой реакции
++    app.run_polling(poll_interval=0.5, timeout=1)
