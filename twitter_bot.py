@@ -147,9 +147,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "chat":
         in_dialog["active"] = True
         await approval_bot.send_message(
-    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-    text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
-)
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
+        )
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.")
@@ -157,9 +157,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_post["active"] = False
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
     elif action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд")
-        pending_post["timer"] = datetime.now()
-        pending_post["active"] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
+        await send_post_for_approval()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
