@@ -103,6 +103,7 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         reply_markup=keyboard
     
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_photo(
@@ -121,6 +122,7 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         countdown_msg = await approval_bot.send_message(
@@ -147,6 +149,7 @@ async def publish_post():
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
@@ -162,6 +165,7 @@ async def publish_post():
             caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
         
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_photo(
@@ -181,6 +185,7 @@ async def publish_post():
         caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
     
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_photo(
@@ -202,6 +207,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
@@ -245,6 +251,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
         
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
@@ -259,6 +266,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
@@ -270,6 +278,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
@@ -301,6 +310,7 @@ async def check_timer():
                     await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
         )
+    try:
     except telegram.error.RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         await approval_bot.send_message(
