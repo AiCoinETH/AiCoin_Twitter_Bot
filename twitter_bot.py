@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
+from telegram.constants import ParseMode
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -46,6 +47,12 @@ do_not_disturb       = {"active": False}
 last_action_time     = {}
 approval_message_ids = {"photo": None}
 DB_FILE = "post_history.db"
+
+# Для обратного отсчёта "Подумать"
+current_think_timer = {
+    "message_id": None,
+    "stop": False
+}
 
 # ========== КЛАВИАТУРА ДЛЯ МОДЕРАЦИИ ==========
 keyboard = InlineKeyboardMarkup([
@@ -149,6 +156,32 @@ async def publish_post_to_channel():
     asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
     pending_post["active"] = False
 
+# ========== ОБРАТНЫЙ ОТСЧЁТ ДЛЯ 'ПОДУМАТЬ' ==========
+async def thinking_countdown():
+    seconds_left = 60
+    while seconds_left > 0:
+        if current_think_timer["stop"]:
+            return  # Прервано другим действием
+        try:
+            await approval_bot.edit_message_text(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                message_id=current_think_timer["message_id"],
+                text=f"🕒 Подумайте! Автопубликация через: <b>{seconds_left}</b> секунд",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        seconds_left -= 1
+    # Таймер истёк — публикуем!
+    if not current_think_timer["stop"]:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⌛ Время ожидания истекло. Публикую автоматически."
+        )
+        await publish_post_to_channel()
+        pending_post["active"] = False
+
 # ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
@@ -170,18 +203,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     user_id = update.effective_user.id
     now = datetime.now()
+    action = update.callback_query.data
+
+    # Сброс таймера обратного отсчёта для всех действий, кроме 'think'
+    if action != "think":
+        current_think_timer["stop"] = True
+
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...")
         return
     last_action_time[user_id] = now
-    action = update.callback_query.data
     prev_data.update(post_data)
+
     if action == 'approve':
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Публикую в канал…")
         await publish_post_to_channel()
     elif action == 'think':
+        # Сбросить предыдущий таймер, если был
+        current_think_timer["stop"] = True
+        current_think_timer["message_id"] = None
         pending_post["timer"] = datetime.now()
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…")
+        msg = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"🕒 Подумайте! Автопубликация через: <b>60</b> секунд",
+            parse_mode=ParseMode.HTML
+        )
+        current_think_timer["message_id"] = msg.message_id
+        current_think_timer["stop"] = False
+        asyncio.create_task(thinking_countdown())
     elif action == 'regenerate':
         post_data["text_ru"] = f"Новый тестовый текст #{post_data['post_id'] + 1}"
         post_data["post_id"] += 1
