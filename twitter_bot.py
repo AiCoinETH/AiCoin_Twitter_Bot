@@ -233,3 +233,86 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+from telegram.ext import ApplicationBuilder
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+
+    global variant_index
+
+    if action == "approve":
+        await publish_short_and_full()
+
+    elif action == "post_en":
+        await publish_to_channel()
+        pending_post["active"] = False
+
+    elif action == "regenerate":
+        variant_index = (variant_index + 1) % len(ru_variants)
+        post_data["text_ru"] = ru_variants[variant_index]
+        await send_post_for_approval()
+
+    elif action == "new_image":
+        post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+        await send_post_for_approval()
+
+    elif action == "chat":
+        in_dialog["active"] = True
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption="💬 Обсуждаем пост:
+" + post_data["text_ru"],
+            reply_markup=keyboard
+        )
+
+    elif action == "do_not_disturb":
+        do_not_disturb["active"] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.")
+
+    elif action == "cancel":
+        pending_post["active"] = False
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Публикация отменена.")
+
+    elif action == "custom_post":
+        custom_input["step"] = "await_text"
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Введите ваш пост.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
+        return
+
+    if in_dialog["active"]:
+        await update.message.reply_text("🔁 Обсуждаем... (заглушка). Введите /end для завершения.")
+        return
+
+    if custom_input["step"] == "await_text":
+        post_data["text_ru"] = update.message.text
+        custom_input["step"] = "await_image"
+        await update.message.reply_text("📎 Теперь отправьте ссылку на картинку.")
+
+    elif custom_input["step"] == "await_image":
+        post_data["image_url"] = update.message.text
+        custom_input["step"] = None
+        await send_post_for_approval()
+
+async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    in_dialog["active"] = False
+    post_data["text_ru"] = ru_variants[variant_index]
+    post_data["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+    await send_post_for_approval()
+
+def main():
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).build()
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("end", end_dialog))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(init_db())
+    main()
