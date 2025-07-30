@@ -12,10 +12,8 @@ import telegram.error
 
 # AI-инструменты и документация: https://gptonline.ai/
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# Чтение переменных окружения
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
@@ -27,7 +25,6 @@ if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEG
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
-# Тестовые картинки
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -54,7 +51,6 @@ countdown_task = None
 last_action_time = {}
 approval_message_ids = {"photo": None, "timer": None}
 
-# Клавиатура для управления постами
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
@@ -154,6 +150,7 @@ async def send_timer_message():
     countdown_task = asyncio.create_task(update_countdown(approval_message_ids["timer"]))
 
 async def publish_post():
+    global pending_post
     if TELEGRAM_CHANNEL_ID:
         try:
             await approval_bot.send_photo(
@@ -175,7 +172,14 @@ async def publish_post():
     else:
         logging.error("TELEGRAM_CHANNEL_ID не задан.")
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
+
+    # Сбрасываем флаги после публикации, чтобы разрешить следующие посты
     pending_post["active"] = False
+    global text_in_progress, image_in_progress, full_in_progress, chat_in_progress
+    text_in_progress = False
+    image_in_progress = False
+    full_in_progress = False
+    chat_in_progress = False
 
 async def check_timer():
     while True:
