@@ -13,15 +13,17 @@ import telegram.error
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
-TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")    # токен для группы модерации
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")     # токен для публикации
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # '@AiCoin_ETH'
 
-if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_USERNAME_ID:
-    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID или CHANNEL_USERNAME_ID)")
+if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_BOT_TOKEN_CHANNEL or not TELEGRAM_CHANNEL_USERNAME_ID:
+    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID, BOT_TOKEN_CHANNEL или CHANNEL_USERNAME_ID)")
     exit(1)
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
+channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
 # ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
 test_images = [
@@ -114,7 +116,7 @@ async def send_post_for_approval():
 # ========== ПУБЛИКАЦИЯ В КАНАЛ ==========
 async def publish_post_to_channel():
     try:
-        msg = await approval_bot.send_photo(
+        msg = await channel_bot.send_photo(
             chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
             photo=post_data["image_url"],
             caption=post_data["text_ru"]
