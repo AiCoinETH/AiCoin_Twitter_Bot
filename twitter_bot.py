@@ -20,7 +20,8 @@ post_data = {
     "text_ru": "Майнинговые токены снова в фокусе...",
     "text_en": "Mining tokens are gaining attention again...",
     "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-    "timestamp": None
+    "timestamp": None,
+    "post_id": 0
 }
 pending_post = {"active": False, "timer": None}
 in_dialog = {"active": False}
@@ -147,10 +148,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "regenerate":
         variant_index = (variant_index + 1) % len(ru_variants)
         post_data["text_ru"] = ru_variants[variant_index]
+        post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
+        post_data["post_id"] += 1
         await send_post_for_approval()
     elif action == "new_image":
         image_index = (image_index + 1) % len(image_variants)
         post_data["image_url"] = image_variants[image_index]
+        post_data["post_id"] += 1
         await send_post_for_approval()
     elif action == "new_post":
         variant_index = (variant_index + 1) % len(ru_variants)
@@ -158,6 +162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["text_ru"] = ru_variants[variant_index]
         post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
         post_data["image_url"] = image_variants[image_index]
+        post_data["post_id"] += 1
         await send_post_for_approval()
     elif action == "chat":
         in_dialog["active"] = True
@@ -174,6 +179,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "think":
         pending_post["active"] = True
         pending_post["timer"] = datetime.now()
+        post_data["post_id"] += 1
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения.")
         await send_post_for_approval()
 
