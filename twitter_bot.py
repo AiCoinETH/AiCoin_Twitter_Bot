@@ -162,6 +162,7 @@ async def publish_post():
             )
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
+    log_post(post_data.get('text_ru') or post_data.get('text_en'))  # лог любого поста
 
 async def check_timer():
     while True:
@@ -284,11 +285,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data['image_url'] = post_data.get('prev_image_url', post_data['image_url'])
             await send_post_for_approval()
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='↩️ Восстановлен предыдущий вариант поста.')
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='⏳ Подождите немного перед повторной отправкой поста.')
-            else:
-                pending_post['active'] = True
-                pending_post['timer'] = datetime.now()
-                await send_post_for_approval()
 
     except Exception as e:
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f'❌ Ошибка: {e}')
@@ -312,8 +308,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text_generation_in_progress = False
             image_generation_in_progress = False
             full_post_generation_in_progress = False
-    else:
-        await update.message.reply_text('🔁 Обсуждаем... Введите /end для завершения.')
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(delayed_start).build()
     app.add_handler(CallbackQueryHandler(button_handler))
