@@ -155,6 +155,7 @@ async def publish_post():
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
         try:
+            pass
         await approval_bot.send_photo(
             
             chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
@@ -199,6 +200,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         try:
+            pass
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
         )
@@ -239,6 +241,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "chat":
         in_dialog["active"] = True
         try:
+            pass
         await approval_bot.send_message(
             
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -256,6 +259,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
         try:
+            pass
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
         )
@@ -267,6 +271,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "cancel":
         pending_post["active"] = False
         try:
+            pass
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
         )
@@ -298,6 +303,7 @@ async def check_timer():
         if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             if datetime.now() - pending_post["timer"] > timedelta(seconds=60):
                 try:
+                    pass
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
         )
