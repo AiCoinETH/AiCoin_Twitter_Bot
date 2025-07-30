@@ -10,22 +10,24 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
 
-# https://gptonline.ai/ — поддержка и инструкции
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ====== ТЕСТОВЫЕ ДАННЫЕ ======
-TELEGRAM_BOT_TOKEN_APPROVAL = "8097657551:AAFEpfksrlBc2-2PZ-ieAJg0_T3mheUv7jk"
-TELEGRAM_APPROVAL_CHAT_ID  = -1002892475684       # Ваша группа для модерации (замените если другая)
-TELEGRAM_CHANNEL_USERNAME_ID = "@AiCoin_ETH"       # username канала
-TELEGRAM_CHANNEL_ID = -1002526439177               # ID канала (используйте либо username, либо ID — но не оба сразу)
-# ====================================
+# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
+TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_CHANNEL_ID         = os.getenv("TELEGRAM_CHANNEL_ID")  # '@AiCoin_ETH' или '-100...'
+if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_ID:
+    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID или CHANNEL_ID)")
+    exit(1)
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
+# ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg"
+    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
+    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
 post_data = {
@@ -36,29 +38,36 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-do_not_disturb       = {"active": False}
 pending_post         = {"active": False, "timer": None}
+do_not_disturb       = {"active": False}
 last_action_time     = {}
-approval_message_ids = {"photo": None, "timer": None}
+approval_message_ids = {"photo": None}
+DB_FILE = "post_history.db"
 
+# ========== КЛАВИАТУРА ДЛЯ МОДЕРАЦИИ ==========
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
-    [InlineKeyboardButton("📝 Новый текст", callback_data="regenerate")]
+    [InlineKeyboardButton("📝 Новый текст", callback_data="regenerate")],
+    [InlineKeyboardButton("🖼️ Новая картинка", callback_data="new_image")],
+    [InlineKeyboardButton("🆕 Пост целиком", callback_data="new_post")],
+    [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
+    [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
 ])
 
-DB_FILE = "post_history.db"
-
+# ========== ИНИЦИАЛИЗАЦИЯ БД ==========
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 image_hash TEXT
             )
-        """)
+            """
+        )
         await db.commit()
     logging.info("База данных инициализирована.")
 
@@ -72,7 +81,7 @@ def get_image_hash(url: str) -> str | None:
         logging.warning(f"Не удалось получить хеш изображения: {e}")
         return None
 
-async def save_post_to_history(text: str, image_url: str | None = None):
+async def save_post_to_history(text, image_url=None):
     image_hash = get_image_hash(image_url) if image_url else None
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
@@ -82,30 +91,9 @@ async def save_post_to_history(text: str, image_url: str | None = None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
-async def is_duplicate(text: str, image_url: str) -> bool:
-    img_hash = get_image_hash(image_url)
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM posts WHERE text = ? OR image_hash = ?",
-            (text, img_hash)
-        )
-        row = await cursor.fetchone()
-    return row[0] > 0
-
+# ========== ОТПРАВКА НА МОДЕРАЦИЮ ==========
 async def send_post_for_approval():
-    if do_not_disturb["active"]:
-        logging.info("Режим 'Не беспокоить' активен — пропуск отправки.")
-        return
-
-    if pending_post["active"]:
-        logging.info("Уже есть активный пост — ожидаем решения.")
-        return
-
-    if await is_duplicate(post_data["text_ru"], post_data["image_url"]):
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="⚠️ Этот пост уже публиковался ранее — отменено."
-        )
+    if do_not_disturb["active"] or pending_post["active"]:
         return
 
     post_data["timestamp"] = datetime.now()
@@ -118,100 +106,92 @@ async def send_post_for_approval():
             reply_markup=keyboard
         )
         approval_message_ids["photo"] = photo_msg.message_id
-
-        # 60 секунд на решение
-        for sec in range(59, -1, -1):
-            await asyncio.sleep(1)
-            try:
-                await approval_bot.edit_message_text(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    message_id=approval_message_ids["photo"],
-                    text=f"⏳ Таймер: {sec} сек.",
-                    reply_markup=keyboard
-                )
-            except Exception:
-                pass
-
+        logging.info("Пост отправлен на согласование.")
     except Exception as e:
         logging.error(f"Ошибка при отправке на согласование: {e}")
-    finally:
-        pending_post["active"] = False
 
-async def publish_post():
-    # Пытаться публиковать сначала по username, потом по ID (удобно для тестов)
-    channel_ids = [TELEGRAM_CHANNEL_USERNAME_ID, TELEGRAM_CHANNEL_ID]
-    published = False
-    for channel in channel_ids:
-        if not channel:
-            continue
-        try:
-            await approval_bot.send_photo(
-                chat_id=channel,
-                photo=post_data["image_url"],
-                caption=post_data["text_ru"]
-            )
-            logging.info(f"Пост опубликован в канал {channel}")
-            published = True
-            break
-        except telegram.error.TelegramError as e:
-            logging.error(f"Ошибка публикации в {channel}: {e}")
-            continue
-    if not published:
-        logging.error("Не удалось опубликовать ни в один канал!")
-        return
+# ========== ПУБЛИКАЦИЯ В КАНАЛ ==========
+async def publish_post_to_channel():
+    try:
+        msg = await approval_bot.send_photo(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_ru"]
+        )
+        logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_ID}, message_id={msg.message_id}")
+    except Exception as e:
+        logging.error(f"Ошибка публикации в канал: {e}")
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     pending_post["active"] = False
 
+# ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
-        await asyncio.sleep(5)
-        if pending_post["active"] and pending_post["timer"]:
-            if datetime.now() - pending_post["timer"] > timedelta(seconds=60):
+        await asyncio.sleep(1)
+        if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
+            try:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text="⌛ Время модерации истекло, публикую автоматически."
+                    text="⌛ Время ожидания истекло. Публикую автоматически."
                 )
-                await publish_post()
+            except Exception:
+                pass
+            await publish_post_to_channel()
+            pending_post["active"] = False
 
+# ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global prev_data
-
-    query = update.callback_query
-    await query.answer()
-
+    global last_action_time, prev_data
+    await update.callback_query.answer()
     user_id = update.effective_user.id
     now = datetime.now()
-    if user_id in last_action_time and (now - last_action_time[user_id]).total_seconds() < 15:
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="⏳ Подождите немного перед следующим действием."
-        )
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 5:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...")
         return
     last_action_time[user_id] = now
+    action = update.callback_query.data
+    prev_data.update(post_data)
+    if action == 'approve':
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Публикую в канал…")
+        await publish_post_to_channel()
+    elif action == 'think':
+        pending_post["timer"] = datetime.now()
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…")
+    elif action == 'regenerate':
+        post_data["text_ru"] = f"Новый тестовый текст #{post_data['post_id'] + 1}"
+        post_data["post_id"] += 1
+        await send_post_for_approval()
+    elif action == "new_image":
+        post_data["image_url"] = random.choice([img for img in test_images if img != post_data["image_url"]])
+        await send_post_for_approval()
+    elif action == "new_post":
+        post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
+        post_data["image_url"] = random.choice(test_images)
+        post_data["post_id"] += 1
+        await send_post_for_approval()
+    elif action == "chat":
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="💬 Начинаем чат:\n" + post_data["text_ru"]
+        )
+    elif action == "do_not_disturb":
+        do_not_disturb["active"] = not do_not_disturb["active"]
+        status = "включён" if do_not_disturb["active"] else "выключен"
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"🌙 Режим «Не беспокоить» {status}."
+        )
+    elif action == "restore_previous":
+        post_data.update(prev_data)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.")
+        await send_post_for_approval()
+    elif action == "end_day":
+        pending_post["active"] = False
+        do_not_disturb["active"] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Завершили публикации на сегодня.")
 
-    action = query.data
-    prev_data = post_data.copy()
-
-    try:
-        if action == "approve":
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Публикация поста…")
-            await publish_post()
-
-        elif action == "think":
-            pending_post["timer"] = datetime.now()
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…")
-
-        elif action == "regenerate":
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔄 Генерация нового текста…")
-            post_data["text_ru"] = f"Новый тестовый текст #{post_data['post_id'] + 1}"
-            post_data["post_id"] += 1
-            await send_post_for_approval()
-
-    except Exception as e:
-        logging.error(f"Ошибка в button_handler: {e}")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка: {e}")
-
+# ========== ЗАПУСК ==========
 async def delayed_start(app: Application):
     await init_db()
     await send_post_for_approval()
@@ -219,13 +199,12 @@ async def delayed_start(app: Application):
     logging.info("Бот запущен и готов к работе.")
 
 def main():
-    app = Application.builder() \
-        .token(TELEGRAM_BOT_TOKEN_APPROVAL) \
-        .post_init(delayed_start) \
+    app = Application.builder()\
+        .token(TELEGRAM_BOT_TOKEN_APPROVAL)\
+        .post_init(delayed_start)\
         .build()
-
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.run_polling()
+    app.run_polling(poll_interval=0.5, timeout=1)
 
 if __name__ == "__main__":
     main()
