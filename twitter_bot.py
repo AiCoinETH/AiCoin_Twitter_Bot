@@ -265,8 +265,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
-            caption="💬 Обсуждаем пост:
-" + post_data["text_ru"],
+            caption="💬 Обсуждаем пост:\n" + post_data["text_ru"],
             reply_markup=keyboard
         )
 
