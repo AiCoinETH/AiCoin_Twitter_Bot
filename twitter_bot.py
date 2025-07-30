@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
 import openai
@@ -19,7 +19,6 @@ openai.api_key = OPENAI_API_KEY
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
-# Данные поста
 post_data = {
     "text_ru": "Майнинговые токены снова в фокусе...",
     "image_url": "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
@@ -28,7 +27,6 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# Состояния
 pending_post = {"active": False, "timer": None}
 text_in_progress = False
 image_in_progress = False
@@ -40,7 +38,6 @@ countdown_task = None
 last_action_time = {}
 approval_message_ids = {"photo": None, "timer": None}
 
-# Клавиатура
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
@@ -88,7 +85,6 @@ async def send_post_for_approval():
         return
     post_data["timestamp"] = datetime.now()
     pending_post.update({"active": True, "timer": datetime.now()})
-    # Отправляем только картинку с caption и кнопками
     try:
         photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -108,7 +104,6 @@ async def send_post_for_approval():
         approval_message_ids["photo"] = photo_msg.message_id
 
 async def send_timer_message():
-    # Отправляем таймер отдельным сообщением с кнопками
     countdown_msg = await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         text="⏳ Таймер: 60 секунд",
@@ -170,6 +165,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = update.effective_user.id
     now = datetime.now()
+
     # Антиспам: не чаще 1 раза в 15 секунд на любую кнопку
     if user_id in last_action_time:
         if (now - last_action_time[user_id]).total_seconds() < 15:
@@ -179,15 +175,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
     last_action_time[user_id] = now
+
     try:
+        # Сброс таймера автопубликации на ЛЮБУЮ кнопку (кроме одобрения/публикации)
+        action = query.data
+
+        # НЕ обновляем таймер только при явном подтверждении публикации!
+        if action != 'approve':
+            pending_post["timer"] = datetime.now()
+
         if text_in_progress or image_in_progress or full_in_progress or chat_in_progress:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="⏳ Бот выполняет задачу, подождите..."
             )
             return
-        action = query.data
+
         prev_data.update(post_data)
+
         if action == 'approve':
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
             await publish_post()
@@ -234,7 +239,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 full_in_progress = False
         elif action == 'think':
-            # Таймер появляется только после нажатия "Подумать"
             if countdown_task is not None and not countdown_task.done():
                 countdown_task.cancel()
             pending_post['timer'] = datetime.now()
@@ -265,7 +269,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"❌ Ошибка: {e}"
         )
 
-# Функция запуска
 async def delayed_start(app: Application):
     await init_db()
     await send_post_for_approval()
