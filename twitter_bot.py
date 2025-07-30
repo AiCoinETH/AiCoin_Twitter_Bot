@@ -162,7 +162,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
-            caption="💬 Обсуждаем пост:\n" + post_data["text_ru"],
+            caption="💬 [Заглушка] Начало чата с OpenAI
+
+" + post_data["text_ru"],
             reply_markup=keyboard
         )
     elif action == "do_not_disturb":
@@ -173,6 +175,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
     elif action == "end_dialog":
         in_dialog["active"] = False
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="📤 [Заглушка] Генерирую пост и изображение после завершения диалога..."
+        )
         await send_post_for_approval()
     elif action == "think":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🕒 Подумайте. Я жду решения. ⏳ Таймер: 60 секунд")
