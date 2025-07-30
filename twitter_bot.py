@@ -94,14 +94,35 @@ async def send_post_for_approval(update: Update = None, context: ContextTypes.DE
     pending_post["active"] = True
     pending_post["timer"] = datetime.now()
 
-    await approval_bot.send_photo(
+    try:
+        await approval_bot.send_photo(
+            
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
         caption=post_data["text_ru"],
         reply_markup=keyboard
-    )
+    
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_photo(
+            
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        photo=post_data["image_url"],
+        caption=post_data["text_ru"],
+        reply_markup=keyboard
+    
+        )
 
-    countdown_msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд")
+    countdown_msg = try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Таймер: 60 секунд"
+        )
 
     async def update_countdown(message_id):
         for i in range(59, -1, -1):
@@ -119,21 +140,53 @@ async def publish_post():
     max_length = 280 - len(footer)
     short_text = full_text[:max_length].rstrip() + " " + footer
 
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text)
+    try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🇬🇧 Английская версия: " + short_text
+        )
 
     if TELEGRAM_PUBLIC_CHANNEL_ID:
+        try:
         await approval_bot.send_photo(
+            
             chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
             photo=post_data["image_url"],
             caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
+        
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_photo(
+            
+            chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
+        
         )
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
-    await approval_bot.send_photo(
+    try:
+        await approval_bot.send_photo(
+            
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
         caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
-    )
+    
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_photo(
+            
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        photo=post_data["image_url"],
+        caption=post_data["text_ru"] + "\n\nПолный текст: " + post_data["text_en"]
+    
+        )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global variant_index, image_index
@@ -142,43 +195,90 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
 
     if action == "approve":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован.")
+        try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Пост опубликован."
+        )
         pending_post["active"] = False
         await publish_post()
     elif action == "regenerate":
-        variant_index = (variant_index + 1) % len(ru_variants)
-        post_data["text_ru"] = ru_variants[variant_index]
-        post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
-        post_data["post_id"] += 1
-        await send_post_for_approval()
+        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед следующей генерацией текста.")
+        else:
+            variant_index = (variant_index + 1) % len(ru_variants)
+            post_data["text_ru"] = ru_variants[variant_index]
+            post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
+            post_data["post_id"] += 1
+            await send_post_for_approval()
     elif action == "new_image":
-        image_index = (image_index + 1) % len(image_variants)
-        post_data["image_url"] = image_variants[image_index]
-        post_data["post_id"] += 1
-        await send_post_for_approval()
+        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед следующей генерацией картинки.")
+        else:
+            image_index = (image_index + 1) % len(image_variants)
+            post_data["image_url"] = image_variants[image_index]
+            post_data["post_id"] += 1
+            await send_post_for_approval()
     elif action == "new_post":
-        import random
-        post_data["text_ru"] = random.choice(ru_variants)
-        post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
-        post_data["image_url"] = random.choice(image_variants)
-        post_data["post_id"] += 1
-        await send_post_for_approval()
+        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед созданием нового поста.")
+        else:
+            import random
+            post_data["text_ru"] = random.choice(ru_variants)
+            post_data["text_en"] = "[Placeholder] English version of: " + post_data["text_ru"]
+            post_data["image_url"] = random.choice(image_variants)
+            post_data["post_id"] += 1
+            await send_post_for_approval()
     elif action == "chat":
         in_dialog["active"] = True
+        try:
         await approval_bot.send_message(
+            
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
+        
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="💬 [Заглушка] Начало чата с OpenAI\n" + post_data["text_ru"]
+        
         )
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен.")
+        try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим 'Не беспокоить' включен."
+        )
     elif action == "cancel":
         pending_post["active"] = False
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена.")
+        try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🛑 Публикация отменена."
+        )
     elif action == "think":
-        pending_post["active"] = True
-        pending_post["timer"] = datetime.now()
-        await send_post_for_approval()
+        if datetime.now() - pending_post.get("timer", datetime.min) < timedelta(seconds=10):
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного перед повторной отправкой поста.")
+        else:
+            pending_post["active"] = True
+            pending_post["timer"] = datetime.now()
+            await send_post_for_approval()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_dialog["active"] or update.effective_user.id != TELEGRAM_APPROVAL_USER_ID:
@@ -194,7 +294,15 @@ async def check_timer():
         await asyncio.sleep(5)
         if pending_post["active"] and pending_post["timer"] and not do_not_disturb["active"]:
             if datetime.now() - pending_post["timer"] > timedelta(seconds=60):
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
+                try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
+        )
+    except telegram.error.RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически."
+        )
                 await publish_post()
                 pending_post["active"] = False
 
