@@ -3,12 +3,12 @@ import requests
 import tempfile
 import os
 
-# Ключи (лучше через переменные окружения!)
-API_KEY = os.getenv("API_KEY", "50VbJPNB1ONcdQY7Qlqpq3nSr")
-API_SECRET = os.getenv("API_SECRET", "hFX4qeXNFhP4vYzySYj7tcFjoK2mTmJSAwHrvdqNhwpsh45JgU")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAANkk2wEAAAAA8XR%2BqHierzWkhUVc%2FZHMShO4S5U%3Du4cH7dn5LVk9lwhj0A8eIsDpyT9xCctROuCAnUTeEqlHjRXBuF")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "1937066883548647424-TwgIiyGxGJTlH4czLq2SFyvquBnFLD")
-ACCESS_SECRET = os.getenv("ACCESS_SECRET", "49otHsBIJvWzq4e3dDG6mxUHrAD3w6zDzwKvs5tUH7KyD")
+# Используем стандартизированные переменные окружения
+API_KEY = os.getenv("TWITTER_API_KEY")
+API_SECRET = os.getenv("TWITTER_API_SECRET")
+BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
+ACCESS_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
 
 def get_api_v1():
     auth = tweepy.OAuth1UserHandler(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
