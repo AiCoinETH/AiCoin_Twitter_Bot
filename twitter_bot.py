@@ -7,8 +7,15 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
 import random
+import logging
 
 # AI-инструменты и документация: https://gptonline.ai/
+
+# --- Логирование ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+)
 
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
@@ -57,18 +64,22 @@ keyboard = InlineKeyboardMarkup([
 DB_FILE = "post_history.db"
 
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                image_hash TEXT
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    image_hash TEXT
+                )
+                """
             )
-            """
-        )
-        await db.commit()
+            await db.commit()
+        logging.info("DB initialized.")
+    except Exception as e:
+        logging.error(f"DB init error: {e}")
 
 async def save_post_to_history(text, image_url=None):
     def get_hash(url):
@@ -76,15 +87,20 @@ async def save_post_to_history(text, image_url=None):
             import requests
             r = requests.get(url)
             return hashlib.sha256(r.content).hexdigest()
-        except:
+        except Exception as e:
+            logging.error(f"Ошибка получения хэша изображения: {e}")
             return None
     h = get_hash(image_url) if image_url else None
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
-            (text, datetime.now().isoformat(), h)
-        )
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
+                (text, datetime.now().isoformat(), h)
+            )
+            await db.commit()
+        logging.info("Post saved to history.")
+    except Exception as e:
+        logging.error(f"Ошибка записи в БД: {e}")
 
 async def send_post_for_approval():
     if do_not_disturb["active"] or pending_post["active"]:
@@ -99,7 +115,9 @@ async def send_post_for_approval():
             reply_markup=keyboard
         )
         approval_message_ids["photo"] = photo_msg.message_id
+        logging.info("Post sent for approval.")
     except telegram.error.RetryAfter as e:
+        logging.warning(f"Retry after: {e.retry_after}")
         await asyncio.sleep(e.retry_after)
         photo_msg = await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -108,35 +126,46 @@ async def send_post_for_approval():
             reply_markup=keyboard
         )
         approval_message_ids["photo"] = photo_msg.message_id
+    except Exception as e:
+        logging.error(f"Ошибка отправки на согласование: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка отправки поста на согласование: {e}"
+        )
 
 async def send_timer_message():
-    countdown_msg = await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="⏳ Таймер: 60 секунд",
-        reply_markup=keyboard
-    )
-    approval_message_ids["timer"] = countdown_msg.message_id
+    try:
+        countdown_msg = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⏳ Таймер: 60 секунд",
+            reply_markup=keyboard
+        )
+        approval_message_ids["timer"] = countdown_msg.message_id
 
-    async def update_countdown_reset(message_id):
-        for i in range(59, -1, -1):
-            await asyncio.sleep(1)
-            try:
-                await approval_bot.edit_message_text(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    message_id=message_id,
-                    text=f"⏳ Таймер: {i} секунд",
-                    reply_markup=keyboard
-                )
-            except:
-                pass
-        pending_post["active"] = False
+        async def update_countdown_reset(message_id):
+            for i in range(59, -1, -1):
+                await asyncio.sleep(1)
+                try:
+                    await approval_bot.edit_message_text(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        message_id=message_id,
+                        text=f"⏳ Таймер: {i} секунд",
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    pass
+            pending_post["active"] = False
 
-    global countdown_task
-    if countdown_task is not None and not countdown_task.done():
-        countdown_task.cancel()
-    countdown_task = asyncio.create_task(update_countdown_reset(approval_message_ids["timer"]))
+        global countdown_task
+        if countdown_task is not None and not countdown_task.done():
+            countdown_task.cancel()
+        countdown_task = asyncio.create_task(update_countdown_reset(approval_message_ids["timer"]))
+        logging.info("Timer started.")
+    except Exception as e:
+        logging.error(f"Ошибка таймера: {e}")
 
 async def publish_post():
+    logging.info(f"Попытка публикации поста в канал: {TELEGRAM_CHANNEL_ID}")
     if TELEGRAM_CHANNEL_ID:
         try:
             await approval_bot.send_photo(
@@ -144,13 +173,27 @@ async def publish_post():
                 photo=post_data["image_url"],
                 caption=post_data["text_ru"]
             )
+            logging.info("Пост успешно опубликован в канал.")
         except telegram.error.RetryAfter as e:
+            logging.warning(f"Retry after: {e.retry_after}")
             await asyncio.sleep(e.retry_after)
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_ru"]
             )
+        except Exception as e:
+            logging.error(f"Ошибка публикации поста в канал: {e}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"❌ Ошибка публикации поста в канал: {e}"
+            )
+    else:
+        logging.error("TELEGRAM_CHANNEL_ID не задан!")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="❌ Ошибка: TELEGRAM_CHANNEL_ID не задан!"
+        )
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     pending_post["active"] = False
 
@@ -201,7 +244,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
             await publish_post()
         elif action == 'regenerate':
-            # ТЕСТОВАЯ ЗАГЛУШКА генерации нового текста
             text_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация нового текста (тест)...")
@@ -209,11 +251,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_data['post_id'] += 1
                 await send_post_for_approval()
             except Exception as e:
+                logging.error(f"Ошибка генерации текста: {e}")
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации текста: {e}")
             finally:
                 text_in_progress = False
         elif action == 'new_image':
-            # ТЕСТОВАЯ ЗАГЛУШКА генерации новой картинки
             image_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация новой картинки (тест)...")
@@ -222,11 +264,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_data['post_id'] += 1
                 await send_post_for_approval()
             except Exception as e:
+                logging.error(f"Ошибка генерации картинки: {e}")
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации картинки: {e}")
             finally:
                 image_in_progress = False
         elif action == 'new_post':
-            # ТЕСТОВАЯ ЗАГЛУШКА генерации всего поста
             full_in_progress = True
             try:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Генерация полного поста и картинки (тест)...")
@@ -236,6 +278,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_data['post_id'] += 1
                 await send_post_for_approval()
             except Exception as e:
+                logging.error(f"Ошибка генерации поста: {e}")
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
             finally:
                 full_in_progress = False
@@ -265,17 +308,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_post_for_approval()
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='↩️ Восстановлен предыдущий вариант поста.')
     except Exception as e:
+        logging.error(f"Ошибка обработки кнопки: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"❌ Ошибка: {e}"
         )
 
 async def delayed_start(app: Application):
+    # Логируем переменные окружения (без секретов)
+    logging.info(f"TELEGRAM_APPROVAL_CHAT_ID: {TELEGRAM_APPROVAL_CHAT_ID}")
+    logging.info(f"TELEGRAM_APPROVAL_USER_ID: {TELEGRAM_APPROVAL_USER_ID}")
+    logging.info(f"TELEGRAM_CHANNEL_ID: {TELEGRAM_CHANNEL_ID}")
+
     await init_db()
     await send_post_for_approval()
     asyncio.create_task(check_timer())
 
 def main():
+    logging.info("STARTING BOT")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(delayed_start).build()
     app.add_handler(CallbackQueryHandler(button_handler))
     app.run_polling()
