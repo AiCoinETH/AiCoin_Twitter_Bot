@@ -248,23 +248,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "post_en":
         mode = context.user_data.get("publish_mode", "twitter")
         if mode == "twitter":
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!", reply_markup=keyboard)
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!")
+            await asyncio.sleep(1.5)
+            await send_post_for_approval()
         elif mode == "telegram":
             await channel_bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
             )
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!", reply_markup=keyboard)
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!")
+            await asyncio.sleep(1.5)
+            await send_post_for_approval()
         elif mode == "both":
             await channel_bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
             )
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!", reply_markup=keyboard)
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!", reply_markup=keyboard)
-        await send_post_for_approval()
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!")
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!")
+            await asyncio.sleep(2)
+            await send_post_for_approval()
         return
     if action == "cancel_to_main":
         await send_post_for_approval()
