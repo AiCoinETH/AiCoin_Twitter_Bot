@@ -163,7 +163,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
             caption="💬 [Заглушка] Начало чата с OpenAI
-"
+""
 " + post_data["text_ru"],
             reply_markup=keyboard
         )
