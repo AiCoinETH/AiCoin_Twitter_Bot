@@ -4,8 +4,10 @@ import hashlib
 import logging
 import random
 from datetime import datetime, timedelta
-
 import tweepy
+import requests
+import tempfile
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
@@ -38,14 +40,25 @@ if not all([
     logging.error("Не заданы обязательные переменные окружения для Twitter!")
     exit(1)
 
-# ========== TWITTER AUTH ==========
-twitter_auth = tweepy.OAuth1UserHandler(
-    TWITTER_API_KEY,
-    TWITTER_API_SECRET,
-    TWITTER_ACCESS_TOKEN,
-    TWITTER_ACCESS_TOKEN_SECRET
-)
-twitter_api = tweepy.API(twitter_auth)
+# ========== TWITTER AUTH (глобальные клиенты) ==========
+def get_twitter_clients():
+    client_v2 = tweepy.Client(
+        consumer_key=TWITTER_API_KEY,
+        consumer_secret=TWITTER_API_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
+    )
+    api_v1 = tweepy.API(
+        tweepy.OAuth1UserHandler(
+            TWITTER_API_KEY,
+            TWITTER_API_SECRET,
+            TWITTER_ACCESS_TOKEN,
+            TWITTER_ACCESS_TOKEN_SECRET
+        )
+    )
+    return client_v2, api_v1
+
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
@@ -112,19 +125,23 @@ def build_twitter_post(text_en: str) -> str:
         main_part = text_en
     return main_part + signature
 
-# ========== TWITTER POST ==========
+# ========== TWITTER POST С ОБХОДОМ ==========
 def publish_post_to_twitter(text, image_url=None):
     try:
+        media_ids = None
         if image_url:
-            import requests
-            img_data = requests.get(image_url).content
-            with open('temp_img.jpg', 'wb') as handler:
-                handler.write(img_data)
-            media = twitter_api.media_upload('temp_img.jpg')
-            twitter_api.update_status(status=text, media_ids=[media.media_id])
-        else:
-            twitter_api.update_status(status=text)
-        logging.info("Пост успешно опубликован в Twitter.")
+            response = requests.get(image_url)
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                tmp.write(response.content)
+                tmp_path = tmp.name
+            try:
+                media = twitter_api_v1.media_upload(tmp_path)
+                media_ids = [media.media_id_string]
+            finally:
+                os.remove(tmp_path)
+        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        logging.info("Пост успешно опубликован в Twitter!")
         return True
     except Exception as e:
         logging.error(f"Ошибка публикации в Twitter: {e}")
@@ -148,7 +165,6 @@ async def init_db():
 
 def get_image_hash(url: str) -> str | None:
     try:
-        import requests
         r = requests.get(url, timeout=3)
         r.raise_for_status()
         return hashlib.sha256(r.content).hexdigest()
