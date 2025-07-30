@@ -14,11 +14,11 @@ import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ====== ТЕСТОВЫЕ ДАННЫЕ ГРУППЫ ======
-TELEGRAM_BOT_TOKEN_APPROVAL = "8326777624:AAG_Owp9T4zsFryttparUnqjqtrVhpHR_LQ"
-TELEGRAM_APPROVAL_CHAT_ID  = -1002892475684      # ID группы для модерации
-TELEGRAM_APPROVAL_USER_ID  = 6105016521          # не используется, просто для примера
-TELEGRAM_CHANNEL_ID        = "@test_channel_name"  # замените на свой канал или оставьте как есть для теста
+# ====== ТЕСТОВЫЕ ДАННЫЕ ======
+TELEGRAM_BOT_TOKEN_APPROVAL = "8097657551:AAFEpfksrlBc2-2PZ-ieAJg0_T3mheUv7jk"
+TELEGRAM_APPROVAL_CHAT_ID  = -1002892475684       # Ваша группа для модерации (замените если другая)
+TELEGRAM_CHANNEL_USERNAME_ID = "@AiCoin_ETH"       # username канала
+TELEGRAM_CHANNEL_ID = -1002526439177               # ID канала (используйте либо username, либо ID — но не оба сразу)
 # ====================================
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
@@ -138,27 +138,26 @@ async def send_post_for_approval():
         pending_post["active"] = False
 
 async def publish_post():
-    if not TELEGRAM_CHANNEL_ID:
-        logging.error("TELEGRAM_CHANNEL_ID не задан.")
-        return
-
-    try:
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"]
-        )
-        logging.info("Пост опубликован в канал.")
-    except telegram.error.RetryAfter as e:
-        logging.warning(f"Rate limit при публикации, ждём {e.retry_after} сек.")
-        await asyncio.sleep(e.retry_after)
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"]
-        )
-    except Exception as e:
-        logging.error(f"Ошибка публикации: {e}")
+    # Пытаться публиковать сначала по username, потом по ID (удобно для тестов)
+    channel_ids = [TELEGRAM_CHANNEL_USERNAME_ID, TELEGRAM_CHANNEL_ID]
+    published = False
+    for channel in channel_ids:
+        if not channel:
+            continue
+        try:
+            await approval_bot.send_photo(
+                chat_id=channel,
+                photo=post_data["image_url"],
+                caption=post_data["text_ru"]
+            )
+            logging.info(f"Пост опубликован в канал {channel}")
+            published = True
+            break
+        except telegram.error.TelegramError as e:
+            logging.error(f"Ошибка публикации в {channel}: {e}")
+            continue
+    if not published:
+        logging.error("Не удалось опубликовать ни в один канал!")
         return
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
