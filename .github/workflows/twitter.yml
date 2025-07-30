@@ -8,19 +8,17 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Токен вашего бота (тот же, что вы передаёте в Bot(token=…))
       TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      # Чат для одобрения (ваш личный или групповой чат)
       TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
-      TELEGRAM_APPROVAL_USER_ID: ${{ secrets.TELEGRAM_APPROVAL_USER_ID }}
-      # Username канала, в который публикуем (например '@AiCoin_ETH')
       TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      PINATA_JWT: ${{ secrets.PINATA_JWT }}
-      API_KEY: ${{ secrets.API_KEY }}
-      API_SECRET: ${{ secrets.API_SECRET }}
-      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-      ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
+
+      # Оставьте остальные переменные только если они реально используются:
+      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      # API_KEY: ${{ secrets.API_KEY }}
+      # API_SECRET: ${{ secrets.API_SECRET }}
+      # ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      # ACCESS_SECRET: ${{ secrets.ACCESS_SECRET }}
 
     steps:
       - name: Checkout repository
