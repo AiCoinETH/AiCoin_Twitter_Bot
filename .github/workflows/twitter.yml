@@ -8,11 +8,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
       TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
-      TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
 
-      # Оставьте остальные переменные только если они реально используются:
+      # Дополнительные переменные — раскомментируйте если нужны:
       # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       # PINATA_JWT: ${{ secrets.PINATA_JWT }}
       # API_KEY: ${{ secrets.API_KEY }}
