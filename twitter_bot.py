@@ -184,7 +184,7 @@ async def delayed_start(app: Application):
     await asyncio.sleep(2)
     await init_db()
     await send_post_for_approval()
-        except Exception as e:
+                except Exception as e:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка генерации поста: {e}")
                 finally:
             full_post_generation_in_progress = False
