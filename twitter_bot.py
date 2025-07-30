@@ -77,7 +77,7 @@ async def init_db():
 def get_image_hash(url: str) -> str | None:
     try:
         import requests
-        r = requests.get(url, timeout=5)
+        r = requests.get(url, timeout=3)  # Было 5, теперь 3
         r.raise_for_status()
         return hashlib.sha256(r.content).hexdigest()
     except Exception as e:
@@ -129,13 +129,14 @@ async def publish_post_to_channel():
     except Exception as e:
         logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
 
-    await save_post_to_history(post_data["text_ru"], post_data["image_url"])
+    # Логирование только по факту публикации (быстрее основной поток)
+    asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
     pending_post["active"] = False
 
 # ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)  # Было 1 секунда, теперь быстрее
         if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
             try:
                 await approval_bot.send_message(
@@ -153,7 +154,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     user_id = update.effective_user.id
     now = datetime.now()
-    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 5:
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:  # Было 5, теперь 3
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...")
         return
     last_action_time[user_id] = now
@@ -212,7 +213,8 @@ def main():
         .post_init(delayed_start)\
         .build()
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.run_polling(poll_interval=0.5, timeout=1)
+    # Ускоренный polling!
+    app.run_polling(poll_interval=0.12, timeout=1)
 
 if __name__ == "__main__":
     main()
