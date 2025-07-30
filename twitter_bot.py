@@ -99,9 +99,7 @@ def reset_timer(timeout=None):
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
-    [InlineKeyboardButton("📝 Новый текст", callback_data="regenerate")],
-    [InlineKeyboardButton("🖼️ Новая картинка", callback_data="new_image")],
-    [InlineKeyboardButton("🆕 Пост целиком", callback_data="new_post")],
+    [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
     [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
 ])
@@ -285,12 +283,10 @@ async def check_timer():
                     twitter_text = build_twitter_post(post_data["text_en"])
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
-                    # --- После публикации уведомляем, но уже без кнопок! ---
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="✅ Посты автоматически опубликованы в Telegram и Twitter."
                     )
-                    # Далее — только управляющая клавиатура:
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="Выберите действие:",
@@ -314,7 +310,6 @@ async def check_timer():
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data
     await update.callback_query.answer()
-    # --- Если пост не опубликован, продлеваем таймер на 15 минут ---
     if pending_post["active"]:
         reset_timer(TIMER_PUBLISH_EXTEND)
 
@@ -378,7 +373,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
-                reply_markup=None  # <<== КНОПОК НЕТ!
+                reply_markup=None
             )
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -459,23 +454,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Все остальные действия ---
-    if action == 'think':
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=keyboard)
-    elif action == 'regenerate':
-        post_data["text_ru"] = f"Новый тестовый текст #{post_data['post_id'] + 1}"
-        post_data["post_id"] += 1
-        if pending_post["active"]:
-            await send_post_for_approval()
-    elif action == "new_image":
-        post_data["image_url"] = random.choice([img for img in test_images if img != post_data["image_url"]])
-        if pending_post["active"]:
-            await send_post_for_approval()
-    elif action == "new_post":
+    if action == "new_post":
+        pending_post["active"] = False  # Сбрасываем старое ожидание, чтобы отправился новый пост
         post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
-        if pending_post["active"]:
-            await send_post_for_approval()
+        await send_post_for_approval()
+        return
+    elif action == 'think':
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=keyboard)
     elif action == "chat":
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
