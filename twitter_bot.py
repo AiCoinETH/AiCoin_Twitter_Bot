@@ -146,7 +146,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval()
     elif action == "chat":
         in_dialog["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 [Заглушка] Начало чата с OpenAI
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 [Заглушка] Начало чата с OpenAI")
 " + post_data["text_ru"])
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
