@@ -4,15 +4,15 @@ from telegram import Bot
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-TOKEN = "ВАШ_ТОКЕН_БОТА"  # Вставьте сюда токен вашего бота
-CHANNEL_ID = "-1002868465126"  # Или "@AiCoin_ETH"
+TOKEN = "8097657551:AAFEpfksrlBc2-2PZ-ieAJg0_T3mheUv7jk"
+CHANNEL_ID = "@AiCoin_ETH"  # Используем username канала
 
 async def main():
     bot = Bot(token=TOKEN)
-    logging.info(f"Пробуем отправить сообщение в канал: {CHANNEL_ID}")
+    logging.info(f"Пытаемся отправить сообщение в канал {CHANNEL_ID}")
     try:
-        message = await bot.send_message(chat_id=CHANNEL_ID, text="Тест публикации из асинхронного скрипта")
-        logging.info(f"Сообщение успешно отправлено, ID: {message.message_id}")
+        message = await bot.send_message(chat_id=CHANNEL_ID, text="Тест публикации из скрипта")
+        logging.info(f"Сообщение отправлено успешно, id: {message.message_id}")
     except Exception as e:
         logging.error(f"Ошибка при отправке сообщения: {e}")
 
