@@ -10,15 +10,27 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
 
-# Для большего количества примеров — https://gptonline.ai/
+# Подробные гайды и поддержка: https://gptonline.ai/
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ====== ВАШИ НАСТРОЙКИ ЗДЕСЬ ======
-TELEGRAM_BOT_TOKEN_APPROVAL = "ВАШ_ТОКЕН_БОТА"
-TELEGRAM_APPROVAL_CHAT_ID   = -1001234567890      # ID группы для модерации (целое число или в кавычках)
-TELEGRAM_CHANNEL_ID         = -1009876543210      # ID канала для публикации (или "@yourchannel")
-# ====== /ВАШИ НАСТРОЙКИ ======
+# ====== ЗАДАЁМ ЧЕРЕЗ ENV ======
+TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_CHANNEL_ID         = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
+
+if TELEGRAM_BOT_TOKEN_APPROVAL is None or TELEGRAM_APPROVAL_CHAT_ID is None or TELEGRAM_CHANNEL_ID is None:
+    logging.error("Не заданы переменные окружения TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID или TELEGRAM_CHANNEL_USERNAME_ID")
+    exit(1)
+
+try:
+    # Если ID — число (для supergroup/channel), преобразуем
+    if TELEGRAM_APPROVAL_CHAT_ID.startswith('-'):
+        TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID)
+    if TELEGRAM_CHANNEL_ID.startswith('-'):
+        TELEGRAM_CHANNEL_ID = int(TELEGRAM_CHANNEL_ID)
+except Exception:
+    pass
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
