@@ -236,3 +236,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except:
                     pass
+        asyncio.create_task(update_countdown_reset(countdown_msg.message_id))
+    elif action == 'chat':
+        chat_in_progress = True
+        try:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text='💬 [Заглушка] Начало чата с OpenAI\n' + post_data['text_ru']
+            )
+        finally:
+            chat_in_progress = False
+    elif action == 'do_not_disturb':
+        do_not_disturb['active'] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🌙 Режим "Не беспокоить" включен.')
+    elif action == 'end_day':
+        pending_post['active'] = False
+        do_not_disturb['active'] = True
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='🔚 Сегодняшняя публикация завершена.')
+    elif action == 'restore_previous':
+        post_data.update(prev_data)
+        await send_post_for_approval()
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text='↩️ Восстановлен предыдущий вариант поста.')
+
+# Функция запуска
+async def delayed_start(app: Application):
+    await init_db()
+    await send_post_for_approval()
+    asyncio.create_task(check_timer())
+
+def main():
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(delayed_start).build()
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
