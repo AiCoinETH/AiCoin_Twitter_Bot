@@ -10,23 +10,18 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import aiosqlite
 import telegram.error
 
-# Подробная документация и AI-инструменты: https://gptonline.ai/
+# Для большего количества примеров — https://gptonline.ai/
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# Переменные окружения
-TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
-TELEGRAM_APPROVAL_CHAT_ID  = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
-TELEGRAM_CHANNEL_ID        = os.getenv("TELEGRAM_CHANNEL_ID")
-
-if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_CHANNEL_ID]):
-    logging.error("Не заданы переменные окружения BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID или CHANNEL_ID")
-    exit(1)
+# ====== ВАШИ НАСТРОЙКИ ЗДЕСЬ ======
+TELEGRAM_BOT_TOKEN_APPROVAL = "ВАШ_ТОКЕН_БОТА"
+TELEGRAM_APPROVAL_CHAT_ID   = -1001234567890      # ID группы для модерации (целое число или в кавычках)
+TELEGRAM_CHANNEL_ID         = -1009876543210      # ID канала для публикации (или "@yourchannel")
+# ====== /ВАШИ НАСТРОЙКИ ======
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 
-# Тестовые картинки и начальные данные для поста
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -42,14 +37,11 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# Сервисы управления состоянием
 do_not_disturb       = {"active": False}
 pending_post         = {"active": False, "timer": None}
-countdown_task: any  = None
 last_action_time     = {}
 approval_message_ids = {"photo": None, "timer": None}
 
-# Клавиатура для модерации
 keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("✅ Пост", callback_data="approve")],
     [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
@@ -66,7 +58,6 @@ DB_FILE = "post_history.db"
 
 
 async def init_db():
-    """Инициализация SQLite для истории постов."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
@@ -81,7 +72,6 @@ async def init_db():
 
 
 def get_image_hash(url: str) -> str | None:
-    """Возвращает SHA256-хэш содержимого изображения по URL."""
     try:
         import requests
         r = requests.get(url, timeout=5)
@@ -93,7 +83,6 @@ def get_image_hash(url: str) -> str | None:
 
 
 async def save_post_to_history(text: str, image_url: str | None = None):
-    """Сохраняет опубликованный пост в историю для последующего контроля дубликатов."""
     image_hash = get_image_hash(image_url) if image_url else None
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
@@ -105,7 +94,6 @@ async def save_post_to_history(text: str, image_url: str | None = None):
 
 
 async def is_duplicate(text: str, image_url: str) -> bool:
-    """Проверяет, публиковался ли уже аналогичный текст или изображение."""
     img_hash = get_image_hash(image_url)
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute(
@@ -117,7 +105,6 @@ async def is_duplicate(text: str, image_url: str) -> bool:
 
 
 async def send_post_for_approval():
-    """Отправляет пост на согласование в группу."""
     if do_not_disturb["active"]:
         logging.info("Режим 'Не беспокоить' активен — пропуск отправки.")
         return
@@ -126,7 +113,6 @@ async def send_post_for_approval():
         logging.info("Уже есть активный пост — ожидаем решения.")
         return
 
-    # Проверка на дубликат
     if await is_duplicate(post_data["text_ru"], post_data["image_url"]):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -134,7 +120,6 @@ async def send_post_for_approval():
         )
         return
 
-    # Запуск таймера и отправка
     post_data["timestamp"] = datetime.now()
     pending_post.update({"active": True, "timer": datetime.now()})
     try:
@@ -146,7 +131,7 @@ async def send_post_for_approval():
         )
         approval_message_ids["photo"] = photo_msg.message_id
 
-        # Отображаем обратный отсчёт 60 секунд
+        # 60 секунд на решение
         for sec in range(59, -1, -1):
             await asyncio.sleep(1)
             try:
@@ -166,7 +151,6 @@ async def send_post_for_approval():
 
 
 async def publish_post():
-    """Публикует одобренный пост в канал и сохраняет его в историю."""
     if not TELEGRAM_CHANNEL_ID:
         logging.error("TELEGRAM_CHANNEL_ID не задан.")
         return
@@ -195,7 +179,6 @@ async def publish_post():
 
 
 async def check_timer():
-    """Если модерация не завершилась за 60 сек — публикуем автоматически."""
     while True:
         await asyncio.sleep(5)
         if pending_post["active"] and pending_post["timer"]:
@@ -208,15 +191,13 @@ async def check_timer():
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий кнопок модерации."""
-    global countdown_task, prev_data
+    global prev_data
 
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
     now = datetime.now()
-    # Антиспам
     if user_id in last_action_time and (now - last_action_time[user_id]).total_seconds() < 15:
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -234,8 +215,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await publish_post()
 
         elif action == "think":
-            if countdown_task and not countdown_task.done():
-                countdown_task.cancel()
             pending_post["timer"] = datetime.now()
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…")
 
