@@ -77,7 +77,7 @@ async def init_db():
 def get_image_hash(url: str) -> str | None:
     try:
         import requests
-        r = requests.get(url, timeout=3)  # Было 5, теперь 3
+        r = requests.get(url, timeout=3)
         r.raise_for_status()
         return hashlib.sha256(r.content).hexdigest()
     except Exception as e:
@@ -122,21 +122,37 @@ async def publish_post_to_channel():
             caption=post_data["text_ru"]
         )
         logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}, message_id={msg.message_id}")
+        # Сообщение модераторам, что пост реально опубликован
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"✅ Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}!\n\nСсылка: https://t.me/{TELEGRAM_CHANNEL_USERNAME_ID.lstrip('@')}/{msg.message_id}"
+        )
     except telegram.error.Forbidden as e:
         logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="❌ Не удалось опубликовать пост: у бота нет прав или он не в канале!"
+        )
     except telegram.error.BadRequest as e:
         logging.error(f"BadRequest: Проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка: проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}!"
+        )
     except Exception as e:
         logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="❌ Ошибка публикации в канал!"
+        )
 
-    # Логирование только по факту публикации (быстрее основной поток)
     asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
     pending_post["active"] = False
 
 # ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
-        await asyncio.sleep(0.3)  # Было 1 секунда, теперь быстрее
+        await asyncio.sleep(0.3)
         if pending_post["active"] and pending_post.get("timer") and (datetime.now() - pending_post["timer"]) > timedelta(seconds=60):
             try:
                 await approval_bot.send_message(
@@ -154,7 +170,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     user_id = update.effective_user.id
     now = datetime.now()
-    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:  # Было 5, теперь 3
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...")
         return
     last_action_time[user_id] = now
