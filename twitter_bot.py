@@ -151,9 +151,7 @@ async def publish_post():
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
                 photo=post_data["image_url"],
-                caption=post_data["text_en"] + "
-
-📎 Читайте нас также на сайте: https://getaicoin.com/"
+                caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
             )
         except telegram.error.RetryAfter as e:
             await asyncio.sleep(e.retry_after)
