@@ -158,9 +158,7 @@ async def publish_post():
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_PUBLIC_CHANNEL_ID,
                 photo=post_data["image_url"],
-                caption=post_data["text_en"] + "
-
-📎 Читайте нас также на сайте: https://getaicoin.com/"
+                caption=post_data["text_en"] + "\n\n📎 Читайте нас также на сайте: https://getaicoin.com/"
             )
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
