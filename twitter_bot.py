@@ -165,6 +165,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="💬 [Заглушка] Начало чата с OpenAI
 " + post_data["text_ru"],
             reply_markup=keyboard
+        ),
+            reply_markup=keyboard
         )
     elif action == "do_not_disturb":
         do_not_disturb["active"] = True
