@@ -15,10 +15,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
-TELEGRAM_CHANNEL_ID         = os.getenv("TELEGRAM_CHANNEL_ID")  # '@AiCoin_ETH' или '-100...'
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # '@AiCoin_ETH'
 
-if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_ID:
-    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID или CHANNEL_ID)")
+if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_USERNAME_ID:
+    logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID или CHANNEL_USERNAME_ID)")
     exit(1)
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
@@ -115,17 +115,17 @@ async def send_post_for_approval():
 async def publish_post_to_channel():
     try:
         msg = await approval_bot.send_photo(
-            chat_id=TELEGRAM_CHANNEL_ID,
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
             photo=post_data["image_url"],
             caption=post_data["text_ru"]
         )
-        logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_ID}, message_id={msg.message_id}")
+        logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}, message_id={msg.message_id}")
     except telegram.error.Forbidden as e:
-        logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_ID}: {e}")
+        logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
     except telegram.error.BadRequest as e:
-        logging.error(f"BadRequest: Проверьте ID/username канала {TELEGRAM_CHANNEL_ID}: {e}")
+        logging.error(f"BadRequest: Проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
     except Exception as e:
-        logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_ID}: {e}")
+        logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
 
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
     pending_post["active"] = False
