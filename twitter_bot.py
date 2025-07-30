@@ -17,9 +17,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0"))
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # Для публикаций в канал
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # username канала, например '@AiCoin_ETH'
 
-if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_ID:
+if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_CHANNEL_USERNAME_ID:
     logging.error("Переменные окружения для бота или каналов не заданы. Завершение работы.")
     exit(1)
 
@@ -151,35 +151,36 @@ async def send_timer_message():
 
 async def publish_post():
     global pending_post
-    if TELEGRAM_CHANNEL_ID:
+    if TELEGRAM_CHANNEL_USERNAME_ID:
         try:
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
+            logging.info(f"Публикация поста в канал {TELEGRAM_CHANNEL_USERNAME_ID}...")
+            msg = await approval_bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_ru"]
             )
-            logging.info("Пост опубликован в канал.")
+            logging.info(f"Пост опубликован в канал, message_id={msg.message_id}")
         except telegram.error.RetryAfter as e:
             logging.warning(f"Rate limit при публикации, ждем {e.retry_after} сек.")
             await asyncio.sleep(e.retry_after)
             await approval_bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                 photo=post_data["image_url"],
                 caption=post_data["text_ru"]
             )
         except Exception as e:
             logging.error(f"Ошибка публикации поста в канал: {e}")
     else:
-        logging.error("TELEGRAM_CHANNEL_ID не задан.")
+        logging.error("TELEGRAM_CHANNEL_USERNAME_ID не задан.")
     await save_post_to_history(post_data["text_ru"], post_data["image_url"])
 
-    # Сбрасываем флаги после публикации, чтобы разрешить следующие посты
     pending_post["active"] = False
     global text_in_progress, image_in_progress, full_in_progress, chat_in_progress
     text_in_progress = False
     image_in_progress = False
     full_in_progress = False
     chat_in_progress = False
+    logging.info("Публикация завершена, флаги сброшены.")
 
 async def check_timer():
     while True:
@@ -225,6 +226,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prev_data.update(post_data)
 
         if action == 'approve':
+            logging.info(f"Пользователь {user_id} нажал кнопку 'approve'")
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Обработка публикации...")
             await publish_post()
 
