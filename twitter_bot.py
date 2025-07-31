@@ -1,5 +1,4 @@
 import os
-import sys
 import asyncio
 import hashlib
 import logging
@@ -16,11 +15,13 @@ import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+# --- Переменные окружения и настройки ---
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
 
+# Для GitHub Actions запуск из телеги
 ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB") or os.getenv("ACTION_PAT")
 ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB") or os.getenv("ACTION_REPO")
 ACTION_EVENT_GITHUB = os.getenv("ACTION_EVENT_GITHUB") or os.getenv("ACTION_EVENT") or "telegram-bot-restart"
@@ -61,9 +62,11 @@ def get_twitter_clients():
     return client_v2, api_v1
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
+# --- FSM состояния ---
 FSM = {
     "SLEEP": "sleep_today",
     "AUTO": "auto_mode",
@@ -71,6 +74,7 @@ FSM = {
 }
 fsm_state = {"current": FSM["MANUAL"]}
 
+# --- Данные для теста и временные переменные ---
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -86,6 +90,7 @@ post_data = {
     "text_en":   "Mining tokens are back in focus. Example of a full English post for Telegram or short version for Twitter!"
 }
 prev_data = post_data.copy()
+
 user_self_post = {}
 
 TIMER_PUBLISH_DEFAULT = 180
@@ -113,7 +118,7 @@ def main_keyboard():
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],  # <<---- КНОПКА ПОЛНОГО ВЫКЛЮЧЕНИЯ
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],  # добавлено!
     ])
 
 def post_choice_keyboard():
@@ -139,8 +144,7 @@ def post_end_keyboard():
         [InlineKeyboardButton("▶️ Старт (GitHub Action)", callback_data="run_github_action")],
         [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],  # <<---- КНОПКА ПОЛНОГО ВЫКЛЮЧЕНИЯ
+        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
 def auto_mode_keyboard(next_time=None):
@@ -161,7 +165,7 @@ def sleep_keyboard(next_time=None):
 def generate_random_schedule(
     posts_per_day=6,
     day_start_hour=6,
-    day_end_hour=23,
+    day_end_hour=24,
     min_offset=-20,
     max_offset=20
 ):
@@ -170,7 +174,7 @@ def generate_random_schedule(
     start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
     if now > start:
         start = now + timedelta(seconds=1)
-    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=59, second=59))
+    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
     total_seconds = int((end - start).total_seconds())
     if posts_per_day < 1:
         return []
@@ -418,6 +422,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
+    # --- Выключение по кнопке ---
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
         await approval_bot.send_message(
@@ -426,8 +431,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await asyncio.sleep(2)
         os._exit(0)
-
-    # ----- Остальная логика твоих кнопок идёт ниже -----
 
     if action == "self_post":
         try:
@@ -513,9 +516,184 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ... ВЕСЬ ОСТАЛЬНОЙ КОД обработчика кнопок (approve, post_twitter, post_telegram, post_both, post_en, cancel_to_choice, new_post, new_post_manual, think, chat, do_not_disturb, restore_previous, end_day)
-    # Смотри, вся эта часть остается полностью, как в твоем оригинале.
-    # Если нужно, могу сюда вставить остальные кнопки как в твоем последнем файле (скажи если хочешь полностью)!
+    if action == 'approve':
+        twitter_text = build_twitter_post(post_data["text_en"])
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=twitter_text,
+            reply_markup=post_choice_keyboard()
+        )
+        return
+
+    if action == "post_twitter":
+        twitter_text = build_twitter_post(post_data["text_en"])
+        context.user_data["publish_mode"] = "twitter"
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=twitter_text,
+            reply_markup=post_action_keyboard()
+        )
+        return
+    if action == "post_telegram":
+        context.user_data["publish_mode"] = "telegram"
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/",
+            reply_markup=post_action_keyboard()
+        )
+        return
+    if action == "post_both":
+        twitter_text = build_twitter_post(post_data["text_en"])
+        context.user_data["publish_mode"] = "both"
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=twitter_text,
+            reply_markup=post_action_keyboard()
+        )
+        return
+    if action == "post_en":
+        mode = context.user_data.get("publish_mode", "twitter")
+        twitter_text = build_twitter_post(post_data["text_en"])
+        twitter_success = False
+        telegram_success = False
+        is_manual = post_data.get("is_manual", False)
+        if mode == "twitter":
+            twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+            pending_post["active"] = False
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
+                reply_markup=None
+            )
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Выберите действие:",
+                reply_markup=post_end_keyboard()
+            )
+        elif mode == "telegram":
+            try:
+                await channel_bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
+                )
+                telegram_success = True
+            except Exception as e:
+                logging.error(f"Ошибка при публикации в Telegram: {e}")
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Не удалось отправить в Telegram: {e}",
+                    reply_markup=None
+                )
+            pending_post["active"] = False
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
+                reply_markup=None
+            )
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Выберите действие:",
+                reply_markup=post_end_keyboard()
+            )
+        elif mode == "both":
+            try:
+                await channel_bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"] + "\n\n🌐 https://getaicoin.com/"
+                )
+                telegram_success = True
+            except Exception as e:
+                logging.error(f"Ошибка при публикации в Telegram: {e}")
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Не удалось отправить в Telegram: {e}",
+                    reply_markup=None
+                )
+            twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+            pending_post["active"] = False
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
+                reply_markup=None
+            )
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
+                reply_markup=None
+            )
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Выберите действие:",
+                reply_markup=post_end_keyboard()
+            )
+        if is_manual:
+            manual_posts_today += 1
+            post_data["is_manual"] = False
+        return
+    if action == "cancel_to_choice":
+        twitter_text = build_twitter_post(post_data["text_en"])
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=twitter_text,
+            reply_markup=post_choice_keyboard()
+        )
+        return
+
+    if action == "new_post":
+        pending_post["active"] = False
+        post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
+        post_data["image_url"] = random.choice(test_images)
+        post_data["post_id"] += 1
+        post_data["is_manual"] = False
+        await send_post_for_approval()
+        return
+    if action == "new_post_manual":
+        pending_post["active"] = False
+        post_data["text_ru"] = f"Ручной новый пост #{post_data['post_id'] + 1}"
+        post_data["image_url"] = random.choice(test_images)
+        post_data["post_id"] += 1
+        post_data["is_manual"] = True
+        await send_post_for_approval()
+        return
+    elif action == 'think':
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=main_keyboard())
+    elif action == "chat":
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="💬 Начинаем чат:\n" + post_data["text_ru"],
+            reply_markup=post_end_keyboard()
+        )
+    elif action == "do_not_disturb":
+        do_not_disturb["active"] = not do_not_disturb["active"]
+        status = "включён" if do_not_disturb["active"] else "выключен"
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"🌙 Режим «Не беспокоить» {status}.",
+            reply_markup=post_end_keyboard()
+        )
+    elif action == "restore_previous":
+        post_data.update(prev_data)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=main_keyboard())
+        if pending_post["active"]:
+            await send_post_for_approval()
+    elif action == "end_day":
+        pending_post["active"] = False
+        do_not_disturb["active"] = True
+        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=9))
+        kb, txt = sleep_keyboard(next_time=tomorrow)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена на сегодня.\n{txt}", parse_mode="HTML", reply_markup=kb)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Выберите действие:",
+            reply_markup=main_keyboard()
+        )
 
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
