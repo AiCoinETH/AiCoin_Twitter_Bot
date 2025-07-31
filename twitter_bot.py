@@ -8,7 +8,7 @@ import tweepy
 import requests
 import tempfile
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, ReplyKeyboardRemove
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
 import telegram.error
@@ -21,7 +21,7 @@ TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
 
-ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB") or os.getenv("ACTION_PAT")  # для гибкости
+ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB") or os.getenv("ACTION_PAT")
 ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB") or os.getenv("ACTION_REPO")
 ACTION_EVENT_GITHUB = os.getenv("ACTION_EVENT_GITHUB") or os.getenv("ACTION_EVENT") or "telegram-bot-restart"
 
@@ -83,7 +83,7 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# ========== КОНТЕКСТ РУЧНОГО ПОСТА ==========
+# ========== Контекст для ручного поста ==========
 user_self_post = {}  # user_id -> {'text': '', 'image': None, 'state': ''}
 
 # ========== ТАЙМЕРЫ И КОЛ-ВО ПОСТОВ ==========
@@ -122,7 +122,7 @@ def post_choice_keyboard():
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("▶️ Старт (GitHub Action)", callback_data="run_github_action")],
-        [InlineKeyboardButton("Отмена", callback_data="cancel_to_main")]
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
 
 def post_action_keyboard():
@@ -141,12 +141,6 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-def self_post_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-    ])
-
 # ========== ГЕНЕРАЦИЯ РАСПИСАНИЯ ==========
 def generate_random_schedule(
     posts_per_day=6,
@@ -157,7 +151,6 @@ def generate_random_schedule(
 ):
     now = datetime.now()
     today = now.date()
-    # Не начинать публикацию в прошлом, если бот запущен днем
     start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
     if now > start:
         start = now + timedelta(seconds=1)
@@ -172,7 +165,6 @@ def generate_random_schedule(
         base_sec = i * base_step
         offset_sec = random.randint(min_offset * 60, max_offset * 60) + random.randint(-59, 59)
         post_time = start + timedelta(seconds=base_sec + offset_sec)
-        # Не выходить за границы
         if post_time < start:
             post_time = start
         if post_time > end:
@@ -200,16 +192,20 @@ def publish_post_to_twitter(text, image_url=None):
     try:
         media_ids = None
         if image_url:
-            response = requests.get(image_url)
-            response.raise_for_status()
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
-            try:
-                media = twitter_api_v1.media_upload(tmp_path)
-                media_ids = [media.media_id_string]
-            finally:
-                os.remove(tmp_path)
+            if image_url.startswith('http'):
+                response = requests.get(image_url)
+                response.raise_for_status()
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                    tmp.write(response.content)
+                    tmp_path = tmp.name
+                try:
+                    media = twitter_api_v1.media_upload(tmp_path)
+                    media_ids = [media.media_id_string]
+                finally:
+                    os.remove(tmp_path)
+            else:
+                # Если file_id Telegram, не прикладываем картинку
+                media_ids = None
         twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
         logging.info("Пост успешно опубликован в Twitter!")
         return True
@@ -361,13 +357,13 @@ async def check_timer():
                         reply_markup=post_end_keyboard()
                     )
                     logging.error(f"Ошибка при автопубликации: {e}")
-                pending_post["active"] = False  # Остановить все таймеры этого поста
+                pending_post["active"] = False
 
 # ========== АСИНХРОННОЕ РАСПИСАНИЕ ==========
 async def schedule_daily_posts():
     global manual_posts_today
     while True:
-        manual_posts_today = 0  # сбрасываем счетчик ручных постов каждый новый день
+        manual_posts_today = 0
         now = datetime.now()
         if now.hour < 6:
             to_sleep = (datetime.combine(now.date(), dt_time(hour=6)) - now).total_seconds()
@@ -379,7 +375,6 @@ async def schedule_daily_posts():
             schedule = generate_random_schedule(posts_per_day=posts_left())
             logging.info(f"Расписание авто-постов на сегодня: {[t.strftime('%H:%M:%S') for t in schedule]}")
             for post_time in schedule:
-                # Пересчёт в реальном времени — если ручной пост был опубликован, уменьшается оставшееся число
                 if posts_left() <= 0:
                     break
                 now = datetime.now()
@@ -393,14 +388,12 @@ async def schedule_daily_posts():
                 post_data["post_id"] += 1
                 post_data["is_manual"] = False
                 await send_post_for_approval()
-                # Ждём публикации поста или автотаймаута (автоматическая публикация по таймеру)
                 while pending_post["active"]:
                     await asyncio.sleep(1)
-        # Ждём до следующего дня
         tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=0))
         to_next_day = (tomorrow - datetime.now()).total_seconds()
         await asyncio.sleep(to_next_day)
-        manual_posts_today = 0  # сбрасываем в начале нового дня
+        manual_posts_today = 0
 
 # ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,26 +411,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # --- "Сделай сам" логика ---
+    # ----------- СДЕЛАЙ САМ -------------
     if action == "self_post":
-        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_text'}
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✍️ Напиши свой текст поста. Затем (по желанию) отправь фото, потом нажми «Завершить генерацию».",
-            reply_markup=self_post_keyboard()
+            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками."
         )
         return
 
+    # ----------- ОТМЕНА (ВОЗВРАТ В ГЛАВНОЕ МЕНЮ) -------------
+    if action == "cancel_to_main":
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+        user_self_post.pop(user_id, None)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Главное меню:",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    # ----------- ЗАВЕРШИТЬ ГЕНЕРАЦИЮ -------------
     if action == "finish_self_post":
         data = user_self_post.get(user_id)
         if not data or not data.get('text'):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="⚠️ Сначала отправь текст поста!",
-                reply_markup=self_post_keyboard()
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
             )
             return
-        # Предпросмотр (с картинкой, если была)
+        # Предпросмотр с выбором публикации
         if data.get('image'):
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -452,8 +465,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=post_choice_keyboard()
             )
         post_data["text_ru"] = data['text']
-        post_data["text_en"] = data['text']  # Для упрощения
-        post_data["image_url"] = data.get('image')  # file_id телеги (для Telegram), url для Twitter не поддерживается
+        post_data["text_en"] = data['text']
+        post_data["image_url"] = data.get('image')
         post_data["is_manual"] = True
         user_self_post.pop(user_id, None)
         return
@@ -604,20 +617,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="Выберите действие:",
                 reply_markup=post_end_keyboard()
             )
-        # После публикации ручного поста - уменьшаем число авто-постов
         if is_manual:
             manual_posts_today += 1
             post_data["is_manual"] = False
-        return
-    if action == "cancel_to_main":
-        if pending_post["active"]:
-            await send_post_for_approval()
-        else:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Главное меню:",
-                reply_markup=main_keyboard()
-            )
         return
     if action == "cancel_to_choice":
         twitter_text = build_twitter_post(post_data["text_en"])
@@ -674,32 +676,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ "СДЕЛАЙ САМ" ==========
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in user_self_post:
-        data = user_self_post[user_id]
-        # Текст (всегда первым)
-        if data['state'] == 'wait_text' and update.message.text:
-            data['text'] = update.message.text
-            data['state'] = 'wait_image'
-            await approval_bot.send_message(
+    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
+        text = update.message.text or ""
+        image = None
+        if update.message.photo:
+            image = update.message.photo[-1].file_id
+        user_self_post[user_id]['text'] = text
+        user_self_post[user_id]['image'] = image
+        user_self_post[user_id]['state'] = 'wait_confirm'
+        # предпросмотр
+        if image:
+            await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Текст получен! Теперь можешь отправить картинку или сразу нажать «Завершить генерацию».",
-                reply_markup=self_post_keyboard()
-            )
-        # Картинка
-        elif update.message.photo:
-            photo = update.message.photo[-1].file_id
-            data['image'] = photo
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Картинка получена! Теперь нажми «Завершить генерацию».",
-                reply_markup=self_post_keyboard()
+                photo=image,
+                caption=text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
             )
         else:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Пожалуйста, отправь текст или картинку, либо нажми «Завершить генерацию».",
-                reply_markup=self_post_keyboard()
+                text=text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
             )
+        return
 
 # ========== ЗАПУСК ==========
 async def delayed_start(app: Application):
