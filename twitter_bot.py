@@ -8,8 +8,8 @@ import tweepy
 import requests
 import tempfile
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, ReplyKeyboardRemove
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
 import telegram.error
 
@@ -20,6 +20,10 @@ TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
+
+ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB") or os.getenv("ACTION_PAT")  # для гибкости
+ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB") or os.getenv("ACTION_REPO")
+ACTION_EVENT_GITHUB = os.getenv("ACTION_EVENT_GITHUB") or os.getenv("ACTION_EVENT") or "telegram-bot-restart"
 
 if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEGRAM_BOT_TOKEN_CHANNEL or not TELEGRAM_CHANNEL_USERNAME_ID:
     logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID, BOT_TOKEN_CHANNEL или CHANNEL_USERNAME_ID)")
@@ -62,38 +66,6 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
-# ========== ДОБАВЛЕНО ДЛЯ TWITTER FOLLOWERS ==========
-def get_twitter_followers_count():
-    user = twitter_api_v1.get_user(screen_name="AiCoin_ETH")
-    return user.followers_count
-
-async def update_pinned_message_with_followers():
-    followers = get_twitter_followers_count()
-    text = (
-        f"🅧: <b>{followers}</b>\n"
-        "Subscribe: https://x.com/AiCoin_ETH\n"
-        "🌐: https://getaicoin.com"
-    )
-    chat = await channel_bot.get_chat(TELEGRAM_CHANNEL_USERNAME_ID)
-    pinned = chat.pinned_message
-    if pinned:
-        await channel_bot.edit_message_text(
-            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-            message_id=pinned.message_id,
-            text=text,
-            parse_mode='HTML'
-        )
-    else:
-        msg = await channel_bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-            text=text,
-            parse_mode='HTML'
-        )
-        await channel_bot.pin_chat_message(
-            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-            message_id=msg.message_id
-        )
-
 # ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
@@ -110,6 +82,9 @@ post_data = {
     "text_en":   "Mining tokens are back in focus. Example of a full English post for Telegram or short version for Twitter!"
 }
 prev_data = post_data.copy()
+
+# ========== КОНТЕКСТ РУЧНОГО ПОСТА ==========
+user_self_post = {}  # user_id -> {'text': '', 'image': None, 'state': ''}
 
 # ========== ТАЙМЕРЫ И КОЛ-ВО ПОСТОВ ==========
 TIMER_PUBLISH_DEFAULT = 180    # 3 минуты после отправки на модерацию
@@ -130,19 +105,23 @@ def reset_timer(timeout=None):
         pending_post["timeout"] = timeout
 
 # ========== КЛАВИАТУРЫ ==========
-keyboard = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Пост", callback_data="approve")],
-    [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
-    [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
-    [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-    [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
-])
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Пост", callback_data="approve")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
+        [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
+        [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
+        [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")]
+    ])
 
 def post_choice_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("▶️ Старт (GitHub Action)", callback_data="run_github_action")],
         [InlineKeyboardButton("Отмена", callback_data="cancel_to_main")]
     ])
 
@@ -152,12 +131,21 @@ def post_action_keyboard():
         [InlineKeyboardButton("Отмена", callback_data="cancel_to_choice")]
     ])
 
-post_end_keyboard = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post_manual")],
-    [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-    [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-    [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
-])
+def post_end_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post_manual")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("▶️ Старт (GitHub Action)", callback_data="run_github_action")],
+        [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
+        [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
+        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
+    ])
+
+def self_post_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+    ])
 
 # ========== ГЕНЕРАЦИЯ РАСПИСАНИЯ ==========
 def generate_random_schedule(
@@ -291,7 +279,7 @@ async def send_post_for_approval():
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             photo=post_data["image_url"],
             caption=post_data["text_ru"],
-            reply_markup=keyboard
+            reply_markup=main_keyboard()
         )
         approval_message_ids["photo"] = photo_msg.message_id
         logging.info("Пост отправлен на согласование.")
@@ -359,7 +347,7 @@ async def check_timer():
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="Выберите действие:",
-                        reply_markup=post_end_keyboard
+                        reply_markup=post_end_keyboard()
                     )
                 except Exception as e:
                     pending_post["active"] = False
@@ -370,7 +358,7 @@ async def check_timer():
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="Выберите действие:",
-                        reply_markup=post_end_keyboard
+                        reply_markup=post_end_keyboard()
                     )
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False  # Остановить все таймеры этого поста
@@ -424,11 +412,80 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=main_keyboard())
         return
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
+
+    # --- "Сделай сам" логика ---
+    if action == "self_post":
+        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_text'}
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✍️ Напиши свой текст поста. Затем (по желанию) отправь фото, потом нажми «Завершить генерацию».",
+            reply_markup=self_post_keyboard()
+        )
+        return
+
+    if action == "finish_self_post":
+        data = user_self_post.get(user_id)
+        if not data or not data.get('text'):
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="⚠️ Сначала отправь текст поста!",
+                reply_markup=self_post_keyboard()
+            )
+            return
+        # Предпросмотр (с картинкой, если была)
+        if data.get('image'):
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=data['image'],
+                caption=data['text'],
+                reply_markup=post_choice_keyboard()
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=data['text'],
+                reply_markup=post_choice_keyboard()
+            )
+        post_data["text_ru"] = data['text']
+        post_data["text_en"] = data['text']  # Для упрощения
+        post_data["image_url"] = data.get('image')  # file_id телеги (для Telegram), url для Twitter не поддерживается
+        post_data["is_manual"] = True
+        user_self_post.pop(user_id, None)
+        return
+
+    if action == "run_github_action":
+        github_token = ACTION_PAT_GITHUB
+        repo = ACTION_REPO_GITHUB
+        event_type = ACTION_EVENT_GITHUB
+        api_url = f"https://api.github.com/repos/{repo}/dispatches"
+        headers = {
+            "Authorization": f"token {github_token}",
+            "Accept": "application/vnd.github+json"
+        }
+        data = {"event_type": event_type}
+        try:
+            resp = requests.post(api_url, headers=headers, json=data)
+            if resp.status_code in [200, 201, 202]:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="▶️ GitHub Action успешно запущен!"
+                )
+            else:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Ошибка запуска GitHub Action: {resp.status_code} {resp.text}"
+                )
+        except Exception as e:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"❌ Ошибка при запуске GitHub: {e}"
+            )
+        return
 
     # --- Новая ветка: после "✅ Пост" ---
     if action == 'approve':
@@ -487,7 +544,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Выберите действие:",
-                reply_markup=post_end_keyboard
+                reply_markup=post_end_keyboard()
             )
         elif mode == "telegram":
             try:
@@ -513,7 +570,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Выберите действие:",
-                reply_markup=post_end_keyboard
+                reply_markup=post_end_keyboard()
             )
         elif mode == "both":
             try:
@@ -545,7 +602,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Выберите действие:",
-                reply_markup=post_end_keyboard
+                reply_markup=post_end_keyboard()
             )
         # После публикации ручного поста - уменьшаем число авто-постов
         if is_manual:
@@ -555,6 +612,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "cancel_to_main":
         if pending_post["active"]:
             await send_post_for_approval()
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Главное меню:",
+                reply_markup=main_keyboard()
+            )
         return
     if action == "cancel_to_choice":
         twitter_text = build_twitter_post(post_data["text_en"])
@@ -583,12 +646,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval()
         return
     elif action == 'think':
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=main_keyboard())
     elif action == "chat":
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="💬 Начинаем чат:\n" + post_data["text_ru"],
-            reply_markup=post_end_keyboard
+            reply_markup=post_end_keyboard()
         )
     elif action == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
@@ -596,17 +659,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🌙 Режим «Не беспокоить» {status}.",
-            reply_markup=post_end_keyboard
+            reply_markup=post_end_keyboard()
         )
     elif action == "restore_previous":
         post_data.update(prev_data)
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=main_keyboard())
         if pending_post["active"]:
             await send_post_for_approval()
     elif action == "end_day":
         pending_post["active"] = False
         do_not_disturb["active"] = True
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Завершили публикации на сегодня.", reply_markup=post_end_keyboard)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Завершили публикации на сегодня.", reply_markup=post_end_keyboard())
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ "СДЕЛАЙ САМ" ==========
+async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in user_self_post:
+        data = user_self_post[user_id]
+        # Текст (всегда первым)
+        if data['state'] == 'wait_text' and update.message.text:
+            data['text'] = update.message.text
+            data['state'] = 'wait_image'
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Текст получен! Теперь можешь отправить картинку или сразу нажать «Завершить генерацию».",
+                reply_markup=self_post_keyboard()
+            )
+        # Картинка
+        elif update.message.photo:
+            photo = update.message.photo[-1].file_id
+            data['image'] = photo
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Картинка получена! Теперь нажми «Завершить генерацию».",
+                reply_markup=self_post_keyboard()
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Пожалуйста, отправь текст или картинку, либо нажми «Завершить генерацию».",
+                reply_markup=self_post_keyboard()
+            )
 
 # ========== ЗАПУСК ==========
 async def delayed_start(app: Application):
@@ -614,7 +707,6 @@ async def delayed_start(app: Application):
     asyncio.create_task(schedule_daily_posts())
     await send_post_for_approval()
     asyncio.create_task(check_timer())
-    await update_pinned_message_with_followers()  # <<< ДОБАВЛЕНО!
     logging.info("Бот запущен и готов к работе.")
 
 def main():
@@ -624,6 +716,7 @@ def main():
         .post_init(delayed_start)\
         .build()
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, self_post_message_handler))
     app.run_polling(poll_interval=0.12, timeout=1)
 
 if __name__ == "__main__":
