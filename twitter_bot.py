@@ -62,6 +62,38 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
+# ========== ДОБАВЛЕНО ДЛЯ TWITTER FOLLOWERS ==========
+def get_twitter_followers_count():
+    user = twitter_api_v1.get_user(screen_name="AiCoin_ETH")
+    return user.followers_count
+
+async def update_pinned_message_with_followers():
+    followers = get_twitter_followers_count()
+    text = (
+        f"🅧: <b>{followers}</b>\n"
+        "Subscribe: https://x.com/AiCoin_ETH\n"
+        "🌐: https://getaicoin.com"
+    )
+    chat = await channel_bot.get_chat(TELEGRAM_CHANNEL_USERNAME_ID)
+    pinned = chat.pinned_message
+    if pinned:
+        await channel_bot.edit_message_text(
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+            message_id=pinned.message_id,
+            text=text,
+            parse_mode='HTML'
+        )
+    else:
+        msg = await channel_bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+            text=text,
+            parse_mode='HTML'
+        )
+        await channel_bot.pin_chat_message(
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+            message_id=msg.message_id
+        )
+
 # ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
@@ -582,6 +614,7 @@ async def delayed_start(app: Application):
     asyncio.create_task(schedule_daily_posts())
     await send_post_for_approval()
     asyncio.create_task(check_timer())
+    await update_pinned_message_with_followers()  # <<< ДОБАВЛЕНО!
     logging.info("Бот запущен и готов к работе.")
 
 def main():
