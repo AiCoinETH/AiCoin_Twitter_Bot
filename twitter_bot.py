@@ -440,9 +440,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # ... (остальная логика без изменений)
-    # Ниже только обработка end_day меняется на вызов shutdown
-
     if action == "end_day":
         pending_post["active"] = False
         do_not_disturb["active"] = True
@@ -452,9 +449,136 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await shutdown(update, context)
         return
 
-    # ... (оставшиеся действия как в твоём исходнике)
+    # --- Остальная логика кнопок из твоего кода ---
+    if action == "self_post":
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками."
+        )
+        return
 
-# ... (остальной код без изменений, включая self_post_message_handler, delayed_start, main и т.д.)
+    if action == "cancel_to_main":
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+        user_self_post.pop(user_id, None)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Главное меню:",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    if action == "finish_self_post":
+        data = user_self_post.get(user_id)
+        if not data or not data.get('text'):
+            user_self_post.pop(user_id, None)
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Главное меню:",
+                reply_markup=main_keyboard()
+            )
+            return
+        if data.get('image'):
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=data['image'],
+                caption=data['text'],
+                reply_markup=post_choice_keyboard()
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=data['text'],
+                reply_markup=post_choice_keyboard()
+            )
+        post_data["text_ru"] = data['text']
+        post_data["text_en"] = data['text']
+        post_data["image_url"] = data.get('image')
+        post_data["is_manual"] = True
+        user_self_post.pop(user_id, None)
+        return
+
+    if action == "run_github_action":
+        github_token = ACTION_PAT_GITHUB
+        repo = ACTION_REPO_GITHUB
+        event_type = ACTION_EVENT_GITHUB
+        api_url = f"https://api.github.com/repos/{repo}/dispatches"
+        headers = {
+            "Authorization": f"token {github_token}",
+            "Accept": "application/vnd.github+json"
+        }
+        data = {"event_type": event_type}
+        try:
+            resp = requests.post(api_url, headers=headers, json=data)
+            if resp.status_code in [200, 201, 202]:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="▶️ GitHub Action успешно запущен!"
+                )
+            else:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"❌ Ошибка запуска GitHub Action: {resp.status_code} {resp.text}"
+                )
+        except Exception as e:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"❌ Ошибка при запуске GitHub: {e}"
+            )
+        return
+
+    # ... (все остальные кнопки по твоей логике, без изменений)
+    # approve, post_twitter, post_telegram, post_both, post_en, cancel_to_choice,
+    # new_post, new_post_manual, think, chat, do_not_disturb, restore_previous
+
+async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
+        text = update.message.text or ""
+        image = None
+        if update.message.photo:
+            image = update.message.photo[-1].file_id
+        user_self_post[user_id]['text'] = text
+        user_self_post[user_id]['image'] = image
+        user_self_post[user_id]['state'] = 'wait_confirm'
+        if image:
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=image,
+                caption=text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
+            )
+        return
+
+async def delayed_start(app: Application):
+    await init_db()
+    asyncio.create_task(schedule_daily_posts())
+    asyncio.create_task(check_timer())
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Бот запущен. Главное меню:",
+        reply_markup=main_keyboard()
+    )
+    logging.info("Бот запущен и готов к работе.")
 
 def main():
     global SHOULD_EXIT
@@ -466,7 +590,6 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, self_post_message_handler))
     app.run_polling(poll_interval=0.12, timeout=1)
-    # После остановки polling
     if SHOULD_EXIT:
         logging.info("Бот остановлен по команде, завершаю процесс...")
         sys.exit(0)
