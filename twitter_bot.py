@@ -98,7 +98,9 @@ post_data = {
     "image_url": test_images[0],
     "timestamp": None,
     "post_id":   0,
-    "text_en":   WELCOME_POST_EN
+    "text_en":   WELCOME_POST_EN,
+    "final_post_en": None,
+    "generating": False
 }
 prev_data = post_data.copy()
 user_self_post = {}
