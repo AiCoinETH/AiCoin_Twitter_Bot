@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, time as dt_time
 import tweepy
 import requests
 import tempfile
-
+import signal
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
@@ -591,9 +591,8 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, self_post_message_handler))
     app.run_polling(poll_interval=0.12, timeout=1)
-    if SHOULD_EXIT:
-        logging.info("Бот остановлен по команде, завершаю процесс...")
-        sys.exit(0)
+    logging.info("Polling завершён, завершаю процесс!")
+    os.kill(os.getpid(), signal.SIGTERM)
 
 if __name__ == "__main__":
     main()
