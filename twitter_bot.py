@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 import logging
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 import tweepy
 import requests
 import tempfile
@@ -40,7 +40,6 @@ if not all([
     logging.error("Не заданы обязательные переменные окружения для Twitter!")
     exit(1)
 
-# ========== TWITTER AUTH (глобальные клиенты) ==========
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -80,7 +79,7 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# ========== ТАЙМЕРЫ ==========
+# ========== ТАЙМЕРЫ И КОЛ-ВО ПОСТОВ ==========
 TIMER_PUBLISH_DEFAULT = 180    # 3 минуты после отправки на модерацию
 TIMER_PUBLISH_EXTEND  = 900    # 15 минут после любого нажатия кнопки
 
@@ -89,6 +88,9 @@ do_not_disturb       = {"active": False}
 last_action_time     = {}
 approval_message_ids = {"photo": None}
 DB_FILE = "post_history.db"
+
+scheduled_posts_per_day = 6
+manual_posts_today = 0  # Сколько ручных постов отправлено сегодня
 
 def reset_timer(timeout=None):
     pending_post["timer"] = datetime.now()
@@ -119,10 +121,45 @@ def post_action_keyboard():
     ])
 
 post_end_keyboard = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post_manual")],
     [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
     [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
     [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
 ])
+
+# ========== ГЕНЕРАЦИЯ РАСПИСАНИЯ ==========
+def generate_random_schedule(
+    posts_per_day=6,
+    day_start_hour=6,
+    day_end_hour=24,
+    min_offset=-20,
+    max_offset=20
+):
+    now = datetime.now()
+    today = now.date()
+    # Не начинать публикацию в прошлом, если бот запущен днем
+    start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
+    if now > start:
+        start = now + timedelta(seconds=1)
+    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
+    total_seconds = int((end - start).total_seconds())
+    if posts_per_day < 1:
+        return []
+    base_step = total_seconds // posts_per_day
+
+    schedule = []
+    for i in range(posts_per_day):
+        base_sec = i * base_step
+        offset_sec = random.randint(min_offset * 60, max_offset * 60) + random.randint(-59, 59)
+        post_time = start + timedelta(seconds=base_sec + offset_sec)
+        # Не выходить за границы
+        if post_time < start:
+            post_time = start
+        if post_time > end:
+            post_time = end
+        schedule.append(post_time)
+    schedule.sort()
+    return schedule
 
 # ========== ФУНКЦИИ ДЛЯ ПОСТРОЕНИЯ ТЕКСТА ==========
 def build_twitter_post(text_en: str) -> str:
@@ -306,9 +343,48 @@ async def check_timer():
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False  # Остановить все таймеры этого поста
 
+# ========== АСИНХРОННОЕ РАСПИСАНИЕ ==========
+async def schedule_daily_posts():
+    global manual_posts_today
+    while True:
+        manual_posts_today = 0  # сбрасываем счетчик ручных постов каждый новый день
+        now = datetime.now()
+        if now.hour < 6:
+            to_sleep = (datetime.combine(now.date(), dt_time(hour=6)) - now).total_seconds()
+            logging.info(f"Жду до 06:00... {int(to_sleep)} сек")
+            await asyncio.sleep(to_sleep)
+
+        posts_left = lambda: scheduled_posts_per_day - manual_posts_today
+        while posts_left() > 0:
+            schedule = generate_random_schedule(posts_per_day=posts_left())
+            logging.info(f"Расписание авто-постов на сегодня: {[t.strftime('%H:%M:%S') for t in schedule]}")
+            for post_time in schedule:
+                # Пересчёт в реальном времени — если ручной пост был опубликован, уменьшается оставшееся число
+                if posts_left() <= 0:
+                    break
+                now = datetime.now()
+                delay = (post_time - now).total_seconds()
+                if delay > 0:
+                    logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
+                    await asyncio.sleep(delay)
+                pending_post["active"] = False
+                post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
+                post_data["image_url"] = random.choice(test_images)
+                post_data["post_id"] += 1
+                post_data["is_manual"] = False
+                await send_post_for_approval()
+                # Ждём публикации поста или автотаймаута (автоматическая публикация по таймеру)
+                while pending_post["active"]:
+                    await asyncio.sleep(1)
+        # Ждём до следующего дня
+        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=0))
+        to_next_day = (tomorrow - datetime.now()).total_seconds()
+        await asyncio.sleep(to_next_day)
+        manual_posts_today = 0  # сбрасываем в начале нового дня
+
 # ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_action_time, prev_data
+    global last_action_time, prev_data, manual_posts_today
     await update.callback_query.answer()
     if pending_post["active"]:
         reset_timer(TIMER_PUBLISH_EXTEND)
@@ -367,6 +443,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         twitter_text = build_twitter_post(post_data["text_en"])
         twitter_success = False
         telegram_success = False
+        is_manual = post_data.get("is_manual", False)
         if mode == "twitter":
             twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
             pending_post["active"] = False
@@ -438,6 +515,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="Выберите действие:",
                 reply_markup=post_end_keyboard
             )
+        # После публикации ручного поста - уменьшаем число авто-постов
+        if is_manual:
+            manual_posts_today += 1
+            post_data["is_manual"] = False
         return
     if action == "cancel_to_main":
         if pending_post["active"]:
@@ -453,12 +534,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Все остальные действия ---
     if action == "new_post":
-        pending_post["active"] = False  # Сбрасываем старое ожидание, чтобы отправился новый пост
+        pending_post["active"] = False
         post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
+        post_data["is_manual"] = False
+        await send_post_for_approval()
+        return
+    if action == "new_post_manual":
+        pending_post["active"] = False
+        post_data["text_ru"] = f"Ручной новый пост #{post_data['post_id'] + 1}"
+        post_data["image_url"] = random.choice(test_images)
+        post_data["post_id"] += 1
+        post_data["is_manual"] = True
         await send_post_for_approval()
         return
     elif action == 'think':
@@ -490,6 +579,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== ЗАПУСК ==========
 async def delayed_start(app: Application):
     await init_db()
+    asyncio.create_task(schedule_daily_posts())
     await send_post_for_approval()
     asyncio.create_task(check_timer())
     logging.info("Бот запущен и готов к работе.")
