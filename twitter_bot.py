@@ -21,7 +21,6 @@ TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
 
-# Для GitHub Actions запуск из телеги
 ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB") or os.getenv("ACTION_PAT")
 ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB") or os.getenv("ACTION_REPO")
 ACTION_EVENT_GITHUB = os.getenv("ACTION_EVENT_GITHUB") or os.getenv("ACTION_EVENT") or "telegram-bot-restart"
@@ -82,15 +81,26 @@ test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
+# --- Стартовые приветственные сообщения для Telegram и Twitter (пример генерации) ---
+WELCOME_POST_RU = (
+    "🚀 Добро пожаловать в бота публикаций!\n\n"
+    "Генерация контента по трендам, новости, идеи, генерация изображений и многое другое."
+)
+WELCOME_POST_EN = (
+    "🚀 Welcome to the publication bot!\n\n"
+    "AI content, news, ideas, image generation and more."
+)
+WELCOME_HASHTAGS = "#AiCoin #AI #crypto #trends #бот #новости"
+
+# Используется при старте и первом запуске, для Telegram — длинный, для Twitter — короткий (см. build_twitter_post)
 post_data = {
-    "text_ru":   "Майнинговые токены снова в фокусе...",
+    "text_ru":   WELCOME_POST_RU,
     "image_url": test_images[0],
     "timestamp": None,
     "post_id":   0,
-    "text_en":   "Mining tokens are back in focus. Example of a full English post for Telegram or short version for Twitter!"
+    "text_en":   WELCOME_POST_EN
 }
 prev_data = post_data.copy()
-
 user_self_post = {}
 
 TIMER_PUBLISH_DEFAULT = 180
@@ -118,7 +128,7 @@ def main_keyboard():
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],  # добавлено!
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
     ])
 
 def post_choice_keyboard():
@@ -145,6 +155,13 @@ def post_end_keyboard():
         [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
+    ])
+
+def start_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать приветствие", callback_data="start_publish")],
+        [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")]
     ])
 
 def auto_mode_keyboard(next_time=None):
@@ -194,6 +211,7 @@ def generate_random_schedule(
     return schedule
 
 def build_twitter_post(text_en: str) -> str:
+    # --- Если текст длиннее 180 символов, он обрезается, добавляются хештеги, ссылки, подписи ---
     signature = (
         "\nRead more on Telegram: t.me/AiCoin_ETH or on the website: https://getaicoin.com/ "
         "#AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
@@ -430,8 +448,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
         )
         await asyncio.sleep(2)
+        # После выключения публикуем стартовое меню (возможность вернуть работу без перезапуска!)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Чтобы возобновить работу, нажмите ▶️ Старт.\nИли опубликуйте приветственный пост:",
+            reply_markup=start_keyboard()
+        )
         os._exit(0)
 
+    # --- Стартовое меню и приветственный пост ---
+    if action == "start":
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Бот запущен заново! Опубликовать приветствие или создать новый пост?",
+            reply_markup=start_keyboard()
+        )
+        return
+
+    if action == "start_publish":
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            reply_markup=main_keyboard()
+        )
+        return
+
+    # Остальные обработчики кнопок — всё как было
     if action == "self_post":
         try:
             await update.callback_query.message.delete()
