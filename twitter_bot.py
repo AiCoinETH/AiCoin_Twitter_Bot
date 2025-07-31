@@ -367,27 +367,28 @@ async def check_timer():
                     )
                     await publish_post_to_channel()
                     twitter_text = build_twitter_post(post_data["text_en"])
-                    publish_post_to_twitter(twitter_text, post_data["image_url"])
-                    logging.info("Автоматическая публикация произведена.")
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="✅ Посты автоматически опубликованы в Telegram и Twitter."
-                    )
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="Выберите действие:",
-                        reply_markup=post_end_keyboard()
-                    )
+                    twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+
+                    if twitter_success:
+                        logging.info("Автоматическая публикация произведена успешно.")
+                        await approval_bot.send_message(
+                            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                            text="✅ Посты автоматически опубликованы в Telegram и Twitter."
+                        )
+
+                        # Добавленное автоматическое выключение
+                        await approval_bot.send_message(
+                            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                            text="🔴 Бот автоматически выключается после успешной публикации."
+                        )
+                        await asyncio.sleep(2)
+                        os._exit(0)
+
                 except Exception as e:
                     pending_post["active"] = False
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text=f"❌ Ошибка при автопубликации: {e}\nВозможные действия: проверьте ключи, лимиты, права бота, лимиты Twitter/Telegram."
-                    )
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="Выберите действие:",
-                        reply_markup=post_end_keyboard()
                     )
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False
