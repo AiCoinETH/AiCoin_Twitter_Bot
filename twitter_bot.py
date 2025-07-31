@@ -168,7 +168,7 @@ def sleep_keyboard(next_time=None):
 def generate_random_schedule(
     posts_per_day=6,
     day_start_hour=6,
-    day_end_hour=24,
+    day_end_hour=23,   # <-- 23 вместо 24!
     min_offset=-20,
     max_offset=20
 ):
@@ -177,7 +177,8 @@ def generate_random_schedule(
     start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
     if now > start:
         start = now + timedelta(seconds=1)
-    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
+    # используем 23:59:59 как конец дня
+    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=59, second=59))
     total_seconds = int((end - start).total_seconds())
     if posts_per_day < 1:
         return []
