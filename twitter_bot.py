@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import hashlib
 import logging
@@ -406,6 +407,15 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
+# --- Функция для полного завершения работы бота ---
+async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="🛑 Бот завершает работу и процесс будет остановлен (GitHub Actions завершится)."
+    )
+    await context.application.stop()
+    sys.exit(0)
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     await update.callback_query.answer()
@@ -675,14 +685,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "end_day":
         pending_post["active"] = False
         do_not_disturb["active"] = True
-        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=9))
-        kb, txt = sleep_keyboard(next_time=tomorrow)
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена на сегодня.\n{txt}", parse_mode="HTML", reply_markup=kb)
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Выберите действие:",
-            reply_markup=main_keyboard()
-        )
+        await shutdown(update, context)
+        return
 
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
