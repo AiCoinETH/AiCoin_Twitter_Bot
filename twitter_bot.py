@@ -15,7 +15,6 @@ import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -29,7 +28,6 @@ if not TELEGRAM_BOT_TOKEN_APPROVAL or not TELEGRAM_APPROVAL_CHAT_ID or not TELEG
     logging.error("Не заданы обязательные переменные окружения (BOT_TOKEN_APPROVAL, APPROVAL_CHAT_ID, BOT_TOKEN_CHANNEL или CHANNEL_USERNAME_ID)")
     exit(1)
 
-# ========== TWITTER ==========
 TWITTER_API_KEY             = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET          = os.getenv("TWITTER_API_SECRET")
 TWITTER_ACCESS_TOKEN        = os.getenv("TWITTER_ACCESS_TOKEN")
@@ -66,7 +64,6 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
-# ========== ДАННЫЕ ДЛЯ ТЕСТА ==========
 test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
@@ -83,12 +80,10 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# ========== Контекст для ручного поста ==========
-user_self_post = {}  # user_id -> {'text': '', 'image': None, 'state': ''}
+user_self_post = {}
 
-# ========== ТАЙМЕРЫ И КОЛ-ВО ПОСТОВ ==========
-TIMER_PUBLISH_DEFAULT = 180    # 3 минуты после отправки на модерацию
-TIMER_PUBLISH_EXTEND  = 900    # 15 минут после любого нажатия кнопки
+TIMER_PUBLISH_DEFAULT = 180
+TIMER_PUBLISH_EXTEND  = 900
 
 pending_post         = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb       = {"active": False}
@@ -97,14 +92,13 @@ approval_message_ids = {"photo": None}
 DB_FILE = "post_history.db"
 
 scheduled_posts_per_day = 6
-manual_posts_today = 0  # Сколько ручных постов отправлено сегодня
+manual_posts_today = 0
 
 def reset_timer(timeout=None):
     pending_post["timer"] = datetime.now()
     if timeout:
         pending_post["timeout"] = timeout
 
-# ========== КЛАВИАТУРЫ ==========
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -141,7 +135,6 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-# ========== ГЕНЕРАЦИЯ РАСПИСАНИЯ ==========
 def generate_random_schedule(
     posts_per_day=6,
     day_start_hour=6,
@@ -173,7 +166,6 @@ def generate_random_schedule(
     schedule.sort()
     return schedule
 
-# ========== ФУНКЦИИ ДЛЯ ПОСТРОЕНИЯ ТЕКСТА ==========
 def build_twitter_post(text_en: str) -> str:
     signature = (
         "\nRead more on Telegram: t.me/AiCoin_ETH or on the website: https://getaicoin.com/ "
@@ -187,7 +179,6 @@ def build_twitter_post(text_en: str) -> str:
         main_part = text_en
     return main_part + signature
 
-# ========== TWITTER POST С ОБХОДОМ ==========
 def publish_post_to_twitter(text, image_url=None):
     try:
         media_ids = None
@@ -204,7 +195,6 @@ def publish_post_to_twitter(text, image_url=None):
                 finally:
                     os.remove(tmp_path)
             else:
-                # Если file_id Telegram, не прикладываем картинку
                 media_ids = None
         twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
         logging.info("Пост успешно опубликован в Twitter!")
@@ -224,7 +214,6 @@ def publish_post_to_twitter(text, image_url=None):
         ))
         return False
 
-# ========== ИНИЦИАЛИЗАЦИЯ БД ==========
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
@@ -259,7 +248,6 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
-# ========== ОТПРАВКА НА МОДЕРАЦИЮ ==========
 async def send_post_for_approval():
     if do_not_disturb["active"] or pending_post["active"]:
         return
@@ -282,7 +270,6 @@ async def send_post_for_approval():
     except Exception as e:
         logging.error(f"Ошибка при отправке на согласование: {e}")
 
-# ========== ПУБЛИКАЦИЯ В КАНАЛ ==========
 async def publish_post_to_channel():
     try:
         msg = await channel_bot.send_photo(
@@ -320,7 +307,6 @@ async def publish_post_to_channel():
     asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
     pending_post["active"] = False
 
-# ========== ТАЙМЕР МОДЕРАЦИИ ==========
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -359,7 +345,6 @@ async def check_timer():
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False
 
-# ========== АСИНХРОННОЕ РАСПИСАНИЕ ==========
 async def schedule_daily_posts():
     global manual_posts_today
     while True:
@@ -395,7 +380,6 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
-# ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     await update.callback_query.answer()
@@ -411,7 +395,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # ----------- СДЕЛАЙ САМ -------------
     if action == "self_post":
         try:
             await update.callback_query.message.delete()
@@ -424,7 +407,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----------- ОТМЕНА (ВОЗВРАТ В ГЛАВНОЕ МЕНЮ) -------------
     if action == "cancel_to_main":
         try:
             await update.callback_query.message.delete()
@@ -438,19 +420,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----------- ЗАВЕРШИТЬ ГЕНЕРАЦИЮ -------------
     if action == "finish_self_post":
         data = user_self_post.get(user_id)
         if not data or not data.get('text'):
+            user_self_post.pop(user_id, None)
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="⚠️ Сначала отправь текст поста!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-                ])
+                text="Главное меню:",
+                reply_markup=main_keyboard()
             )
             return
-        # Предпросмотр с выбором публикации
         if data.get('image'):
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -500,7 +479,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # --- Новая ветка: после "✅ Пост" ---
     if action == 'approve':
         twitter_text = build_twitter_post(post_data["text_en"])
         await approval_bot.send_photo(
@@ -673,7 +651,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         do_not_disturb["active"] = True
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔚 Завершили публикации на сегодня.", reply_markup=post_end_keyboard())
 
-# ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ "СДЕЛАЙ САМ" ==========
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
@@ -684,7 +661,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
-        # предпросмотр
         if image:
             await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -706,7 +682,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
         return
 
-# ========== ЗАПУСК ==========
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
