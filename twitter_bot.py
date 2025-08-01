@@ -11,6 +11,7 @@ import tempfile
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
+import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -274,6 +275,31 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
+async def send_photo_or_url(bot, chat_id, image, caption, reply_markup=None):
+    # Универсальная отправка картинки: file_id, ссылка, отсутствие картинки
+    if image and isinstance(image, str) and not image.startswith("http"):
+        # Это file_id из Telegram — можно отправить напрямую
+        await bot.send_photo(chat_id=chat_id, photo=image, caption=caption, reply_markup=reply_markup)
+    elif image and isinstance(image, str) and image.startswith("http"):
+        # Это URL — нужно скачать и отправить как файл
+        tmp_path = None
+        try:
+            response = requests.get(image)
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                tmp.write(response.content)
+                tmp_path = tmp.name
+            with open(tmp_path, "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption, reply_markup=reply_markup)
+        except Exception as e:
+            logging.error(f"Не удалось отправить фото по ссылке: {e}")
+            await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    else:
+        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -288,11 +314,7 @@ async def check_timer():
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="⌛ Время ожидания истекло. Публикую автоматически."
                     )
-                    await channel_bot.send_photo(
-                        chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                        photo=post_data["image_url"],
-                        caption=telegram_text
-                    )
+                    await send_photo_or_url(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, post_data["image_url"], telegram_text)
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
                     await approval_bot.send_message(
@@ -330,13 +352,7 @@ async def send_post_for_approval():
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         try:
-            photo_msg = await approval_bot.send_photo(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                photo=post_data["image_url"],
-                caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
-                reply_markup=main_keyboard()
-            )
-            approval_message_ids["photo"] = photo_msg.message_id
+            await send_photo_or_url(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS, main_keyboard())
             logging.info("Пост отправлен на согласование.")
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
@@ -386,11 +402,9 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
         if image:
-            await approval_bot.send_photo(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                photo=image,
-                caption=text,
-                reply_markup=InlineKeyboardMarkup([
+            await send_photo_or_url(
+                approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image, text,
+                InlineKeyboardMarkup([
                     [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
                     [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
                 ])
@@ -405,8 +419,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
                 ])
             )
         return
-    # если не self-пост — игнорируем сообщение
-    return
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
@@ -431,23 +443,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if image:
                 post_data["image_url"] = image
             else:
-                post_data["image_url"] = random.choice(test_images)  # дефолтная картинка!
+                post_data["image_url"] = random.choice(test_images)
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            if post_data["image_url"]:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=post_data["image_url"],
-                    caption=post_data["text_en"],
-                    reply_markup=post_choice_keyboard()
-                )
-            else:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=post_data["text_en"],
-                    reply_markup=post_choice_keyboard()
-                )
+            await send_photo_or_url(
+                approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"],
+                post_data["text_en"], post_choice_keyboard()
+            )
         return
 
     if action == "shutdown_bot":
@@ -467,11 +470,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_en"])
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=post_data["image_url"],
-            caption=twitter_text,
-            reply_markup=post_choice_keyboard()
+        await send_photo_or_url(
+            approval_bot, TELEGRAM_APPROVAL_CHAT_ID,
+            post_data["image_url"], twitter_text, post_choice_keyboard()
         )
         return
 
@@ -485,11 +486,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["post_telegram", "post_both"]:
             try:
-                await channel_bot.send_photo(
-                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                    photo=post_data["image_url"],
-                    caption=telegram_text
-                )
+                await send_photo_or_url(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, post_data["image_url"], telegram_text)
                 telegram_success = True
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Telegram: {e}")
@@ -613,11 +610,9 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await approval_bot.send_photo(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        photo=post_data["image_url"],
-        caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
-        reply_markup=main_keyboard()
+    await send_photo_or_url(
+        approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"],
+        post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS, main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
 
