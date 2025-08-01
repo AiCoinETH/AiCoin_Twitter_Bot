@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install  # 👈 ОБЯЗАТЕЛЬНО
+          python -m playwright install
 
       - name: Run Twitter Stat Bot
-        run: python twitter_stat_bot.py
+        run: xvfb-run python twitter_stat_bot.py
