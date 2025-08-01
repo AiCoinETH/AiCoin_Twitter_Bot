@@ -2,19 +2,16 @@ name: Update Twitter Followers Stat
 
 on:
   schedule:
-    - cron: '0 7 * * *'   # Каждый день в 07:00 утра UTC
-  workflow_dispatch:       # Возможность ручного запуска
+    - cron: '0 7 */5 * *'   # Каждые 5 дней в 07:00 утра UTC
+  workflow_dispatch:
 
 jobs:
   update-twitter-followers:
     runs-on: ubuntu-latest
 
     env:
-      # Telegram bot settings (ИСПОЛЬЗУЙТЕ ТОТ ЖЕ ТОКЕН и CHANNEL, что и в контент-боте)
       TELEGRAM_BOT_TOKEN_CHANNEL: ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
       TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
-
-      # Twitter username (без @)
       TWITTER_USERNAME: ${{ secrets.TWITTER_USERNAME }}
       MESSAGE_ID: ${{ secrets.MESSAGE_ID }}
 
