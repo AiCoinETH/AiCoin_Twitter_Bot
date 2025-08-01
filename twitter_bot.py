@@ -43,7 +43,8 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
 approval_lock = asyncio.Lock()
 DB_FILE = "post_history.db"
-scheduled_posts_per_day = 6
+MAX_HISTORY_POSTS = 15
+MANUAL_POSTS_PER_DAY = 6
 manual_posts_today = 0
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 900
@@ -139,17 +140,74 @@ def build_twitter_post(text_ru: str) -> str:
     return main_part + signature
 
 def build_telegram_post(text: str) -> str:
-    # Telegram лимит на caption: 1024 символа, лимитируем текст с учетом ссылок (и переносов строки!)
     links = "\n\n" + TELEGRAM_LINKS
     reserve = TELEGRAM_CAPTION_LIMIT - len(links)
     if len(text) > reserve:
         text = text[:reserve - 3].rstrip() + "..."
     return text + links
 
+def hash_text(text: str):
+    return hashlib.sha256(text.strip().encode('utf-8')).hexdigest()
+
+def hash_image(img_path: str):
+    with open(img_path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+async def is_duplicate_post(text, image_url, db_file=DB_FILE):
+    text_hash = hash_text(text)
+    img_hash = None
+    try:
+        if image_url and str(image_url).startswith("http"):
+            # скачиваем для хеша
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+            tmp.write(r.content)
+            tmp.close()
+            img_hash = hash_image(tmp.name)
+            os.remove(tmp.name)
+        elif image_url:
+            # file_id Telegram
+            img_hash = image_url
+    except Exception:
+        img_hash = None
+
+    async with aiosqlite.connect(db_file) as db:
+        async with db.execute("SELECT text_hash, image_hash FROM posts ORDER BY id DESC LIMIT ?", (MAX_HISTORY_POSTS,)) as cursor:
+            async for row in cursor:
+                if text_hash == row[0]:
+                    return True
+                if img_hash and img_hash == row[1]:
+                    return True
+    return False
+
+async def save_post_to_db(text, image_url, db_file=DB_FILE):
+    text_hash = hash_text(text)
+    img_hash = None
+    try:
+        if image_url and str(image_url).startswith("http"):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+            tmp.write(r.content)
+            tmp.close()
+            img_hash = hash_image(tmp.name)
+            os.remove(tmp.name)
+        elif image_url:
+            img_hash = image_url
+    except Exception:
+        img_hash = None
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute("INSERT INTO posts (text, timestamp, text_hash, image_hash) VALUES (?, ?, ?, ?)", (
+            text, datetime.now().isoformat(), text_hash, img_hash
+        ))
+        await db.commit()
+        await db.execute(f"DELETE FROM posts WHERE id NOT IN (SELECT id FROM posts ORDER BY id DESC LIMIT {MAX_HISTORY_POSTS})")
+        await db.commit()
+
 # --- Скачивание картинки ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
-        file = bot.get_file(url_or_file_id)
+        file = asyncio.run(bot.get_file(url_or_file_id))
         file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
         r = requests.get(file_url)
         r.raise_for_status()
@@ -178,10 +236,13 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
         msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption)
         return msg
     except ValueError as ve:
-        await bot.send_message(chat_id=chat_id, text=str(ve))
+        await bot.send_message(chat_id=chat_id, text=str(ve), disable_web_page_preview=True)
         logging.error(str(ve))
+        # fallback: отправить только текст, если был caption
+        if caption:
+            await bot.send_message(chat_id=chat_id, text=caption, disable_web_page_preview=True)
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"❗️Ошибка: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"❗️Ошибка: {e}", disable_web_page_preview=True)
         logging.error(str(e))
     finally:
         if file_path and os.path.exists(file_path):
@@ -196,7 +257,8 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
         logging.error(f"Ошибка при публикации в Telegram: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Telegram: {e}"
+            text=f"❌ Ошибка при публикации в Telegram: {e}",
+            disable_web_page_preview=True
         )
         return False
 
@@ -223,7 +285,8 @@ def publish_post_to_twitter(text, image_url=None):
         logging.error(f"Ошибка публикации в Twitter: {e}")
         asyncio.create_task(approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."
+            text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа.",
+            disable_web_page_preview=True
         ))
         return False
 
@@ -233,7 +296,8 @@ def shutdown_bot_and_exit():
         asyncio.create_task(
             approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
+                text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!",
+                disable_web_page_preview=True
             )
         )
     except Exception:
@@ -249,6 +313,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
+                text_hash TEXT,
                 image_hash TEXT
             )
             """
@@ -267,14 +332,23 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     if update.message.photo:
         image = update.message.photo[-1].file_id
 
-    # Проверяем лимит на длину текста с учетом ссылок!
     links = "\n\n" + TELEGRAM_LINKS
     max_caption = TELEGRAM_CAPTION_LIMIT
     reserve = max_caption - len(links)
     if len(text) > reserve:
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❗️Длина поста превышает лимит для Telegram ({max_caption} символов с учетом ссылок). Ваш текст: {len(text)} символов, доступно: {reserve}.\nУкоротите сообщение!"
+            text=f"❗️Длина поста превышает лимит для Telegram ({max_caption} символов с учетом ссылок). Ваш текст: {len(text)} символов, доступно: {reserve}.\nУкоротите сообщение!",
+            disable_web_page_preview=True
+        )
+        return
+
+    # Проверка на дубликат!
+    if await is_duplicate_post(text, image):
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="❗️Этот пост или картинка уже были опубликованы за последние 15 постов. Измени текст или прикрепи другую картинку.",
+            disable_web_page_preview=True
         )
         return
 
@@ -282,7 +356,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_self_post[user_id]['image'] = image
     user_self_post[user_id]['state'] = 'wait_confirm'
 
-    # Предпросмотр (фото+текст)
     preview = build_telegram_post(text)
     if image:
         await send_photo_with_download(
@@ -300,7 +373,8 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     else:
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="(пустое сообщение)"
+            text="(пустое сообщение)",
+            disable_web_page_preview=True
         )
 
     await approval_bot.send_message(
@@ -309,7 +383,8 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-        ])
+        ]),
+        disable_web_page_preview=True
     )
 
 # --- Обработка кнопок ---
@@ -321,7 +396,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=main_keyboard())
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=main_keyboard(), disable_web_page_preview=True)
         return
     last_action_time[user_id] = now
     action = update.callback_query.data
@@ -344,14 +419,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text="Финальный пост для Twitter:\n\n" + twitter_preview,
-                    reply_markup=post_choice_keyboard()
+                    reply_markup=post_choice_keyboard(),
+                    disable_web_page_preview=True
                 )
                 logging.info("Показан финальный Twitter-пост с выбором площадки.")
             except Exception as e:
                 logging.error(f"Ошибка отправки меню выбора площадки: {e}")
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=twitter_preview + "\n\n(Не удалось показать меню выбора площадки)"
+                    text=twitter_preview + "\n\n(Не удалось показать меню выбора площадки)",
+                    disable_web_page_preview=True
                 )
         else:
             await update.callback_query.answer("Ошибка: состояние не позволяет завершить генерацию.", show_alert=True)
@@ -361,7 +438,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info("Останавливаю бота по кнопке!")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
+            text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!",
+            disable_web_page_preview=True
         )
         await asyncio.sleep(2)
         shutdown_bot_and_exit()
@@ -372,7 +450,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Финальный пост для Twitter:\n\n" + twitter_text,
-            reply_markup=post_choice_keyboard()
+            reply_markup=post_choice_keyboard(),
+            disable_web_page_preview=True
         )
         return
 
@@ -380,6 +459,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_text = post_data["text_ru"].strip()
         telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
+
+        # Проверка на дубликат!
+        if await is_duplicate_post(base_text, post_data["image_url"]):
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="❗️Этот пост или картинка уже были опубликованы за последние 15 постов. Измени текст или прикрепи другую картинку.",
+                disable_web_page_preview=True
+            )
+            return
 
         telegram_success = False
         twitter_success = False
@@ -392,7 +480,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text=f"❌ Не удалось отправить в Telegram: {e}",
-                    reply_markup=None
+                    reply_markup=None,
+                    disable_web_page_preview=True
                 )
 
         if action in ["post_twitter", "post_both"]:
@@ -403,41 +492,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text=f"❌ Не удалось отправить в Twitter: {e}",
-                    reply_markup=None
+                    reply_markup=None,
+                    disable_web_page_preview=True
                 )
 
         pending_post["active"] = False
+
+        # Запись в БД — если успех в одной из соцсетей
+        if telegram_success or twitter_success:
+            await save_post_to_db(base_text, post_data["image_url"])
 
         if telegram_success:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="✅ Успешно отправлено в Telegram!",
-                reply_markup=None
+                reply_markup=None,
+                disable_web_page_preview=True
             )
         else:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="❌ Не удалось отправить в Telegram.",
-                reply_markup=None
+                reply_markup=None,
+                disable_web_page_preview=True
             )
 
         if twitter_success:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="✅ Успешно отправлено в Twitter!",
-                reply_markup=None
+                reply_markup=None,
+                disable_web_page_preview=True
             )
         else:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="❌ Не удалось отправить в Twitter.",
-                reply_markup=None
+                reply_markup=None,
+                disable_web_page_preview=True
             )
 
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Работа завершена.",
-            reply_markup=post_end_keyboard()
+            reply_markup=post_end_keyboard(),
+            disable_web_page_preview=True
         )
 
         shutdown_bot_and_exit()
@@ -451,7 +550,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками."
+            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.",
+            disable_web_page_preview=True
         )
         return
 
@@ -464,13 +564,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Главное меню:",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True
         )
         return
 
     if action == "restore_previous":
         post_data.update(prev_data)
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=main_keyboard())
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=main_keyboard(), disable_web_page_preview=True)
         if pending_post["active"]:
             await send_post_for_approval()
         return
@@ -480,18 +581,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=9))
         kb = main_keyboard()
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M')}", parse_mode="HTML", reply_markup=kb)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M')}", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
 
     if action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=main_keyboard())
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=main_keyboard(), disable_web_page_preview=True)
         return
 
     if action == "chat":
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="💬 Начинаем чат:\n" + post_data["text_ru"],
-            reply_markup=post_end_keyboard()
+            reply_markup=post_end_keyboard(),
+            disable_web_page_preview=True
         )
         return
 
@@ -501,7 +603,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🌙 Режим «Не беспокоить» {status}.",
-            reply_markup=post_end_keyboard()
+            reply_markup=post_end_keyboard(),
+            disable_web_page_preview=True
         )
         return
 
@@ -556,7 +659,8 @@ async def delayed_start(app: Application):
     await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         text="Добро пожаловать! Выберите действие:",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(),
+        disable_web_page_preview=True
     )
     logging.info("Бот запущен и готов к работе.")
 
