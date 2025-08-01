@@ -390,42 +390,42 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
-# --- Логика "Сделай сам" ---
+# --- Обработчик сообщений "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
-        text = update.message.text or ""
-        image = None
-        if update.message.photo:
-            image = update.message.photo[-1].file_id  # Берём максимальный размер
-        user_self_post[user_id]['text'] = text
-        user_self_post[user_id]['image'] = image
-        user_self_post[user_id]['state'] = 'wait_confirm'
-        if image:
-            await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                image,
-                caption=text,
-            )
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
-                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-                ])
-            )
-        else:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=text,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
-                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-                ])
-            )
-        return
+    if user_id not in user_self_post or user_self_post[user_id]['state'] != 'wait_post':
+        return  # Игнорируем, если пользователь не в режиме "Сделай сам"
+
+    text = update.message.text or ""
+    image = None
+    if update.message.photo:
+        image = update.message.photo[-1].file_id  # Максимальный размер фото
+
+    user_self_post[user_id]['text'] = text
+    user_self_post[user_id]['image'] = image
+    user_self_post[user_id]['state'] = 'wait_confirm'
+
+    if image:
+        await send_photo_with_download(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            image,
+            caption=text
+        )
+    else:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=text
+        )
+
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+        ])
+    )
 
 # --- Обработка кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
