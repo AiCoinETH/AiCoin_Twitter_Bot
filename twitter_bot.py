@@ -194,130 +194,87 @@ def build_twitter_post(text_en: str) -> str:
         main_part = text_en
     return main_part + signature
 
-def download_image(image):
-    # image - file_id или URL
-    file_bytes = None
-    tmp_path = None
-    try:
-        if image and isinstance(image, str) and not image.startswith("http"):
-            # file_id из Telegram
-            loop = asyncio.get_event_loop()
-            file = loop.run_until_complete(approval_bot.get_file(image))
-            file_bytes = loop.run_until_complete(file.download_as_bytearray())
-        elif image and isinstance(image, str) and image.startswith("http"):
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; MyBot/1.0; +https://gptonline.ai/)"}
-            r = requests.get(image, headers=headers)
-            r.raise_for_status()
-            file_bytes = r.content
-        elif isinstance(image, bytes):
-            file_bytes = image
-
-        if file_bytes:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-            return tmp_path
-    except Exception as e:
-        logging.error(f"Не удалось скачать фото: {e}")
-    return None
-
-async def send_photo_or_url(bot, chat_id, image, caption, reply_markup=None):
-    tmp_path = None
-    try:
-        tmp_path = await download_image_async(image)
-        if tmp_path:
-            with open(tmp_path, "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption, reply_markup=reply_markup)
-        else:
-            await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
-    except Exception as e:
-        logging.error(f"Не удалось отправить фото: {e}")
-        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-async def download_image_async(image):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, download_image, image)
+def download_image_to_temp(image_url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AiBot/1.0; +https://gptonline.ai/)"
+    }
+    response = requests.get(image_url, headers=headers)
+    response.raise_for_status()
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+    return tmp_path
 
 def publish_post_to_twitter(text, image_url=None):
     try:
         media_ids = None
         tmp_path = None
         if image_url:
-            tmp_path = download_image(image_url)
-            if tmp_path:
-                media = twitter_api_v1.media_upload(tmp_path)
-                media_ids = [media.media_id_string]
+            # Всегда скачиваем файл!
+            if image_url.startswith('http'):
+                tmp_path = download_image_to_temp(image_url)
+            else:
+                # Telegram file_id — надо сначала скачать file!
+                return False
+            media = twitter_api_v1.media_upload(tmp_path)
+            media_ids = [media.media_id_string]
         twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
         logging.info("Пост успешно опубликован в Twitter!")
-        if tmp_path and os.path.exists(tmp_path):
+        if tmp_path:
             os.remove(tmp_path)
         return True
     except Exception as e:
-        pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
-        asyncio.create_task(approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Twitter: {e}\n"
-                 "Проверьте:\n"
-                 "- Действительность ключей/токенов\n"
-                 "- Лимиты публикации (Twitter API)\n"
-                 "- Формат медиа\n"
-                 "- Права доступа\n"
-                 "Пост не будет опубликован повторно автоматически."
-        ))
         return False
 
-def shutdown_bot_and_exit():
-    logging.info("Завершение работы бота через shutdown_bot_and_exit()")
+async def send_photo_by_file(bot: Bot, chat_id, image_url, caption):
+    """
+    Отправка фото в Telegram через скачивание, всегда file!
+    """
+    tmp_path = None
     try:
-        asyncio.create_task(
-            approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
-            )
-        )
-    except Exception:
-        pass
-    import time; time.sleep(2)
-    os._exit(0)
+        if image_url and image_url.startswith('http'):
+            tmp_path = download_image_to_temp(image_url)
+            with open(tmp_path, "rb") as f:
+                msg = await bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+            os.remove(tmp_path)
+            return msg
+        elif image_url and not image_url.startswith('http'):
+            # file_id от Telegram — можно отправлять напрямую
+            msg = await bot.send_photo(chat_id=chat_id, photo=image_url, caption=caption)
+            return msg
+        else:
+            # Нет фото
+            msg = await bot.send_message(chat_id=chat_id, text=caption)
+            return msg
+    except Exception as e:
+        logging.error(f"Не удалось отправить фото по ссылке: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await bot.send_message(chat_id=chat_id, text=f"Ошибка отправки фото: {e}")
+        return None
 
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                image_hash TEXT
-            )
-            """
-        )
-        await db.commit()
-    logging.info("База данных инициализирована.")
-
-async def save_post_to_history(text, image_url=None):
-    image_hash = None
-    if image_url:
+async def send_post_for_approval():
+    async with approval_lock:
+        if do_not_disturb["active"] or pending_post["active"]:
+            return
+        post_data["timestamp"] = datetime.now()
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         try:
-            tmp_path = await download_image_async(image_url)
-            if tmp_path:
-                with open(tmp_path, "rb") as f:
-                    image_hash = hashlib.sha256(f.read()).hexdigest()
-                os.remove(tmp_path)
+            msg = await send_photo_by_file(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                post_data["image_url"],
+                post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
+            )
+            approval_message_ids["photo"] = getattr(msg, "message_id", None)
+            logging.info("Пост отправлен на согласование.")
         except Exception as e:
-            logging.warning(f"Не удалось получить хеш изображения: {e}")
-            image_hash = None
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
-            (text, datetime.now().isoformat(), image_hash)
-        )
-        await db.commit()
-    logging.info("Пост сохранён в историю.")
+            logging.error(f"Ошибка при отправке на согласование: {e}")
 
 async def check_timer():
     while True:
@@ -333,11 +290,11 @@ async def check_timer():
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="⌛ Время ожидания истекло. Публикую автоматически."
                     )
-                    await send_photo_or_url(
+                    await send_photo_by_file(
                         channel_bot,
                         TELEGRAM_CHANNEL_USERNAME_ID,
                         post_data["image_url"],
-                        telegram_text
+                        telegram_text,
                     )
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
@@ -365,27 +322,38 @@ async def check_timer():
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False
 
-async def send_post_for_approval():
-    async with approval_lock:
-        if do_not_disturb["active"] or pending_post["active"]:
-            return
-        post_data["timestamp"] = datetime.now()
-        pending_post.update({
-            "active": True,
-            "timer": datetime.now(),
-            "timeout": TIMER_PUBLISH_DEFAULT
-        })
-        try:
-            await send_photo_or_url(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
-                reply_markup=main_keyboard()
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                image_hash TEXT
             )
-            logging.info("Пост отправлен на согласование.")
+            """
+        )
+        await db.commit()
+    logging.info("База данных инициализирована.")
+
+async def save_post_to_history(text, image_url=None):
+    image_hash = None
+    if image_url:
+        try:
+            r = requests.get(image_url, timeout=3)
+            r.raise_for_status()
+            image_hash = hashlib.sha256(r.content).hexdigest()
         except Exception as e:
-            logging.error(f"Ошибка при отправке на согласование: {e}")
+            logging.warning(f"Не удалось получить хеш изображения: {e}")
+            image_hash = None
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
+            (text, datetime.now().isoformat(), image_hash)
+        )
+        await db.commit()
+    logging.info("Пост сохранён в историю.")
 
 async def schedule_daily_posts():
     global manual_posts_today
@@ -424,7 +392,9 @@ async def schedule_daily_posts():
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
-        text = update.message.text or ""
+        text = update.message.text if update.message.text is not None else ""
+        if not text:
+            text = "🖼️ Фото без текста"
         image = None
         if update.message.photo:
             image = update.message.photo[-1].file_id
@@ -432,11 +402,10 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
         if image:
-            await send_photo_or_url(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                image,
-                text,
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=image,
+                caption=text,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
                     [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
@@ -480,13 +449,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            await send_photo_or_url(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                post_data["text_en"],
-                reply_markup=post_choice_keyboard()
-            )
+            if post_data["image_url"]:
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"],
+                    reply_markup=post_choice_keyboard()
+                )
+            else:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=post_data["text_en"],
+                    reply_markup=post_choice_keyboard()
+                )
         return
 
     if action == "shutdown_bot":
@@ -506,11 +481,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_en"])
-        await send_photo_or_url(
-            approval_bot,
-            TELEGRAM_APPROVAL_CHAT_ID,
-            post_data["image_url"],
-            twitter_text,
+        await approval_bot.send_photo(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            photo=post_data["image_url"],
+            caption=twitter_text,
             reply_markup=post_choice_keyboard()
         )
         return
@@ -525,11 +499,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["post_telegram", "post_both"]:
             try:
-                await send_photo_or_url(
+                await send_photo_by_file(
                     channel_bot,
                     TELEGRAM_CHANNEL_USERNAME_ID,
                     post_data["image_url"],
-                    telegram_text
+                    telegram_text,
                 )
                 telegram_success = True
             except Exception as e:
@@ -650,19 +624,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval()
         return
 
-    # --- Можно добавить остальные кнопки и логику по аналогии ---
-
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_or_url(
-        approval_bot,
-        TELEGRAM_APPROVAL_CHAT_ID,
-        post_data["image_url"],
-        post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
-        reply_markup=main_keyboard()
-    )
+    await send_post_for_approval()
     logging.info("Бот запущен и готов к работе.")
 
 def main():
@@ -674,6 +640,20 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, self_post_message_handler))
     app.run_polling(poll_interval=0.12, timeout=1)
+
+def shutdown_bot_and_exit():
+    logging.info("Завершение работы бота через shutdown_bot_and_exit()")
+    try:
+        asyncio.create_task(
+            approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
+            )
+        )
+    except Exception:
+        pass
+    import time; time.sleep(2)
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
