@@ -379,7 +379,7 @@ async def check_timer():
                         reply_markup=post_end_keyboard()
                     )
                     logging.info("===> Завершаем процесс: os._exit(0) <===")
-os._exit(0)  # <-- ДОБАВЬ эту строку после публикации!
+                    os._exit(0)
                 except Exception as e:
                     pending_post["active"] = False
                     await approval_bot.send_message(
