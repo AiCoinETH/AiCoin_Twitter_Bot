@@ -393,9 +393,8 @@ async def schedule_daily_posts():
 # --- Обработчик сообщений "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Игнорируем если пользователь не в режиме "Сделай сам"
     if user_id not in user_self_post or user_self_post[user_id]['state'] != 'wait_post':
-        return
+        return  # Игнорируем, если пользователь не в режиме "Сделай сам"
 
     text = update.message.text or ""
     image = None
@@ -635,7 +634,7 @@ async def delayed_start(app: Application):
     )
     await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Выберите действие:",
+        text="Добро пожаловать! Выберите действие:",
         reply_markup=main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
