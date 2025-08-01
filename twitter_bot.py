@@ -204,10 +204,10 @@ async def save_post_to_db(text, image_url, db_file=DB_FILE):
         await db.execute(f"DELETE FROM posts WHERE id NOT IN (SELECT id FROM posts ORDER BY id DESC LIMIT {MAX_HISTORY_POSTS})")
         await db.commit()
 
-# --- Скачивание картинки ---
-def download_image(url_or_file_id, is_telegram_file=False, bot=None):
+# --- Асинхронное скачивание Telegram file_id и обычного URL ---
+async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
-        file = asyncio.run(bot.get_file(url_or_file_id))
+        file = await bot.get_file(url_or_file_id)
         file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
         r = requests.get(file_url)
         r.raise_for_status()
@@ -232,7 +232,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
     file_path = None
     try:
         is_telegram = not (str(url_or_file_id).startswith("http"))
-        file_path = download_image(url_or_file_id, is_telegram, bot if is_telegram else None)
+        file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
         msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption)
         return msg
     except ValueError as ve:
@@ -270,7 +270,12 @@ def publish_post_to_twitter(text, image_url=None):
         media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
-            file_path = download_image(image_url, is_telegram, approval_bot if is_telegram else None)
+            # Важно! Только download_image - синхронный (Twitter API не асинхронный)
+            loop = asyncio.get_event_loop()
+            if is_telegram:
+                file_path = loop.run_until_complete(download_image_async(image_url, is_telegram, approval_bot))
+            else:
+                file_path = loop.run_until_complete(download_image_async(image_url, is_telegram))
             try:
                 media = twitter_api_v1.media_upload(file_path)
                 media_ids = [media.media_id_string]
