@@ -83,10 +83,6 @@ test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
-WELCOME_POST_RU = (
-    "🚀 Добро пожаловать в бота публикаций!\n\n"
-    "Генерация контента по трендам, новости, идеи, генерация изображений и многое другое."
-)
 WELCOME_POST_EN = (
     "🚀 Welcome to the publication bot!\n\n"
     "AI content, news, ideas, image generation and more."
@@ -94,11 +90,10 @@ WELCOME_POST_EN = (
 WELCOME_HASHTAGS = "#AiCoin #AI #crypto #trends #бот #новости"
 
 post_data = {
-    "text_ru":   WELCOME_POST_RU,
+    "text_en":   WELCOME_POST_EN,
     "image_url": test_images[0],
     "timestamp": None,
-    "post_id":   0,
-    "text_en":   WELCOME_POST_EN
+    "post_id":   0
 }
 prev_data = post_data.copy()
 user_self_post = {}
@@ -290,12 +285,18 @@ async def check_timer():
             passed = (datetime.now() - pending_post["timer"]).total_seconds()
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
+                    base_text = post_data["text_en"].strip()
+                    telegram_text = f"{base_text}\n\nRead more: https://getaicoin.com/"
+                    twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="⌛ Время ожидания истекло. Публикую автоматически."
                     )
-                    await publish_post_to_channel()
-                    twitter_text = build_twitter_post(post_data["text_en"])
+                    await channel_bot.send_photo(
+                        chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                        photo=post_data["image_url"],
+                        caption=telegram_text
+                    )
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
                     await approval_bot.send_message(
@@ -336,7 +337,7 @@ async def send_post_for_approval():
             photo_msg = await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 photo=post_data["image_url"],
-                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+                caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
                 reply_markup=main_keyboard()
             )
             approval_message_ids["photo"] = photo_msg.message_id
@@ -366,7 +367,7 @@ async def schedule_daily_posts():
                 if delay > 0:
                     logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
                     await asyncio.sleep(delay)
-                post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
+                post_data["text_en"] = f"New post ({post_time.strftime('%H:%M:%S')})"
                 post_data["image_url"] = random.choice(test_images)
                 post_data["post_id"] += 1
                 post_data["is_manual"] = False
@@ -449,7 +450,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
-        twitter_text = build_twitter_post(post_data["text_en"])
+        base_text = post_data["text_en"].strip()
+        telegram_text = f"{base_text}\n\nRead more: https://getaicoin.com/"
+        twitter_text = build_twitter_post(base_text)
+
         telegram_success = False
         twitter_success = False
 
@@ -458,7 +462,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await channel_bot.send_photo(
                     chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
                     photo=post_data["image_url"],
-                    caption=post_data["text_ru"]
+                    caption=telegram_text
                 )
                 telegram_success = True
             except Exception as e:
@@ -479,6 +483,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"❌ Не удалось отправить в Twitter: {e}",
                     reply_markup=None
                 )
+
         pending_post["active"] = False
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -545,7 +550,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "chat":
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="💬 Начинаем чат:\n" + post_data["text_ru"],
+            text="💬 Начинаем чат:\n" + post_data["text_en"],
             reply_markup=post_end_keyboard()
         )
         return
@@ -562,7 +567,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "new_post":
         pending_post["active"] = False
-        post_data["text_ru"] = f"Новый тестовый пост #{post_data['post_id'] + 1}"
+        post_data["text_en"] = f"New test post #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = False
@@ -571,7 +576,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "new_post_manual":
         pending_post["active"] = False
-        post_data["text_ru"] = f"Ручной новый пост #{post_data['post_id'] + 1}"
+        post_data["text_en"] = f"Manual new post #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = True
@@ -587,7 +592,7 @@ async def delayed_start(app: Application):
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+        caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
