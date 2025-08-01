@@ -1,52 +1,28 @@
 import os
-import requests
 import asyncio
 from telegram import Bot
+from playwright.async_api import async_playwright
 
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN_CHANNEL')
-CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
-MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
-TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN_CHANNEL"]
+CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_USERNAME_ID"]
+MESSAGE_ID = int(os.environ["MESSAGE_ID"])
+TWITTER_USERNAME = os.environ.get("TWITTER_USERNAME", "AiCoin_ETH")
 
-AUTHORIZATION = "Bearer AAAAAAAAAAAAAAAAAAAAAANW7CgEAAAAA4pEDHwG%2Fkz7l4nslFY4knUzHVW0%3DdGPw9KsgX4mwV0ht9kzYz7mO0ly8aHRD1DiIOQyRKhqvRFBgD5"
-GUEST_TOKEN_URL = "https://api.twitter.com/1.1/guest/activate.json"
-GRAPHQL_URL = "https://twitter.com/i/api/graphql/HYvLL37gkgw1TgJXAL6Wlw/UserByScreenName"
-
-def get_guest_token():
-    headers = {
-        "Authorization": AUTHORIZATION,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    }
-    r = requests.post(GUEST_TOKEN_URL, headers=headers)
-    if r.status_code == 200:
-        return r.json().get("guest_token")
-    print("[ERROR] Failed to get guest token:", r.status_code)
-    return None
-
-def get_followers_count(username):
-    guest_token = get_guest_token()
-    if not guest_token:
-        return None
-
-    headers = {
-        "Authorization": AUTHORIZATION,
-        "X-Guest-Token": guest_token,
-        "User-Agent": "Mozilla/5.0",
-    }
-    params = {
-        "variables": f'{{"screen_name":"{username}","withSafetyModeUserFields":true}}'
-    }
-    r = requests.get(GRAPHQL_URL, headers=headers, params=params)
-    if r.status_code == 200:
+async def get_followers_from_twitter(username):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
         try:
-            data = r.json()
-            return data['data']['user']['result']['legacy']['followers_count']
+            await page.goto(f"https://twitter.com/{username}", timeout=60000)
+            await page.wait_for_selector('a[href$="/followers"] > div > div > span > span', timeout=60000)
+            text = await page.locator('a[href$="/followers"] > div > div > span > span').inner_text()
+            return text.strip().replace(',', '')
         except Exception as e:
-            print("[ERROR] Failed to parse followers:", e)
-    else:
-        print("[ERROR] Twitter response:", r.status_code)
-    return None
+            print(f"[Playwright ERROR] {e}")
+            return None
+        finally:
+            await browser.close()
 
 async def update_telegram_message(followers):
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -61,15 +37,13 @@ async def update_telegram_message(followers):
             text=text,
             parse_mode='Markdown'
         )
-        print("[Telegram] Message updated.")
+        print("[Telegram] Message updated")
     except Exception as e:
         print("[Telegram ERROR]", e)
 
 async def main():
     print("Script started")
-    print("TWITTER_USERNAME:", TWITTER_USERNAME)
-
-    followers = get_followers_count(TWITTER_USERNAME)
+    followers = await get_followers_from_twitter(TWITTER_USERNAME)
     if not followers:
         followers = "N/A"
     print("Followers parsed:", followers)
