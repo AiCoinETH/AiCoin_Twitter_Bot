@@ -393,8 +393,9 @@ async def schedule_daily_posts():
 # --- Обработчик сообщений "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # Игнорируем если пользователь не в режиме "Сделай сам"
     if user_id not in user_self_post or user_self_post[user_id]['state'] != 'wait_post':
-        return  # Игнорируем, если пользователь не в режиме "Сделай сам"
+        return
 
     text = update.message.text or ""
     image = None
