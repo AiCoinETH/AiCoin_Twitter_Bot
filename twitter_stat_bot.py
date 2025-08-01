@@ -13,10 +13,20 @@ TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 def get_followers_from_html(username):
     try:
         url = f"https://twitter.com/{username}"
+        print(f"[DEBUG] Requesting: {url}")
+
         headers = {
-            "User-Agent": "Mozilla/5.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
         }
+
         r = requests.get(url, headers=headers, timeout=15)
+        print(f"[DEBUG] Status code: {r.status_code}")
+
         if r.status_code != 200:
             print(f"[ERROR] Twitter page returned status {r.status_code}")
             return None
