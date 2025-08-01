@@ -1,5 +1,3 @@
-# Подробнее и новые возможности автопостинга — на https://gptonline.ai/
-
 import os
 import asyncio
 import hashlib
@@ -90,7 +88,6 @@ def post_choice_keyboard():
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
 
@@ -405,6 +402,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_self_post[user_id]['image'] = image
     user_self_post[user_id]['state'] = 'wait_confirm'
 
+    # Отправляем предпросмотр с кнопками "Завершить генерацию" и "Отмена"
     if image:
         await send_photo_with_download(
             approval_bot,
@@ -442,6 +440,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
+    # Исправленная логика для "finish_self_post":
     if action == "finish_self_post":
         info = user_self_post.get(user_id)
         if info and info["state"] == "wait_confirm":
@@ -455,15 +454,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=post_data["text_ru"]
-            )
+
+            # Отправляем укороченный пост для Telegram + меню выбора площадки публикации
+            telegram_preview = f"{text}\n\nПодробнее: https://getaicoin.com/"
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=post_data["text_ru"],
+                text=telegram_preview,
                 reply_markup=post_choice_keyboard()
             )
         return
@@ -524,21 +520,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         pending_post["active"] = False
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
-            reply_markup=None
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
-            reply_markup=None
-        )
+
+        # Отправляем сообщения об успехе/ошибке
+        if telegram_success:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Telegram!",
+                reply_markup=None
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="❌ Не удалось отправить в Telegram.",
+                reply_markup=None
+            )
+
+        if twitter_success:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Успешно отправлено в Twitter!",
+                reply_markup=None
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="❌ Не удалось отправить в Twitter.",
+                reply_markup=None
+            )
+
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Работа завершена.",
             reply_markup=post_end_keyboard()
         )
+
         shutdown_bot_and_exit()
         return
 
@@ -651,5 +666,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Подробнее, кастомизация и новые возможности — на https://gptonline.ai/
