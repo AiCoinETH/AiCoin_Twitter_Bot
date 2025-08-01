@@ -1,49 +1,54 @@
 import os
-import re
 import requests
+import re
 from telegram import Bot
 
-# --- Получаем данные из переменных окружения ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN_CHANNEL')
 CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
 MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
-TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME')
+TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME')  # например, 'AiCoin_ETH'
 
-def get_twitter_followers(username):
-    print(f"Парсим X (Twitter) для пользователя: {username}")
-    url = f'https://x.com/{username}'
+def get_twitter_followers_nitter(username):
+    # Используем nitter.net, если недоступен — меняй на другой инстанс
+    url = f'https://nitter.1d4.us/{username}'
     headers = {'User-Agent': 'Mozilla/5.0'}
-    r = requests.get(url, headers=headers, timeout=10)
-    # Проверяем оба варианта: Followers (EN) и читателей (RU)
-    match = re.search(r'(\d[\d,\.]*)\s+(Followers|читателей)', r.text)
-    if match:
-        print("Нашли совпадение:", match.group(0))
-        return match.group(1).replace(',', '').replace('.', '')
-    else:
-        print("Не удалось найти число подписчиков на странице!")
-        return None
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        html = r.text
+        # Парсим строчку вида <span class="profile-stat-num">11</span> Followers
+        match = re.search(r'profile-stat-num">([\d,\.]+)<.*?Followers', html, re.DOTALL)
+        if not match:
+            # fallback для русскоязычного инстанса или других версий
+            match = re.search(r'profile-stat-num">([\d,\.]+)<', html)
+        if match:
+            return match.group(1).replace(',', '').replace('.', '')
+    except Exception as e:
+        print("Nitter error:", e)
+    return None
 
 def update_telegram_message(followers):
     bot = Bot(token=TELEGRAM_TOKEN)
-    # Английский текст для канала, все ссылки кликабельные (Markdown)
     text = (
         "🕊️ [Twitter](https://x.com/AiCoin_ETH): {} followers\n"
         "🌐 [Website](https://getaicoin.com/)"
-    ).format(followers)
+    ).format(followers if followers is not None else '0')
     bot.edit_message_text(
         chat_id=CHANNEL_ID,
         message_id=MESSAGE_ID,
         text=text,
         parse_mode='Markdown'
     )
-    print("Telegram message updated!")
 
 if __name__ == "__main__":
     print("Script started")
     print("TWITTER_USERNAME:", TWITTER_USERNAME)
-    followers = get_twitter_followers(TWITTER_USERNAME)
+    print("Парсим Nitter для пользователя:", TWITTER_USERNAME)
+    followers = get_twitter_followers_nitter(TWITTER_USERNAME)
     print("Followers parsed:", followers)
-    if followers:
+    if followers is not None:
         update_telegram_message(followers)
+        print("Telegram message updated!")
     else:
         print("Failed to get followers count!")
