@@ -1,4 +1,3 @@
-
 import os
 import re
 import asyncio
@@ -39,15 +38,16 @@ async def get_followers_via_xhr(username: str) -> str | None:
 async def update_telegram_message(followers):
     bot = Bot(token=TELEGRAM_TOKEN)
     text = (
-        f"ðï¸ [Twitter](https://x.com/{TWITTER_USERNAME}): {followers} followers\n"
-        f"ð [Website](https://getaicoin.com/)"
+        f"🕊️ [Twitter](https://x.com/{TWITTER_USERNAME}): {followers} followers\n"
+        f"🌐 [Website](https://getaicoin.com/)"
     )
     try:
         await bot.edit_message_text(
             chat_id=CHANNEL_ID,
             message_id=MESSAGE_ID,
             text=text,
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            disable_web_page_preview=True  # 👈 Отключаем предпросмотр
         )
         print("[Telegram] Message updated:", text)
     except Exception as e:
