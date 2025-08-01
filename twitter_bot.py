@@ -182,7 +182,6 @@ def build_twitter_post(text_en: str) -> str:
     return main_part + signature
 
 def get_image_bytes(image_url):
-    # file_id — скачиваем с серверов Telegram (ботом channel_bot, он публикует)
     if isinstance(image_url, str) and len(image_url) > 30 and not image_url.startswith('http'):
         file = channel_bot.get_file(image_url)
         return file.download_as_bytearray()
@@ -376,7 +375,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         image = None
         if update.message.photo:
             image = update.message.photo[-1].file_id
-        # [ВАЖНО] Если пришла только картинка, текст не нужен!
         if not text and not image:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -422,7 +420,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # --- обработка finish_self_post ---
     if action == "finish_self_post":
         info = user_self_post.get(user_id)
         if info and info["state"] == "wait_confirm":
@@ -613,11 +610,9 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    img_bytes = get_image_bytes(post_data["image_url"])
-    await approval_bot.send_photo(
+    await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        photo=img_bytes,
-        caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
+        text="👋 Добро пожаловать! Что вы хотите сделать?",
         reply_markup=start_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
