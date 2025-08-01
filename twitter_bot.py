@@ -324,8 +324,72 @@ async def send_post_for_approval():
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
-# ... дальше весь остальной код без изменений ...
-# Логика "Сделай сам"
+def generate_random_schedule(
+    posts_per_day=6,
+    day_start_hour=6,
+    day_end_hour=23,
+    min_offset=-20,
+    max_offset=20
+):
+    if day_end_hour > 23: day_end_hour = 23
+    now = datetime.now()
+    today = now.date()
+    start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
+    if now > start:
+        start = now + timedelta(seconds=1)
+    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
+    total_seconds = int((end - start).total_seconds())
+    if posts_per_day < 1:
+        return []
+    base_step = total_seconds // posts_per_day
+    schedule = []
+    for i in range(posts_per_day):
+        base_sec = i * base_step
+        offset_sec = random.randint(min_offset * 60, max_offset * 60) + random.randint(-59, 59)
+        post_time = start + timedelta(seconds=base_sec + offset_sec)
+        if post_time < start:
+            post_time = start
+        if post_time > end:
+            post_time = end
+        schedule.append(post_time)
+    schedule.sort()
+    return schedule
+
+async def schedule_daily_posts():
+    global manual_posts_today
+    while True:
+        manual_posts_today = 0
+        now = datetime.now()
+        if now.hour < 6:
+            to_sleep = (datetime.combine(now.date(), dt_time(hour=6)) - now).total_seconds()
+            logging.info(f"Жду до 06:00... {int(to_sleep)} сек")
+            await asyncio.sleep(to_sleep)
+
+        posts_left = lambda: scheduled_posts_per_day - manual_posts_today
+        while posts_left() > 0:
+            schedule = generate_random_schedule(posts_per_day=posts_left())
+            logging.info(f"Расписание авто-постов на сегодня: {[t.strftime('%H:%M:%S') for t in schedule]}")
+            for post_time in schedule:
+                if posts_left() <= 0:
+                    break
+                now = datetime.now()
+                delay = (post_time - now).total_seconds()
+                if delay > 0:
+                    logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
+                    await asyncio.sleep(delay)
+                post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
+                post_data["image_url"] = random.choice(test_images)
+                post_data["post_id"] += 1
+                post_data["is_manual"] = False
+                await send_post_for_approval()
+                while pending_post["active"]:
+                    await asyncio.sleep(1)
+        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=0))
+        to_next_day = (tomorrow - datetime.now()).total_seconds()
+        await asyncio.sleep(to_next_day)
+        manual_posts_today = 0
+
+# --- Логика "Сделай сам" (полная!)
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
@@ -362,6 +426,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
         return
 
+# --- Обработка кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     await update.callback_query.answer()
