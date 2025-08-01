@@ -1,55 +1,44 @@
 import os
+import json
 import requests
-import re
 import asyncio
 from telegram import Bot
 from telegram.error import BadRequest
-from playwright.async_api import async_playwright
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN_CHANNEL')
 CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
 MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 
-async def get_followers_from_twitter(username: str) -> str | None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        page = await context.new_page()
+def get_followers_via_api(username: str) -> str | None:
+    headers = {
+        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAgB5dTfR2wYXFY9UL6p4ZQJrkNdo%3D...cut",
+        "X-Guest-Token": "1490980653852325888",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+    }
 
-        followers_count = None
+    variables = {
+        "screen_name": username,
+        "withSafetyModeUserFields": True,
+        "withSuperFollowsUserFields": True
+    }
 
-        def handle_response(response):
-            if "UserByScreenName" in response.url and response.status == 200:
-                print(f"[XHR] Found URL: {response.url}")
-                asyncio.create_task(parse_json(response))
+    params = {
+        "variables": json.dumps(variables)
+    }
 
-        async def parse_json(response):
-            nonlocal followers_count
-            try:
-                json_data = await response.json()
-                print(f"[XHR] JSON Response: {json_data}")
-                followers_count = (
-                    json_data.get("data", {})
-                    .get("user", {})
-                    .get("result", {})
-                    .get("legacy", {})
-                    .get("followers_count")
-                )
-                print(f"[INFO] Parsed followers: {followers_count}")
-            except Exception as e:
-                print(f"[ERROR] JSON parse failed: {e}")
+    url = "https://twitter.com/i/api/graphql/-xfUfZ2o5Wuj5GnE1UuBPA/UserByScreenName"
 
-        page.on("response", handle_response)
-
-        try:
-            await page.goto(f"https://twitter.com/{username}", timeout=60000)
-            await asyncio.sleep(15)  # Дай XHR-запросу выполниться
-        except Exception as e:
-            print(f"[Playwright error]: {e}")
-
-        await browser.close()
-        return str(followers_count) if followers_count else None
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        data = response.json()
+        followers = data["data"]["user"]["result"]["legacy"]["followers_count"]
+        print(f"[INFO] Fetched followers: {followers}")
+        return str(followers)
+    except Exception as e:
+        print(f"[ERROR] Twitter API fetch failed: {e}")
+        return None
 
 async def update_telegram_message(followers):
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -75,7 +64,7 @@ async def main():
     print("Script started")
     print("TWITTER_USERNAME:", TWITTER_USERNAME)
 
-    followers = await get_followers_from_twitter(TWITTER_USERNAME)
+    followers = get_followers_via_api(TWITTER_USERNAME)
     if not followers:
         followers = "N/A"
 
