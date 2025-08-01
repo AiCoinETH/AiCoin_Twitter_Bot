@@ -63,7 +63,8 @@ post_data = {
     "text_en": WELCOME_POST_RU,
     "image_url": test_images[0],
     "timestamp": None,
-    "post_id": 0
+    "post_id": 0,
+    "is_manual": False
 }
 prev_data = post_data.copy()
 user_self_post = {}
@@ -103,7 +104,7 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-# --- Twitter
+# --- Twitter ---
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -120,6 +121,7 @@ def get_twitter_clients():
         )
     )
     return client_v2, api_v1
+
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
@@ -135,7 +137,7 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
-# --- Скачивание картинки для Telegram и Twitter
+# --- Скачивание картинки для Telegram и Twitter ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
         file = bot.get_file(url_or_file_id)
@@ -179,7 +181,7 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
         )
         return False
 
-async def publish_post_to_twitter(text, image_url=None):
+def publish_post_to_twitter(text, image_url=None):
     try:
         media_ids = None
         if image_url:
@@ -197,10 +199,10 @@ async def publish_post_to_twitter(text, image_url=None):
     except Exception as e:
         pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
-        await approval_bot.send_message(
+        asyncio.create_task(approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."
-        )
+        ))
         return False
 
 def shutdown_bot_and_exit():
@@ -272,7 +274,7 @@ async def check_timer():
                         text="⌛ Время ожидания истекло. Публикую автоматически."
                     )
                     await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
-                    await publish_post_to_twitter(twitter_text, post_data["image_url"])
+                    publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -396,7 +398,9 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         text = update.message.text or ""
         image = None
         if update.message.photo:
+            # Берём file_id самого большого изображения
             image = update.message.photo[-1].file_id
+        # Если нет текста, то просто пустая строка
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
@@ -513,7 +517,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["post_twitter", "post_both"]:
             try:
-                twitter_success = await publish_post_to_twitter(twitter_text, post_data["image_url"])
+                twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Twitter: {e}")
                 await approval_bot.send_message(
@@ -625,11 +629,17 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
+    # Отправляем приветственный пост с кнопками стартового меню
     await send_photo_with_download(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
         post_data["image_url"],
         caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS
+    )
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Выберите действие:",
+        reply_markup=main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
 
