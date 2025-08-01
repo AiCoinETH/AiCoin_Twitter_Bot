@@ -304,12 +304,12 @@ async def send_post_for_approval():
         "timeout": TIMER_PUBLISH_DEFAULT
     })
     try:
-        photo_msg = await approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"],
-            reply_markup=main_keyboard()
-        )
+await approval_bot.send_photo(
+    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+    photo=post_data["image_url"],
+    caption=post_data["text_ru"] + "\\n\\n" + WELCOME_HASHTAGS,
+    reply_markup=main_keyboard()
+)
         approval_message_ids["photo"] = photo_msg.message_id
         logging.info("Пост отправлен на согласование.")
     except Exception as e:
@@ -777,9 +777,7 @@ async def delayed_start(app: Application):
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         photo=post_data["image_url"],
-        caption=post_data["text_ru"] + "
-
-" + WELCOME_HASHTAGS,
+        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
     # --- Сообщение о запуске и меню ---
