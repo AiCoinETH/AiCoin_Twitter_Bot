@@ -15,6 +15,9 @@ import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+# --- Глобальный lock для синхронизации автопостинга ---
+approval_lock = asyncio.Lock()
+
 # --- Переменные окружения и настройки ---
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
@@ -81,7 +84,6 @@ test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
-# --- Стартовые приветственные сообщения для Telegram и Twitter (пример генерации) ---
 WELCOME_POST_RU = (
     "🚀 Добро пожаловать в бота публикаций!\n\n"
     "Генерация контента по трендам, новости, идеи, генерация изображений и многое другое."
@@ -92,7 +94,6 @@ WELCOME_POST_EN = (
 )
 WELCOME_HASHTAGS = "#AiCoin #AI #crypto #trends #бот #новости"
 
-# Используется при старте и первом запуске, для Telegram — длинный, для Twitter — короткий (см. build_twitter_post)
 post_data = {
     "text_ru":   WELCOME_POST_RU,
     "image_url": test_images[0],
@@ -211,7 +212,6 @@ def generate_random_schedule(
     return schedule
 
 def build_twitter_post(text_en: str) -> str:
-    # --- Если текст длиннее 180 символов, он обрезается, добавляются хештеги, ссылки, подписи ---
     signature = (
         "\nRead more on Telegram: t.me/AiCoin_ETH or on the website: https://getaicoin.com/ "
         "#AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
@@ -294,65 +294,65 @@ async def save_post_to_history(text, image_url=None):
     logging.info("Пост сохранён в историю.")
 
 async def send_post_for_approval():
-    if do_not_disturb["active"] or pending_post["active"]:
-        return
+    async with approval_lock:
+        if do_not_disturb["active"] or pending_post["active"]:
+            return
 
-    post_data["timestamp"] = datetime.now()
-    pending_post.update({
-        "active": True,
-        "timer": datetime.now(),
-        "timeout": TIMER_PUBLISH_DEFAULT
-    })
-    try:
-        photo_msg = await approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
-            reply_markup=main_keyboard()
-        )
-        approval_message_ids["photo"] = photo_msg.message_id
-        logging.info("Пост отправлен на согласование.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке на согласование: {e}")
-
-
+        post_data["timestamp"] = datetime.now()
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
+        try:
+            photo_msg = await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=post_data["image_url"],
+                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+                reply_markup=main_keyboard()
+            )
+            approval_message_ids["photo"] = photo_msg.message_id
+            logging.info("Пост отправлен на согласование.")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке на согласование: {e}")
 
 async def publish_post_to_channel():
-    try:
-        msg = await channel_bot.send_photo(
-            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-            photo=post_data["image_url"],
-            caption=post_data["text_ru"]
-        )
-        logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}, message_id={msg.message_id}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"✅ Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}!\n\nСсылка: https://t.me/{TELEGRAM_CHANNEL_USERNAME_ID.lstrip('@')}/{msg.message_id}"
-        )
-    except telegram.error.Forbidden as e:
-        pending_post["active"] = False
-        logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="❌ Не удалось опубликовать пост: у бота нет прав или он не в канале!"
-        )
-    except telegram.error.BadRequest as e:
-        pending_post["active"] = False
-        logging.error(f"BadRequest: Проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка: проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}!"
-        )
-    except Exception as e:
-        pending_post["active"] = False
-        logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="❌ Ошибка публикации в канал!"
-        )
+    async with approval_lock:
+        try:
+            msg = await channel_bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                photo=post_data["image_url"],
+                caption=post_data["text_ru"]
+            )
+            logging.info(f"Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}, message_id={msg.message_id}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"✅ Пост опубликован в канал {TELEGRAM_CHANNEL_USERNAME_ID}!\n\nСсылка: https://t.me/{TELEGRAM_CHANNEL_USERNAME_ID.lstrip('@')}/{msg.message_id}"
+            )
+        except telegram.error.Forbidden as e:
+            pending_post["active"] = False
+            logging.error(f"Forbidden: Бот не админ или не может писать в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="❌ Не удалось опубликовать пост: у бота нет прав или он не в канале!"
+            )
+        except telegram.error.BadRequest as e:
+            pending_post["active"] = False
+            logging.error(f"BadRequest: Проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=f"❌ Ошибка: проверьте username канала {TELEGRAM_CHANNEL_USERNAME_ID}!"
+            )
+        except Exception as e:
+            pending_post["active"] = False
+            logging.error(f"Ошибка публикации в канал {TELEGRAM_CHANNEL_USERNAME_ID}: {e}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="❌ Ошибка публикации в канал!"
+            )
 
-    asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
-    pending_post["active"] = False
+        asyncio.create_task(save_post_to_history(post_data["text_ru"], post_data["image_url"]))
+        pending_post["active"] = False
 
 async def check_timer():
     while True:
@@ -414,7 +414,7 @@ async def schedule_daily_posts():
                 if delay > 0:
                     logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
                     await asyncio.sleep(delay)
-                pending_post["active"] = False
+                # УДАЛЁН pending_post["active"] = False — ЭТО ДЕЛАТЬ НЕ НУЖНО!
                 post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
                 post_data["image_url"] = random.choice(test_images)
                 post_data["post_id"] += 1
@@ -427,6 +427,7 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
+# ...Остальной твой код (handlers и main) без изменений
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     await update.callback_query.answer()
