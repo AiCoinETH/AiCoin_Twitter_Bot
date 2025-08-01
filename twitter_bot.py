@@ -378,6 +378,7 @@ async def check_timer():
                         text="Выберите действие:",
                         reply_markup=post_end_keyboard()
                     )
+                    os._exit(0)  # <-- ДОБАВЬ эту строку после публикации!
                 except Exception as e:
                     pending_post["active"] = False
                     await approval_bot.send_message(
