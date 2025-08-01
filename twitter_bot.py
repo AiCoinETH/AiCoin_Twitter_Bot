@@ -3,7 +3,6 @@ import asyncio
 import hashlib
 import logging
 import random
-import sys
 from datetime import datetime, timedelta, time as dt_time
 import tweepy
 import requests
@@ -423,6 +422,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
+
+    # --- обработка finish_self_post ---
+    if action == "finish_self_post":
+        info = user_self_post.get(user_id)
+        if info and info["state"] == "wait_confirm":
+            text = info.get("text", "")
+            image = info.get("image", None)
+            post_data["text_en"] = text
+            if image:
+                post_data["image_url"] = image
+            else:
+                post_data["image_url"] = None
+            post_data["post_id"] += 1
+            post_data["is_manual"] = True
+            user_self_post.pop(user_id, None)
+            if post_data["image_url"]:
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=post_data["image_url"],
+                    caption=post_data["text_en"],
+                    reply_markup=post_choice_keyboard()
+                )
+            else:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=post_data["text_en"],
+                    reply_markup=post_choice_keyboard()
+                )
+        return
 
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
