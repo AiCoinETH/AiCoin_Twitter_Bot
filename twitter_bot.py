@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import logging
 import random
+import sys
 from datetime import datetime, timedelta, time as dt_time
 import tweepy
 import requests
@@ -15,10 +16,8 @@ import telegram.error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# --- Глобальный lock для синхронизации автопостинга ---
 approval_lock = asyncio.Lock()
 
-# --- Переменные окружения и настройки ---
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID   = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL  = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -433,7 +432,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if image:
                 post_data["image_url"] = image
             else:
-                post_data["image_url"] = None
+                post_data["image_url"] = random.choice(test_images)  # Дефолтная картинка!
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
