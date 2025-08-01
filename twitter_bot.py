@@ -440,7 +440,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # Исправленная логика для "finish_self_post":
     if action == "finish_self_post":
         info = user_self_post.get(user_id)
         if info and info["state"] == "wait_confirm":
