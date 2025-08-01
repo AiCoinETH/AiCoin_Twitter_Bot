@@ -7,5 +7,6 @@ pytrends
 snscrape
 PyGithub
 aiosqlite
-python-dotenv  # чтобы удобно работать с .env (рекомендуется!)
-pytz           # для работы с timezone 'Europe/Kyiv'
+python-dotenv
+pytz
+playwright>=1.44.0  # 👈 для поддержки async playwright
