@@ -71,6 +71,17 @@ pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT
 do_not_disturb = {"active": False}
 last_action_time = {}
 
+# --- Telegram лимиты и ссылки ---
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_LINKS = " Website: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH"
+LINKS_LEN = len(TELEGRAM_LINKS)
+
+def build_telegram_post(text_en: str) -> str:
+    max_text_len = TELEGRAM_CAPTION_LIMIT - LINKS_LEN
+    if len(text_en) > max_text_len:
+        text_en = text_en[:max_text_len - 3] + "..."
+    return text_en + TELEGRAM_LINKS
+
 # --- Главное меню ---
 def main_keyboard():
     return InlineKeyboardMarkup([
@@ -165,8 +176,10 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
             os.remove(file_path)
 
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
+    # caption всегда <= 1024 с учетом ссылок
+    caption = build_telegram_post(text)
     try:
-        await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        await send_photo_with_download(bot, chat_id, image_url, caption=caption)
         logging.info("Пост успешно опубликован в Telegram!")
         return True
     except Exception as e:
@@ -263,7 +276,7 @@ async def check_timer():
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
                     base_text = post_data["text_ru"].strip()
-                    telegram_text = f"{base_text}\n\nПодробнее: https://getaicoin.com/"
+                    telegram_text = build_telegram_post(base_text)
                     twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -398,6 +411,16 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     if update.message.photo:
         image = update.message.photo[-1].file_id
 
+    # Проверка лимита Telegram:
+    max_text_len = TELEGRAM_CAPTION_LIMIT - LINKS_LEN
+    if len(text) > max_text_len:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❗️Пост слишком длинный для Telegram (лимит {TELEGRAM_CAPTION_LIMIT} вместе со ссылками, сейчас: {len(text) + LINKS_LEN}).\n"
+                 f"Укоротите текст до {max_text_len} символов."
+        )
+        return
+
     user_self_post[user_id]['text'] = text
     user_self_post[user_id]['image'] = image
     user_self_post[user_id]['state'] = 'wait_confirm'
@@ -459,20 +482,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
 
-            telegram_preview = f"{text}\n\nПодробнее: https://getaicoin.com/"
-
+            # Показываем предпросмотр Твиттера (финишный вариант)
+            twitter_preview = build_twitter_post(text)
             try:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=telegram_preview,
+                    text=twitter_preview,
                     reply_markup=post_choice_keyboard()
                 )
-                logging.info("Показано меню выбора площадки после завершения генерации.")
+                logging.info("Показан финальный Twitter-пост с выбором площадки.")
             except Exception as e:
                 logging.error(f"Ошибка отправки меню выбора площадки: {e}")
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=telegram_preview + "\n\n(Не удалось показать меню выбора площадки)"
+                    text=twitter_preview + "\n\n(Не удалось показать меню выбора площадки)"
                 )
         else:
             await update.callback_query.answer("Ошибка: состояние не позволяет завершить генерацию.", show_alert=True)
@@ -505,7 +528,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
         base_text = post_data["text_ru"].strip()
-        telegram_text = f"{base_text}\n\nПодробнее: https://getaicoin.com/"
+        telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
 
         telegram_success = False
@@ -513,7 +536,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["post_telegram", "post_both"]:
             try:
-                telegram_success = await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
+                telegram_success = await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, base_text, post_data["image_url"])
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Telegram: {e}")
                 await approval_bot.send_message(
