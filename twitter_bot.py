@@ -286,16 +286,20 @@ async def check_timer():
                     base_text = post_data["text_en"].strip()
                     telegram_text = f"{base_text}\n\nRead more: https://getaicoin.com/"
                     twitter_text = build_twitter_post(base_text)
+                    # --- гарантия что отправляем только валидную ссылку! ---
+                    img_url = post_data["image_url"]
+                    if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+                        img_url = random.choice(test_images)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text="⌛ Время ожидания истекло. Публикую автоматически."
                     )
                     await channel_bot.send_photo(
                         chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                        photo=post_data["image_url"],
+                        photo=img_url,
                         caption=telegram_text
                     )
-                    publish_post_to_twitter(twitter_text, post_data["image_url"])
+                    publish_post_to_twitter(twitter_text, img_url)
                     logging.info("Автоматическая публикация произведена.")
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -332,9 +336,13 @@ async def send_post_for_approval():
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         try:
+            # --- гарантия что отправляем только валидную ссылку! ---
+            img_url = post_data["image_url"]
+            if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+                img_url = random.choice(test_images)
             photo_msg = await approval_bot.send_photo(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                photo=post_data["image_url"],
+                photo=img_url,
                 caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
                 reply_markup=main_keyboard()
             )
@@ -436,19 +444,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            if post_data["image_url"]:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=post_data["image_url"],
-                    caption=post_data["text_en"],
-                    reply_markup=post_choice_keyboard()
-                )
-            else:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=post_data["text_en"],
-                    reply_markup=post_choice_keyboard()
-                )
+            img_url = post_data["image_url"]
+            if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+                img_url = random.choice(test_images)
+            await approval_bot.send_photo(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                photo=img_url,
+                caption=post_data["text_en"],
+                reply_markup=post_choice_keyboard()
+            )
         return
 
     if action == "shutdown_bot":
@@ -468,9 +472,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_en"])
+        img_url = post_data["image_url"]
+        if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+            img_url = random.choice(test_images)
         await approval_bot.send_photo(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            photo=post_data["image_url"],
+            photo=img_url,
             caption=twitter_text,
             reply_markup=post_choice_keyboard()
         )
@@ -484,11 +491,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         telegram_success = False
         twitter_success = False
 
+        img_url = post_data["image_url"]
+        if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+            img_url = random.choice(test_images)
+
         if action in ["post_telegram", "post_both"]:
             try:
                 await channel_bot.send_photo(
                     chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                    photo=post_data["image_url"],
+                    photo=img_url,
                     caption=telegram_text
                 )
                 telegram_success = True
@@ -502,7 +513,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["post_twitter", "post_both"]:
             try:
-                twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
+                twitter_success = publish_post_to_twitter(twitter_text, img_url)
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Twitter: {e}")
                 await approval_bot.send_message(
@@ -616,9 +627,12 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
+    img_url = post_data["image_url"]
+    if not img_url or not isinstance(img_url, str) or not img_url.startswith("http"):
+        img_url = random.choice(test_images)
     await approval_bot.send_photo(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        photo=post_data["image_url"],
+        photo=img_url,
         caption=post_data["text_en"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
