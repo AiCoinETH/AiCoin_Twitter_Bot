@@ -3,10 +3,8 @@ import requests
 import re
 import asyncio
 from telegram import Bot
-from telegram import __version__ as tg_ver
+from telegram.error import BadRequest
 from playwright.async_api import async_playwright
-
-print("python-telegram-bot version:", tg_ver)
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN_CHANNEL')
 CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
@@ -14,12 +12,10 @@ MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 
 def get_followers_from_nitter(username):
-    # ... без изменений ...
-    return None
+    return None  # отключено
 
 def get_followers_from_socialblade(username):
-    # ... без изменений ...
-    return None
+    return None  # отключено
 
 async def get_followers_from_twitter(username: str) -> str | None:
     async with async_playwright() as pw:
@@ -51,8 +47,7 @@ async def get_followers_from_twitter(username: str) -> str | None:
 
         try:
             await page.goto(f"https://twitter.com/{username}", timeout=60000)
-            await page.wait_for_selector('[data-testid="primaryColumn"]', timeout=60000)
-            await asyncio.sleep(5)  # дождись XHR-запросов
+            await asyncio.sleep(10)  # ждём загрузку XHR
         except Exception as e:
             print(f"Playwright error: {e}")
 
@@ -73,7 +68,7 @@ async def update_telegram_message(followers):
             parse_mode='Markdown'
         )
         print("Telegram message updated:", text)
-    except Exception as e:
+    except BadRequest as e:
         if "Message is not modified" in str(e):
             print("Telegram: message unchanged — skipping.")
         else:
@@ -83,13 +78,7 @@ async def main():
     print("Script started")
     print("TWITTER_USERNAME:", TWITTER_USERNAME)
 
-    followers = get_followers_from_nitter(TWITTER_USERNAME)
-    if not followers:
-        print("Nitter failed, trying Socialblade")
-        followers = get_followers_from_socialblade(TWITTER_USERNAME)
-    if not followers:
-        print("Socialblade failed, trying Twitter directly")
-        followers = await get_followers_from_twitter(TWITTER_USERNAME)
+    followers = await get_followers_from_twitter(TWITTER_USERNAME)
     if not followers:
         followers = "N/A"
 
