@@ -72,9 +72,8 @@ user_self_post = {}
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
 last_action_time = {}
-approval_message_ids = {"photo": None}
 
-# --- Главное меню (стартовое и для работы) ---
+# --- Главное меню ---
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -137,7 +136,7 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
-# --- Скачивание картинки для Telegram и Twitter ---
+# --- Скачивание картинки ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
         file = bot.get_file(url_or_file_id)
@@ -391,16 +390,14 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
-# --- Логика "Сделай сам" (полная!)
+# --- Логика "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
         text = update.message.text or ""
         image = None
         if update.message.photo:
-            # Берём file_id самого большого изображения
-            image = update.message.photo[-1].file_id
-        # Если нет текста, то просто пустая строка
+            image = update.message.photo[-1].file_id  # Берём максимальный размер
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
@@ -629,7 +626,6 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    # Отправляем приветственный пост с кнопками стартового меню
     await send_photo_with_download(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
