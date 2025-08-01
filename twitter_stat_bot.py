@@ -11,12 +11,6 @@ CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
 MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 
-def get_followers_from_nitter(username):
-    return None  # отключено
-
-def get_followers_from_socialblade(username):
-    return None  # отключено
-
 async def get_followers_from_twitter(username: str) -> str | None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -27,12 +21,14 @@ async def get_followers_from_twitter(username: str) -> str | None:
 
         def handle_response(response):
             if "UserByScreenName" in response.url and response.status == 200:
+                print(f"[XHR] Found URL: {response.url}")
                 asyncio.create_task(parse_json(response))
 
         async def parse_json(response):
             nonlocal followers_count
             try:
                 json_data = await response.json()
+                print(f"[XHR] JSON Response: {json_data}")
                 followers_count = (
                     json_data.get("data", {})
                     .get("user", {})
@@ -40,16 +36,17 @@ async def get_followers_from_twitter(username: str) -> str | None:
                     .get("legacy", {})
                     .get("followers_count")
                 )
+                print(f"[INFO] Parsed followers: {followers_count}")
             except Exception as e:
-                print(f"JSON parse error: {e}")
+                print(f"[ERROR] JSON parse failed: {e}")
 
         page.on("response", handle_response)
 
         try:
             await page.goto(f"https://twitter.com/{username}", timeout=60000)
-            await asyncio.sleep(10)  # ждём загрузку XHR
+            await asyncio.sleep(15)  # Дай XHR-запросу выполниться
         except Exception as e:
-            print(f"Playwright error: {e}")
+            print(f"[Playwright error]: {e}")
 
         await browser.close()
         return str(followers_count) if followers_count else None
@@ -67,10 +64,10 @@ async def update_telegram_message(followers):
             text=text,
             parse_mode='Markdown'
         )
-        print("Telegram message updated:", text)
+        print("[Telegram] Message updated.")
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            print("Telegram: message unchanged — skipping.")
+            print("[Telegram] Message unchanged — skipping.")
         else:
             raise
 
