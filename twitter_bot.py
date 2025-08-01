@@ -378,7 +378,8 @@ async def check_timer():
                         text="Выберите действие:",
                         reply_markup=post_end_keyboard()
                     )
-                    os._exit(0)  # <-- ДОБАВЬ эту строку после публикации!
+                    logging.info("===> Завершаем процесс: os._exit(0) <===")
+os._exit(0)  # <-- ДОБАВЬ эту строку после публикации!
                 except Exception as e:
                     pending_post["active"] = False
                     await approval_bot.send_message(
@@ -784,14 +785,13 @@ async def delayed_start(app: Application):
         caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
-    # --- Сообщение о запуске и меню ---
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Бот запущен. Главное меню:",
-        reply_markup=main_keyboard()
-    )
+    # --- Сообщение о запуске и меню --- (УБРАТЬ лишнее!)
+    # await approval_bot.send_message(
+    #     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+    #     text="Бот запущен. Главное меню:",
+    #     reply_markup=main_keyboard()
+    # )
     logging.info("Бот запущен и готов к работе.")
-
 def main():
     logging.info("Старт Telegram бота модерации и публикации…")
     app = Application.builder()\
