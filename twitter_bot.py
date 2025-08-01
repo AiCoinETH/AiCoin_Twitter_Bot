@@ -133,6 +133,7 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
+# --- Скачивание картинки ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
         file = bot.get_file(url_or_file_id)
@@ -389,7 +390,6 @@ async def schedule_daily_posts():
 # --- Обработчик сообщений "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Только если пользователь активировал режим "Сделай сам"
     if user_id not in user_self_post or user_self_post[user_id].get('state') != 'wait_post':
         return
 
@@ -402,7 +402,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_self_post[user_id]['image'] = image
     user_self_post[user_id]['state'] = 'wait_confirm'
 
-    # Отправляем предпросмотр и кнопки подтверждения
+    # Предпросмотр (фото+текст)
     if image:
         await send_photo_with_download(
             approval_bot,
@@ -410,10 +410,15 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             image,
             caption=text
         )
-    else:
+    elif text:
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=text
+        )
+    else:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="(пустое сообщение)"
         )
 
     await approval_bot.send_message(
