@@ -26,16 +26,38 @@ async def get_followers_from_twitter(username: str) -> str | None:
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         page = await context.new_page()
+
+        followers_count = None
+
+        def handle_response(response):
+            if "UserByScreenName" in response.url and response.status == 200:
+                asyncio.create_task(parse_json(response))
+
+        async def parse_json(response):
+            nonlocal followers_count
+            try:
+                json_data = await response.json()
+                followers_count = (
+                    json_data.get("data", {})
+                    .get("user", {})
+                    .get("result", {})
+                    .get("legacy", {})
+                    .get("followers_count")
+                )
+            except Exception as e:
+                print(f"JSON parse error: {e}")
+
+        page.on("response", handle_response)
+
         try:
             await page.goto(f"https://twitter.com/{username}", timeout=60000)
-            await page.wait_for_selector('div[data-testid="followers"] span span', timeout=45000)
-            count_text = await page.locator('div[data-testid="followers"] span span').first.inner_text()
-            return count_text.strip()
+            await page.wait_for_selector('[data-testid="primaryColumn"]', timeout=60000)
+            await asyncio.sleep(5)  # дождись XHR-запросов
         except Exception as e:
             print(f"Playwright error: {e}")
-            return None
-        finally:
-            await browser.close()
+
+        await browser.close()
+        return str(followers_count) if followers_count else None
 
 async def update_telegram_message(followers):
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -43,13 +65,19 @@ async def update_telegram_message(followers):
         f"🕊️ [Twitter](https://x.com/{TWITTER_USERNAME}): {followers} followers\n"
         f"🌐 [Website](https://getaicoin.com/)"
     )
-    await bot.edit_message_text(
-        chat_id=CHANNEL_ID,
-        message_id=MESSAGE_ID,
-        text=text,
-        parse_mode='Markdown'
-    )
-    print("Telegram message updated:", text)
+    try:
+        await bot.edit_message_text(
+            chat_id=CHANNEL_ID,
+            message_id=MESSAGE_ID,
+            text=text,
+            parse_mode='Markdown'
+        )
+        print("Telegram message updated:", text)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            print("Telegram: message unchanged — skipping.")
+        else:
+            raise
 
 async def main():
     print("Script started")
