@@ -455,13 +455,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
 
-            # Отправляем укороченный пост для Telegram + меню выбора площадки публикации
             telegram_preview = f"{text}\n\nПодробнее: https://getaicoin.com/"
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=telegram_preview,
-                reply_markup=post_choice_keyboard()
-            )
+
+            try:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=telegram_preview,
+                    reply_markup=post_choice_keyboard()
+                )
+                logging.info("Показано меню выбора площадки после завершения генерации.")
+            except Exception as e:
+                logging.error(f"Ошибка отправки меню выбора площадки: {e}")
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=telegram_preview + "\n\n(Не удалось показать меню выбора площадки)"
+                )
+        else:
+            await update.callback_query.answer("Ошибка: состояние не позволяет завершить генерацию.", show_alert=True)
         return
 
     if action == "shutdown_bot":
@@ -521,7 +531,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending_post["active"] = False
 
-        # Отправляем сообщения об успехе/ошибке
         if telegram_success:
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
