@@ -1,5 +1,5 @@
 import os
-import json
+import re
 import requests
 import asyncio
 from telegram import Bot
@@ -10,34 +10,27 @@ CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
 MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 
-def get_followers_via_api(username: str) -> str | None:
-    headers = {
-        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAgB5dTfR2wYXFY9UL6p4ZQJrkNdo%3D...cut",
-        "X-Guest-Token": "1490980653852325888",
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json"
-    }
-
-    variables = {
-        "screen_name": username,
-        "withSafetyModeUserFields": True,
-        "withSuperFollowsUserFields": True
-    }
-
-    params = {
-        "variables": json.dumps(variables)
-    }
-
-    url = "https://twitter.com/i/api/graphql/-xfUfZ2o5Wuj5GnE1UuBPA/UserByScreenName"
-
+def get_followers_from_html(username):
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        data = response.json()
-        followers = data["data"]["user"]["result"]["legacy"]["followers_count"]
-        print(f"[INFO] Fetched followers: {followers}")
-        return str(followers)
+        url = f"https://twitter.com/{username}"
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            print(f"[ERROR] Twitter page returned status {r.status_code}")
+            return None
+
+        match = re.search(r'"followers_count":(\d+)', r.text)
+        if match:
+            followers = match.group(1)
+            print(f"[INFO] Found followers: {followers}")
+            return followers
+        else:
+            print("[WARN] Regex match not found in HTML")
+            return None
     except Exception as e:
-        print(f"[ERROR] Twitter API fetch failed: {e}")
+        print(f"[ERROR] HTML fetch failed: {e}")
         return None
 
 async def update_telegram_message(followers):
@@ -64,7 +57,7 @@ async def main():
     print("Script started")
     print("TWITTER_USERNAME:", TWITTER_USERNAME)
 
-    followers = get_followers_via_api(TWITTER_USERNAME)
+    followers = get_followers_from_html(TWITTER_USERNAME)
     if not followers:
         followers = "N/A"
 
