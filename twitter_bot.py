@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, time as dt_time
 import tweepy
 import requests
 import tempfile
+import sys
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -183,16 +184,18 @@ def sleep_keyboard(next_time=None):
 def generate_random_schedule(
     posts_per_day=6,
     day_start_hour=6,
-    day_end_hour=24,
+    day_end_hour=23,   # Было 24
     min_offset=-20,
     max_offset=20
 ):
+    if day_end_hour > 23: day_end_hour = 23
     now = datetime.now()
     today = now.date()
     start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
     if now > start:
         start = now + timedelta(seconds=1)
     end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
+    ...
     total_seconds = int((end - start).total_seconds())
     if posts_per_day < 1:
         return []
@@ -378,8 +381,8 @@ async def check_timer():
                         text="Выберите действие:",
                         reply_markup=post_end_keyboard()
                     )
-                    logging.info("===> Завершаем процесс: os._exit(0) <===")
-                    os._exit(0)
+                    logging.info("===> Завершаем процесс: sys.exit(0) <===")
+                    sys.exit(0)  # <-- вот это лучший способ!
                 except Exception as e:
                     pending_post["active"] = False
                     await approval_bot.send_message(
