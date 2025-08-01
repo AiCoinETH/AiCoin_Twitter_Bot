@@ -8,43 +8,44 @@ CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_USERNAME_ID')
 MESSAGE_ID = int(os.environ.get('MESSAGE_ID'))
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME') or 'AiCoin_ETH'
 
-AUTHORIZATION = "Bearer AAAAAAAAAAAAAAAAAAAAANIRLAAAAAAAb9g8OlU9nSTbKMrKm0I%2FQBhN0%3DMvb2Fo5dzsld2Aev5UlixkOUvxnTrw0OtY0U0BdKnM2KJh8D8D"
+AUTHORIZATION = "Bearer AAAAAAAAAAAAAAAAAAAAAANW7CgEAAAAA4pEDHwG%2Fkz7l4nslFY4knUzHVW0%3DdGPw9KsgX4mwV0ht9kzYz7mO0ly8aHRD1DiIOQyRKhqvRFBgD5"
+GUEST_TOKEN_URL = "https://api.twitter.com/1.1/guest/activate.json"
+GRAPHQL_URL = "https://twitter.com/i/api/graphql/HYvLL37gkgw1TgJXAL6Wlw/UserByScreenName"
 
 def get_guest_token():
-    r = requests.post(
-        "https://api.twitter.com/1.1/guest/activate.json",
-        headers={"authorization": AUTHORIZATION},
-        timeout=10
-    )
+    headers = {
+        "Authorization": AUTHORIZATION,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    r = requests.post(GUEST_TOKEN_URL, headers=headers)
     if r.status_code == 200:
-        return r.json()["guest_token"]
-    else:
-        print("[ERROR] Failed to get guest token:", r.status_code)
-        return None
+        return r.json().get("guest_token")
+    print("[ERROR] Failed to get guest token:", r.status_code)
+    return None
 
-def get_followers_from_graphql(username):
+def get_followers_count(username):
     guest_token = get_guest_token()
     if not guest_token:
         return None
 
     headers = {
-        "authorization": AUTHORIZATION,
-        "x-guest-token": guest_token,
-        "user-agent": "Mozilla/5.0"
+        "Authorization": AUTHORIZATION,
+        "X-Guest-Token": guest_token,
+        "User-Agent": "Mozilla/5.0",
     }
-    url = "https://twitter.com/i/api/graphql/HYvLL37gkgw1TgJXAL6Wlw/UserByScreenName"
     params = {
-        "variables": f'{{"screen_name":"{username}","withSafetyModeUserFields":true,"withSuperFollowsUserFields":true}}'
+        "variables": f'{{"screen_name":"{username}","withSafetyModeUserFields":true}}'
     }
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        if r.status_code == 200:
+    r = requests.get(GRAPHQL_URL, headers=headers, params=params)
+    if r.status_code == 200:
+        try:
             data = r.json()
-            return data["data"]["user"]["result"]["legacy"]["followers_count"]
-        else:
-            print("[ERROR] Twitter response:", r.status_code, r.text)
-    except Exception as e:
-        print("[ERROR]", e)
+            return data['data']['user']['result']['legacy']['followers_count']
+        except Exception as e:
+            print("[ERROR] Failed to parse followers:", e)
+    else:
+        print("[ERROR] Twitter response:", r.status_code)
     return None
 
 async def update_telegram_message(followers):
@@ -60,7 +61,7 @@ async def update_telegram_message(followers):
             text=text,
             parse_mode='Markdown'
         )
-        print("[Telegram] Message updated")
+        print("[Telegram] Message updated.")
     except Exception as e:
         print("[Telegram ERROR]", e)
 
@@ -68,10 +69,9 @@ async def main():
     print("Script started")
     print("TWITTER_USERNAME:", TWITTER_USERNAME)
 
-    followers = get_followers_from_graphql(TWITTER_USERNAME)
+    followers = get_followers_count(TWITTER_USERNAME)
     if not followers:
         followers = "N/A"
-
     print("Followers parsed:", followers)
     await update_telegram_message(followers)
 
