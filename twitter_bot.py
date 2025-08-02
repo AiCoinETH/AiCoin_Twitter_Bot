@@ -690,11 +690,10 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_with_download(
-        approval_bot,
-        TELEGRAM_APPROVAL_CHAT_ID,
-        post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+    # Только приветствие! (без автосоздания поста/картинки)
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
