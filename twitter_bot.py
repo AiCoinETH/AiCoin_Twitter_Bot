@@ -469,7 +469,10 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 # --- Обработка кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
-    await update.callback_query.answer()
+    try:
+        await update.callback_query.answer()
+    except Exception as e:
+        logging.warning(f"Не удалось ответить на callback_query: {e}")
     if pending_post["active"]:
         reset_timer(TIMER_PUBLISH_EXTEND)
     user_id = update.effective_user.id
