@@ -373,7 +373,8 @@ async def send_post_for_approval():
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["image_url"],
-                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS
+                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+                reply_markup=main_keyboard()
             )
             logging.info("Пост отправлен на согласование.")
         except Exception as e:
@@ -672,7 +673,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["post_id"] += 1
         post_data["is_manual"] = False
         logging.info("button_handler: new_post, автогенерация нового поста")
-        await send_post_for_approval()
+        await send_photo_with_download(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            post_data["image_url"],
+            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            reply_markup=main_keyboard()
+        )
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         return
 
     if action == "new_post_manual":
@@ -682,7 +694,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["post_id"] += 1
         post_data["is_manual"] = True
         logging.info("button_handler: new_post_manual, ручная генерация нового поста")
-        await send_post_for_approval()
+        await send_photo_with_download(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            post_data["image_url"],
+            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            reply_markup=main_keyboard()
+        )
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         return
 
 async def delayed_start(app: Application):
@@ -690,10 +713,12 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    # Только приветствие! (без автосоздания поста/картинки)
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+    # Приветствие: сразу картинка + текст + кнопки
+    await send_photo_with_download(
+        approval_bot,
+        TELEGRAM_APPROVAL_CHAT_ID,
+        post_data["image_url"],
+        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
     logging.info("Бот запущен и готов к работе.")
