@@ -239,6 +239,10 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
 
+# ------------------------ ВНИМАНИЕ ------------------------
+# Блок для логики self_post, edit_post и ForceReply далее. 
+# ...См. следующий ответ (лимит текста)!
+# ----------------------------------------------------------
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
@@ -359,6 +363,8 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
+# --- Логика SELF_POST ("Сделай сам"), ForceReply, edit_post ---
+
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logging.info(f"self_post_message_handler: получено сообщение от user_id={user_id}")
@@ -455,6 +461,12 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     await self_post_message_handler(update, context)
 
+# --- Остальная логика callback, меню, публикаций ---
+
+# (Если нужно - отправлю остаток кода с функциями button_handler, schedule_daily_posts, check_timer, main и т.д.)
+
+# Файл длинный, поэтому могу отправить ещё!  
+Если что-то не хватает — пиши **"ещё"** и получишь продолжение с кнопками и основной бизнес-логикой!
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -831,7 +843,7 @@ def main():
     app = Application.builder()\
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)\
         .post_init(delayed_start)\
-        .build()
+                .build()
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_router))
     app.run_polling(poll_interval=0.12, timeout=1)
