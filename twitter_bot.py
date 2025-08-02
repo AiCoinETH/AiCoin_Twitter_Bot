@@ -78,11 +78,12 @@ do_not_disturb = {"active": False}
 last_action_time = {}
 
 # --- Главное меню ---
-def main_keyboard():
+def main_keyboard(timer: int = None):
+    think_label = "🕒 Подумать" if timer is None else f"🕒 Думаем... {timer} сек"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
+        [InlineKeyboardButton(think_label, callback_data="think")],
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
@@ -158,7 +159,6 @@ async def is_duplicate_post(text, image_url, db_file=DB_FILE):
     img_hash = None
     try:
         if image_url and str(image_url).startswith("http"):
-            # скачиваем для хеша
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
             tmp.write(r.content)
@@ -166,7 +166,6 @@ async def is_duplicate_post(text, image_url, db_file=DB_FILE):
             img_hash = hash_image(tmp.name)
             os.remove(tmp.name)
         elif image_url:
-            # file_id Telegram
             img_hash = image_url
     except Exception:
         img_hash = None
@@ -204,10 +203,11 @@ async def save_post_to_db(text, image_url, db_file=DB_FILE):
         await db.execute(f"DELETE FROM posts WHERE id NOT IN (SELECT id FROM posts ORDER BY id DESC LIMIT {MAX_HISTORY_POSTS})")
         await db.commit()
 
-# --- Асинхронное скачивание Telegram file_id и обычного URL ---
-async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
+# --- Скачивание картинки ---
+def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
-        file = await bot.get_file(url_or_file_id)
+        loop = asyncio.get_event_loop()
+        file = loop.run_until_complete(bot.get_file(url_or_file_id))
         file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
         r = requests.get(file_url)
         r.raise_for_status()
@@ -232,13 +232,12 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
     file_path = None
     try:
         is_telegram = not (str(url_or_file_id).startswith("http"))
-        file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
+        file_path = download_image(url_or_file_id, is_telegram, bot if is_telegram else None)
         msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption)
         return msg
     except ValueError as ve:
         await bot.send_message(chat_id=chat_id, text=str(ve), disable_web_page_preview=True)
         logging.error(str(ve))
-        # fallback: отправить только текст, если был caption
         if caption:
             await bot.send_message(chat_id=chat_id, text=caption, disable_web_page_preview=True)
     except Exception as e:
@@ -250,7 +249,10 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
 
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     try:
-        await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        if image_url:
+            await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
         logging.info("Пост успешно опубликован в Telegram!")
         return True
     except Exception as e:
@@ -270,12 +272,7 @@ def publish_post_to_twitter(text, image_url=None):
         media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
-            # Важно! Только download_image - синхронный (Twitter API не асинхронный)
-            loop = asyncio.get_event_loop()
-            if is_telegram:
-                file_path = loop.run_until_complete(download_image_async(image_url, is_telegram, approval_bot))
-            else:
-                file_path = loop.run_until_complete(download_image_async(image_url, is_telegram))
+            file_path = download_image(image_url, is_telegram, approval_bot if is_telegram else None)
             try:
                 media = twitter_api_v1.media_upload(file_path)
                 media_ids = [media.media_id_string]
@@ -296,7 +293,7 @@ def publish_post_to_twitter(text, image_url=None):
         return False
 
 def shutdown_bot_and_exit():
-    logging.info("Завершение работы бота через shutdown_bot_and_exit()")
+    logging.info("Завершение работы бота через shutdown_bot_and_exit() и exit")
     try:
         asyncio.create_task(
             approval_bot.send_message(
@@ -326,7 +323,7 @@ async def init_db():
         await db.commit()
     logging.info("База данных инициализирована.")
 
-# --- Обработчик сообщений "Сделай сам" ---
+# --- Self-пост ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_self_post or user_self_post[user_id].get('state') != 'wait_post':
@@ -413,7 +410,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = info.get("text", "")
             image = info.get("image", None)
             post_data["text_ru"] = text
-            post_data["image_url"] = image if image else random.choice(test_images)
+            post_data["image_url"] = image if image else None  # только если приложено!
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
@@ -465,7 +462,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
 
-        # Проверка на дубликат!
         if await is_duplicate_post(base_text, post_data["image_url"]):
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -503,7 +499,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending_post["active"] = False
 
-        # Запись в БД — если успех в одной из соцсетей
         if telegram_success or twitter_success:
             await save_post_to_db(base_text, post_data["image_url"])
 
@@ -590,7 +585,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "think":
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🧐 Думаем дальше…", reply_markup=main_keyboard(), disable_web_page_preview=True)
+        if pending_post.get("active") and pending_post.get("timer"):
+            seconds_left = pending_post["timeout"] - int((datetime.now() - pending_post["timer"]).total_seconds())
+            seconds_left = max(seconds_left, 0)
+        else:
+            seconds_left = TIMER_PUBLISH_DEFAULT
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🧐 Думаем дальше… До автопубликации {seconds_left} сек", reply_markup=main_keyboard(timer=seconds_left), disable_web_page_preview=True)
         return
 
     if action == "chat":
