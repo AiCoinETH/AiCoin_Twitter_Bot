@@ -488,7 +488,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             logging.error(f"Ошибка отправки предпросмотра 'Сделай сам': {e}")
         return
 
-# --- Новая функция для обработки редактирования поста ---
+# --- Обработка редактирования поста ---
 async def handle_edit_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     info = user_self_post.get(user_id)
@@ -496,17 +496,14 @@ async def handle_edit_post_message(update: Update, context: ContextTypes.DEFAULT
         return
 
     new_text = update.message.text or update.message.caption or info['text']
-    new_image_url = info['image_url']
+    new_image_url = info.get('image_url', None)
 
     if update.message.photo:
-        # загрузить новую фотографию на GitHub
         new_image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
 
-    # обновляем данные
     user_self_post[user_id]['text'] = new_text
     user_self_post[user_id]['image_url'] = new_image_url
 
-    # Отправляем предпросмотр и кнопки для подтверждения
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💾 Сохранить", callback_data="save_edit_post")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
@@ -575,12 +572,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'text': post_data["text_ru"],
             'image_url': post_data["image_url"]
         }
+        # Отправляем запрос на редактирование с ForceReply + кнопка отмены (через отдельное сообщение)
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✏️ Отправьте новый текст и/или новую фотографию для редактирования поста (можно и то, и другое). Для отмены нажмите ❌ Отмена.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]]),
-            reply_to_message_id=update.callback_query.message.message_id,
             reply_markup=ForceReply(selective=True)
+        )
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Если хотите отменить, нажмите ❌ Отмена.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
         )
         return
 
@@ -590,7 +591,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["text_ru"] = info['text']
             post_data["image_url"] = info['image_url']
 
-            # Редактируем исходное сообщение бота в чате
             try:
                 await approval_bot.edit_message_media(
                     chat_id=info['chat_id'],
@@ -599,7 +599,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logging.error(f"Ошибка редактирования сообщения бота: {e}")
-                # Если ошибка, пытаемся отредактировать текст и картинку по отдельности
                 try:
                     await approval_bot.edit_message_caption(
                         chat_id=info['chat_id'],
@@ -698,7 +697,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
         logging.info(f"button_handler: self_post, user_id={user_id} перешел в режим ввода текста/фото")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.",
+            reply_markup=ForceReply(selective=True)
+        )
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Если хотите отменить, нажмите ❌ Отмена.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+        )
         return
 
     if action == "cancel_to_main":
