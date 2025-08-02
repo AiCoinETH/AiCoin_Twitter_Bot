@@ -456,9 +456,9 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     logging.info(f"self_post_message_handler: получено сообщение от user_id={user_id}")
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
-        text = update.message.text or ""
+        # КОРРЕКТНО! Caption, текст и фото поддерживаются
+        text = update.message.text or update.message.caption or ""
         image_url = None
-        # КОРРЕКТНАЯ ЛОГИКА: если и текст, и фото — предпросмотр всегда текст+фото
         if update.message.photo:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
         logging.info(f"self_post_message_handler: сохранение text='{text}', image_url={image_url}")
@@ -468,12 +468,12 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
         try:
             if image_url:
-                # Всегда отправлять фото с подписью (caption) = текст (если есть)
+                # caption — всегда строка, даже если пустая, Telegram нормально кушает ""
                 await send_photo_with_download(
                     approval_bot,
                     TELEGRAM_APPROVAL_CHAT_ID,
                     image_url,
-                    caption=text if text else None
+                    caption=text
                 )
             elif text:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
