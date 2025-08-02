@@ -410,7 +410,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            # Предпросмотр для модератора: всегда текст + фото если есть!
+            # Предпросмотр для модератора: всегда фото + текст (caption) если фото есть!
             if image:
                 await approval_bot.send_photo(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
