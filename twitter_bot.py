@@ -410,7 +410,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            # Предпросмотр для модератора
+            # Предпросмотр для модератора: всегда текст + фото если есть!
             if image:
                 await approval_bot.send_photo(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -462,7 +462,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            # Итоговый предпросмотр с кнопками площадок!
+            # Итоговый предпросмотр с кнопками площадок (всегда текст+фото)!
             if image:
                 await approval_bot.send_photo(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
