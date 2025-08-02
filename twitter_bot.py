@@ -356,7 +356,6 @@ def generate_random_schedule(
     schedule.sort()
     return schedule
 
-# --- Добавляем функцию schedule_daily_posts ---
 async def schedule_daily_posts():
     global manual_posts_today
     while True:
