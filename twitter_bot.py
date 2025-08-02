@@ -20,7 +20,6 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(funcName)s %(message)s'
 )
 
-# --- Переменные окружения ---
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -86,7 +85,6 @@ last_action_time = {}
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
-# --- Клавиатуры ---
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -117,7 +115,6 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-# --- Twitter ---
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -230,8 +227,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
-
-async def publish_post_to_telegram(bot, chat_id, text, image_url):
+        async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
     try:
