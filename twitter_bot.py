@@ -426,6 +426,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
+            # Здесь тоже посылаем фото и текст в одном сообщении
             if image and text:
                 await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text)
             elif image and not text:
