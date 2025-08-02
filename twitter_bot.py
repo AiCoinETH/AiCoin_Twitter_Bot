@@ -93,6 +93,7 @@ def main_keyboard():
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
+        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_post")], # <--- новая кнопка!
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
@@ -468,7 +469,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
         try:
             if image_url:
-                # caption — всегда строка, даже если пустая, Telegram нормально кушает ""
                 await send_photo_with_download(
                     approval_bot,
                     TELEGRAM_APPROVAL_CHAT_ID,
@@ -507,6 +507,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     logging.info(f"button_handler: user_id={user_id}, action={action}")
     prev_data.update(post_data)
+
+    # --- ВСТАВКА ДЛЯ КНОПКИ "ИЗМЕНИТЬ" ---
+    if action == "edit_post":
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+        user_self_post[user_id] = {
+            'text': post_data.get("text_ru", ""),
+            'image': post_data.get("image_url", None),
+            'state': 'wait_post'
+        }
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✏️ Отправь новый текст и (опционально) фото для изменения текущего поста.",
+            reply_markup=None
+        )
+        return
 
     if action == "finish_self_post":
         info = user_self_post.get(user_id)
