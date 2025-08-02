@@ -437,11 +437,9 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            if image and text:
-                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text)
-            elif image and not text:
-                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image)
-            elif text and not image:
+            if image:
+                await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image, caption=text if text else None)
+            else:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -483,12 +481,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            if image and text:
-                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text, reply_markup=post_choice_keyboard())
-            elif image and not text:
-                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, reply_markup=post_choice_keyboard())
-            elif text and not image:
-                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
+            try:
+                if image:
+                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image, caption=text, reply_markup=post_choice_keyboard())
+                else:
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
+            except Exception as e:
+                logging.error(f"Ошибка отправки предпросмотра после завершения 'Сделай сам': {e}")
         return
 
     if action == "shutdown_bot":
