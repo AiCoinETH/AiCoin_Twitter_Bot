@@ -548,6 +548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if info and info["state"] == "wait_confirm":
             text = info.get("text", "")
             image_url = info.get("image", None)
+            twitter_text = build_twitter_post(text)
             post_data["text_ru"] = text
             if image_url:
                 post_data["image_url"] = image_url
@@ -558,13 +559,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_self_post.pop(user_id, None)
             try:
                 if image_url:
-                    logging.info(f"button_handler: отправка предпросмотра после finish_self_post image_url={image_url}, caption='{text}'")
-                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=text, reply_markup=post_choice_keyboard())
+                    logging.info(f"button_handler: предпросмотр finish_self_post image_url={image_url}, caption='{twitter_text}'")
+                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=twitter_text, reply_markup=post_choice_keyboard())
                 else:
-                    logging.info(f"button_handler: отправка предпросмотра после finish_self_post text='{text}'")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
+                    logging.info(f"button_handler: предпросмотр finish_self_post text='{twitter_text}'")
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=twitter_text, reply_markup=post_choice_keyboard())
             except Exception as e:
-                logging.error(f"Ошибка отправки предпросмотра после завершения 'Сделай сам': {e}")
+                logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
         return
 
     if action == "shutdown_bot":
