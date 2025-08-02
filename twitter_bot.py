@@ -73,7 +73,7 @@ pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT
 do_not_disturb = {"active": False}
 last_action_time = {}
 
-# --- Клавиатуры ---
+# --- Главное меню ---
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -101,12 +101,6 @@ def post_end_keyboard():
         [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
-    ])
-
-def self_post_confirm_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
 
 # --- Twitter ---
@@ -327,11 +321,6 @@ async def send_post_for_approval():
                 post_data["image_url"],
                 caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS
             )
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Выберите действие:",
-                reply_markup=main_keyboard()
-            )
             logging.info("Пост отправлен на согласование.")
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
@@ -408,19 +397,18 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         text = update.message.text or ""
         image = None
         if update.message.photo:
-            image = update.message.photo[-1].file_id  # Берём максимальный размер
+            image = update.message.photo[-1].file_id  # Максимальный размер фото
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
 
-        # Отправляем предпросмотр и кнопки для подтверждения
         try:
             if image:
                 await send_photo_with_download(
                     approval_bot,
                     TELEGRAM_APPROVAL_CHAT_ID,
                     image,
-                    caption=text
+                    caption=text,
                 )
             else:
                 await approval_bot.send_message(
@@ -430,7 +418,10 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
-                reply_markup=self_post_confirm_keyboard()
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                ])
             )
         except Exception as e:
             logging.error(f"Ошибка отправки предпросмотра 'Сделай сам': {e}")
