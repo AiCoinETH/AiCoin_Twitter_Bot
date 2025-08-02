@@ -9,4 +9,5 @@ PyGithub
 aiosqlite
 python-dotenv
 pytz
+pillow
 playwright>=1.44.0  # 👈 для поддержки async playwright
