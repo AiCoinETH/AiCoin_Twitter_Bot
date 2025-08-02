@@ -125,24 +125,18 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
     signature = (
-        "Learn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
+        "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
     )
     max_length = 280
-    # +1 — перенос строки, если надо, но здесь без перевода, всё одной строкой
-    reserve = max_length - len(signature) - 1
+    reserve = max_length - len(signature)
     if len(text_ru) > reserve:
         main_part = text_ru[:reserve - 3].rstrip() + "..."
     else:
         main_part = text_ru
-    return f"{main_part} {signature}"
-
-def build_telegram_post(text_ru: str) -> str:
-    # Подпись на английском для Telegram
-    return f"{text_ru}\n\nLearn more: https://getaicoin.com/"
+    return main_part + signature
 
 # --- Скачивание картинки ---
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
-    # Исправленная асинхронная версия скачивания, чтобы не было ошибок await
     if is_telegram_file:
         file = await bot.get_file(url_or_file_id)
         file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
@@ -161,12 +155,12 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None)
         tmp.close()
         return tmp.name
 
-async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     file_path = None
     try:
         is_telegram = not (str(url_or_file_id).startswith("http"))
         file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
-        msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption)
+        msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption, reply_markup=reply_markup)
         return msg
     finally:
         if file_path and os.path.exists(file_path):
@@ -192,7 +186,6 @@ def publish_post_to_twitter(text, image_url=None):
             is_telegram = not (str(image_url).startswith("http"))
             file_path = None
             if is_telegram:
-                # Обработка фото из Telegram здесь при необходимости
                 pass
             else:
                 headers = {'User-Agent': 'Mozilla/5.0'}
@@ -280,7 +273,7 @@ async def check_timer():
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
                     base_text = post_data["text_ru"].strip()
-                    telegram_text = build_telegram_post(base_text)
+                    telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
                     twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -417,12 +410,12 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
+            # Предпросмотр для модератора
             if image:
-                await send_photo_with_download(
-                    approval_bot,
-                    TELEGRAM_APPROVAL_CHAT_ID,
-                    image,
-                    caption=text,
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=image,
+                    caption=text
                 )
             else:
                 await approval_bot.send_message(
@@ -469,17 +462,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=post_data["text_ru"]
-            )
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=post_data["text_ru"],
-                reply_markup=post_choice_keyboard()
-            )
+            # Итоговый предпросмотр с кнопками площадок!
+            if image:
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=image,
+                    caption=post_data["text_ru"],
+                    reply_markup=post_choice_keyboard()
+                )
+            else:
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=post_data["text_ru"],
+                    reply_markup=post_choice_keyboard()
+                )
         return
 
     if action == "shutdown_bot":
@@ -509,7 +505,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
         base_text = post_data["text_ru"].strip()
-        telegram_text = build_telegram_post(base_text)
+        telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
         twitter_text = build_twitter_post(base_text)
 
         telegram_success = False
@@ -665,3 +661,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Подробнее и новые возможности автопостинга — на https://gptonline.ai/
