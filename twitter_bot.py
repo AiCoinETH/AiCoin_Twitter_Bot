@@ -391,67 +391,6 @@ async def send_post_for_approval():
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
-def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23, min_offset=-20, max_offset=20):
-    if day_end_hour > 23:
-        day_end_hour = 23
-    now = datetime.now()
-    today = now.date()
-    start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
-    if now > start:
-        start = now + timedelta(seconds=1)
-    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
-    total_seconds = int((end - start).total_seconds())
-    if posts_per_day < 1:
-        return []
-    base_step = total_seconds // posts_per_day
-    schedule = []
-    for i in range(posts_per_day):
-        base_sec = i * base_step
-        offset_sec = random.randint(min_offset * 60, max_offset * 60) + random.randint(-59, 59)
-        post_time = start + timedelta(seconds=base_sec + offset_sec)
-        if post_time < start:
-            post_time = start
-        if post_time > end:
-            post_time = end
-        schedule.append(post_time)
-    schedule.sort()
-    logging.info(f"generate_random_schedule: {[(t.strftime('%H:%M:%S')) for t in schedule]}")
-    return schedule
-
-async def schedule_daily_posts():
-    global manual_posts_today
-    while True:
-        manual_posts_today = 0
-        now = datetime.now()
-        if now.hour < 6:
-            to_sleep = (datetime.combine(now.date(), dt_time(hour=6)) - now).total_seconds()
-            logging.info(f"Жду до 06:00... {int(to_sleep)} сек")
-            await asyncio.sleep(to_sleep)
-
-        posts_left = lambda: scheduled_posts_per_day - manual_posts_today
-        while posts_left() > 0:
-            schedule = generate_random_schedule(posts_per_day=posts_left())
-            logging.info(f"Расписание авто-постов на сегодня: {[t.strftime('%H:%M:%S') for t in schedule]}")
-            for post_time in schedule:
-                if posts_left() <= 0:
-                    break
-                now = datetime.now()
-                delay = (post_time - now).total_seconds()
-                if delay > 0:
-                    logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
-                    await asyncio.sleep(delay)
-                post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
-                post_data["image_url"] = random.choice(test_images)
-                post_data["post_id"] += 1
-                post_data["is_manual"] = False
-                await send_post_for_approval()
-                while pending_post["active"]:
-                    await asyncio.sleep(1)
-        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=0))
-        to_next_day = (tomorrow - datetime.now()).total_seconds()
-        await asyncio.sleep(to_next_day)
-        manual_posts_today = 0
-
 # --- Логика "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -561,16 +500,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prev_data.update(post_data)
 
     if action == "edit_post":
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
+        # НЕ удаляем сообщение, чтобы можно было редактировать
+        # Сохраняем текущее изображение на GitHub, если надо
+        image_url = post_data["image_url"]
+        if not image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
+            try:
+                if not image_url.startswith("http"):
+                    image_path = await download_image_async(image_url, is_telegram_file=True, bot=approval_bot)
+                else:
+                    image_path = await download_image_async(image_url, is_telegram_file=False)
+                new_url, _ = await save_image_and_get_github_url(image_path)
+                os.remove(image_path)
+                if new_url:
+                    image_url = new_url
+                else:
+                    logging.warning("Не удалось загрузить изображение на GitHub при редактировании поста")
+            except Exception as e:
+                logging.error(f"Ошибка при загрузке изображения на GitHub для редактирования: {e}")
+
         user_self_post[user_id] = {
             'state': 'wait_edit',
             'message_id': update.callback_query.message.message_id,
             'chat_id': update.callback_query.message.chat_id,
             'text': post_data["text_ru"],
-            'image_url': post_data["image_url"]
+            'image_url': image_url
         }
         # Отправляем запрос на редактирование с ForceReply + кнопка отмены (через отдельное сообщение)
         await approval_bot.send_message(
