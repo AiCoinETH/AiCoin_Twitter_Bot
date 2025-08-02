@@ -197,9 +197,13 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     github_url = None
     github_filename = None
     try:
-        is_telegram = not (str(url_or_file_id).startswith("http"))
-        file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
-        github_url, github_filename = await save_image_and_get_github_url(file_path)
+        if not str(url_or_file_id).startswith("http"):
+            # Если file_id, скачиваем и загружаем на GitHub
+            file_path = await download_image_async(url_or_file_id, True, bot)
+            github_url, github_filename = await save_image_and_get_github_url(file_path)
+            url_or_file_id = github_url
+            os.remove(file_path)
+        file_path = await download_image_async(url_or_file_id, False)
         with open(file_path, "rb") as photo_file:
             msg = await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, reply_markup=reply_markup)
         return msg, github_filename
@@ -339,6 +343,13 @@ async def send_post_for_approval():
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         try:
+            # Если image_url - это file_id, конвертируем в URL
+            if not str(post_data["image_url"]).startswith("http"):
+                file_path = await download_image_async(post_data["image_url"], True, approval_bot)
+                url, filename = await save_image_and_get_github_url(file_path)
+                if url:
+                    post_data["image_url"] = url
+                os.remove(file_path)
             await send_photo_with_download(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
