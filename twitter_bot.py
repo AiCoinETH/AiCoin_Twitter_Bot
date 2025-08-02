@@ -167,7 +167,7 @@ def delete_image_from_github(filename):
     except Exception as e:
         logging.error(f"Ошибка удаления файла с GitHub: {e}")
 
-# --- Скачивание картинки с повторными попытками для Telegram file_id ---
+# --- Скачивание картинки ---
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
         for attempt in range(retries):
@@ -197,17 +197,27 @@ async def save_image_and_get_github_url(image_path):
     url = upload_image_to_github(image_path, filename)
     return url, filename
 
+# --- Новый хелпер: обработка фото из Telegram ---
+async def process_telegram_photo(file_id: str, bot: Bot) -> str:
+    """
+    Скачивает фото по Telegram file_id, загружает на GitHub,
+    возвращает ссылку на файл на GitHub.
+    """
+    file_path = await download_image_async(file_id, is_telegram_file=True, bot=bot)
+    url, filename = await save_image_and_get_github_url(file_path)
+    os.remove(file_path)
+    if not url:
+        raise Exception("Не удалось загрузить фото на GitHub")
+    return url
+
 # --- Отправка фото с загрузкой ---
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     github_filename = None
     try:
         if not str(url_or_file_id).startswith("http"):
             # file_id — скачиваем, загружаем на GitHub, получаем URL
-            file_path = await download_image_async(url_or_file_id, True, bot)
-            url, github_filename = await save_image_and_get_github_url(file_path)
-            os.remove(file_path)
-            if not url:
-                raise Exception("Не удалось получить URL после загрузки на GitHub")
+            url = await process_telegram_photo(url_or_file_id, bot)
+            github_filename = url.split('/')[-1]
             # Отправляем фото по URL
             msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
             return msg, github_filename
@@ -353,11 +363,8 @@ async def send_post_for_approval():
         try:
             # Конвертация file_id в URL если нужно
             if not str(post_data["image_url"]).startswith("http"):
-                file_path = await download_image_async(post_data["image_url"], True, approval_bot)
-                url, filename = await save_image_and_get_github_url(file_path)
-                if url:
-                    post_data["image_url"] = url
-                os.remove(file_path)
+                url = await process_telegram_photo(post_data["image_url"], approval_bot)
+                post_data["image_url"] = url
             await send_photo_with_download(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
@@ -435,16 +442,16 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
         text = update.message.text or ""
-        image = None
+        image_url = None
         if update.message.photo:
-            image = update.message.photo[-1].file_id
+            image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
         user_self_post[user_id]['text'] = text
-        user_self_post[user_id]['image'] = image
+        user_self_post[user_id]['image'] = image_url
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            if image:
-                await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image, caption=text if text else None)
+            if image_url:
+                await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=text if text else None)
             else:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
             await approval_bot.send_message(
@@ -478,18 +485,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = user_self_post.get(user_id)
         if info and info["state"] == "wait_confirm":
             text = info.get("text", "")
-            image = info.get("image", None)
+            image_url = info.get("image", None)
             post_data["text_ru"] = text
-            if image:
-                post_data["image_url"] = image
+            if image_url:
+                post_data["image_url"] = image_url
             else:
                 post_data["image_url"] = random.choice(test_images)
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
             try:
-                if image:
-                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image, caption=text, reply_markup=post_choice_keyboard())
+                if image_url:
+                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=text, reply_markup=post_choice_keyboard())
                 else:
                     await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
             except Exception as e:
