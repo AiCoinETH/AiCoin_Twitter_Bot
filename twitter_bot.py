@@ -7,6 +7,7 @@ import logging
 import random
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timedelta, time as dt_time
 
 import tweepy
@@ -14,6 +15,7 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
+from github import Github
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -28,11 +30,18 @@ TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
 TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
 
+GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
+GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
+GITHUB_IMAGE_PATH = "images_for_posts"  # Папка в репозитории для хранения картинок
+
 if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
     logging.error("Не заданы обязательные переменные окружения Telegram!")
     sys.exit(1)
 if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET]):
     logging.error("Не заданы обязательные переменные окружения для Twitter!")
+    sys.exit(1)
+if not all([GITHUB_TOKEN, GITHUB_REPO]):
+    logging.error("Не заданы обязательные переменные окружения GitHub!")
     sys.exit(1)
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
@@ -72,6 +81,9 @@ user_self_post = {}
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
 last_action_time = {}
+
+github_client = Github(GITHUB_TOKEN)
+github_repo = github_client.get_repo(GITHUB_REPO)
 
 # --- Главное меню ---
 def main_keyboard():
@@ -135,6 +147,28 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
+# --- GitHub upload/delete functions ---
+def upload_image_to_github(image_path, filename):
+    with open(image_path, "rb") as img_file:
+        content = img_file.read()
+    try:
+        github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
+        url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/{filename}"
+        logging.info(f"Загружено на GitHub: {url}")
+        return url
+    except Exception as e:
+        logging.error(f"Ошибка загрузки файла на GitHub: {e}")
+        return None
+
+def delete_image_from_github(filename):
+    try:
+        file_path = f"{GITHUB_IMAGE_PATH}/{filename}"
+        contents = github_repo.get_contents(file_path, ref="main")
+        github_repo.delete_file(contents.path, "delete image after posting", contents.sha, branch="main")
+        logging.info(f"Удалён файл с GitHub: {filename}")
+    except Exception as e:
+        logging.error(f"Ошибка удаления файла с GitHub: {e}")
+
 # --- Скачивание картинки ---
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
@@ -155,38 +189,54 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None)
         tmp.close()
         return tmp.name
 
+# --- Загрузка на GitHub и получение ссылки ---
+async def save_image_and_get_github_url(image_path):
+    filename = f"{uuid.uuid4().hex}.jpg"
+    url = upload_image_to_github(image_path, filename)
+    return url, filename
+
+# --- Отправка фото с предварительной загрузкой на GitHub ---
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     file_path = None
+    github_url = None
+    github_filename = None
     try:
         is_telegram = not (str(url_or_file_id).startswith("http"))
         file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
+        github_url, github_filename = await save_image_and_get_github_url(file_path)
         msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption, reply_markup=reply_markup)
-        return msg
+        return msg, github_filename
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
+# --- Публикация в Telegram с удалением из GitHub ---
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
+    github_filename = None
     try:
-        await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
         logging.info("Пост успешно опубликован в Telegram!")
+        if github_filename:
+            delete_image_from_github(github_filename)
         return True
     except Exception as e:
         logging.error(f"Ошибка при публикации в Telegram: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Telegram: {e}"
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Telegram: {e}")
+        if github_filename:
+            delete_image_from_github(github_filename)
         return False
 
+# --- Публикация в Twitter с удалением из GitHub ---
 def publish_post_to_twitter(text, image_url=None):
+    github_filename = None
     try:
         media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
             file_path = None
             if is_telegram:
-                pass
+                logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
+                return False
             else:
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 r = requests.get(image_url, headers=headers)
@@ -201,42 +251,29 @@ def publish_post_to_twitter(text, image_url=None):
                 os.remove(file_path)
         twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
         logging.info("Пост успешно опубликован в Twitter!")
+        if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
+            github_filename = image_url.split('/')[-1]
+            delete_image_from_github(github_filename)
         return True
     except Exception as e:
         pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
-        asyncio.create_task(approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."
-        ))
+        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."))
+        if github_filename:
+            delete_image_from_github(github_filename)
         return False
 
-def shutdown_bot_and_exit():
-    logging.info("Завершение работы бота через shutdown_bot_and_exit()")
-    try:
-        asyncio.create_task(
-            approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
-            )
-        )
-    except Exception:
-        pass
-    import time; time.sleep(2)
-    os._exit(0)
-
+# --- Инициализация базы данных ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 image_hash TEXT
             )
-            """
-        )
+        """)
         await db.commit()
     logging.info("База данных инициализирована.")
 
@@ -258,13 +295,11 @@ async def save_post_to_history(text, image_url=None):
             logging.warning(f"Не удалось получить хеш изображения: {e}")
             image_hash = None
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
-            (text, datetime.now().isoformat(), image_hash)
-        )
+        await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
+# --- Таймер ожидания публикации ---
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -275,34 +310,17 @@ async def check_timer():
                     base_text = post_data["text_ru"].strip()
                     telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
                     twitter_text = build_twitter_post(base_text)
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="⌛ Время ожидания истекло. Публикую автоматически."
-                    )
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
                     await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="✅ Посты автоматически опубликованы в Telegram и Twitter."
-                    )
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="Выберите действие:",
-                        reply_markup=post_end_keyboard()
-                    )
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Посты автоматически опубликованы в Telegram и Twitter.")
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
                     shutdown_bot_and_exit()
                 except Exception as e:
                     pending_post["active"] = False
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text=f"❌ Ошибка при автопубликации: {e}\nПроверьте ключи, лимиты, права бота, лимиты Twitter/Telegram."
-                    )
-                    await approval_bot.send_message(
-                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text="Выберите действие:",
-                        reply_markup=post_end_keyboard()
-                    )
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при автопубликации: {e}\nПроверьте ключи, лимиты, права бота, лимиты Twitter/Telegram.")
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False
 
@@ -311,6 +329,7 @@ def reset_timer(timeout=None):
     if timeout:
         pending_post["timeout"] = timeout
 
+# --- Отправка поста на согласование ---
 async def send_post_for_approval():
     async with approval_lock:
         if do_not_disturb["active"] or pending_post["active"]:
@@ -332,14 +351,10 @@ async def send_post_for_approval():
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
-def generate_random_schedule(
-    posts_per_day=6,
-    day_start_hour=6,
-    day_end_hour=23,
-    min_offset=-20,
-    max_offset=20
-):
-    if day_end_hour > 23: day_end_hour = 23
+# --- Генерация расписания постов ---
+def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23, min_offset=-20, max_offset=20):
+    if day_end_hour > 23:
+        day_end_hour = 23
     now = datetime.now()
     today = now.date()
     start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
@@ -363,6 +378,7 @@ def generate_random_schedule(
     schedule.sort()
     return schedule
 
+# --- Автоматическое расписание постов ---
 async def schedule_daily_posts():
     global manual_posts_today
     while True:
@@ -404,29 +420,18 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         text = update.message.text or ""
         image = None
         if update.message.photo:
-            image = update.message.photo[-1].file_id  # Максимальный размер фото
+            image = update.message.photo[-1].file_id
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            # Предпросмотр для модератора: только то, что отправил пользователь
             if image and text:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=image,
-                    caption=text
-                )
+                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text)
             elif image and not text:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=image
-                )
+                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image)
             elif text and not image:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=text
-                )
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
@@ -467,51 +472,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            # Итоговый предпросмотр с кнопками площадок — только то, что ввёл пользователь
             if image and text:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=image,
-                    caption=text,
-                    reply_markup=post_choice_keyboard()
-                )
+                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text, reply_markup=post_choice_keyboard())
             elif image and not text:
-                await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    photo=image,
-                    reply_markup=post_choice_keyboard()
-                )
+                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, reply_markup=post_choice_keyboard())
             elif text and not image:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=text,
-                    reply_markup=post_choice_keyboard()
-                )
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
         return
 
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!")
         await asyncio.sleep(2)
         shutdown_bot_and_exit()
         return
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_ru"])
-        await send_photo_with_download(
-            approval_bot,
-            TELEGRAM_APPROVAL_CHAT_ID,
-            post_data["image_url"],
-            caption=twitter_text
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Выберите площадку:",
-            reply_markup=post_choice_keyboard()
-        )
+        await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
@@ -527,39 +506,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 telegram_success = await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Telegram: {e}")
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=f"❌ Не удалось отправить в Telegram: {e}",
-                    reply_markup=None
-                )
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Не удалось отправить в Telegram: {e}")
 
         if action in ["post_twitter", "post_both"]:
             try:
                 twitter_success = publish_post_to_twitter(twitter_text, post_data["image_url"])
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Twitter: {e}")
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=f"❌ Не удалось отправить в Twitter: {e}",
-                    reply_markup=None
-                )
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Не удалось отправить в Twitter: {e}")
 
         pending_post["active"] = False
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.",
-            reply_markup=None
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.",
-            reply_markup=None
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Работа завершена.",
-            reply_markup=post_end_keyboard()
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Twitter!" if twitter_success else "❌ Не удалось отправить в Twitter.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Работа завершена.", reply_markup=post_end_keyboard())
         shutdown_bot_and_exit()
         return
 
@@ -569,10 +528,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками."
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.")
         return
 
     if action == "cancel_to_main":
@@ -581,11 +537,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         user_self_post.pop(user_id, None)
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Главное меню:",
-            reply_markup=main_keyboard()
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=main_keyboard())
         return
 
     if action == "restore_previous":
@@ -608,21 +560,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "chat":
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="💬 Начинаем чат:\n" + post_data["text_ru"],
-            reply_markup=post_end_keyboard()
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="💬 Начинаем чат:\n" + post_data["text_ru"], reply_markup=post_end_keyboard())
         return
 
     if action == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"🌙 Режим «Не беспокоить» {status}.",
-            reply_markup=post_end_keyboard()
-        )
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=post_end_keyboard())
         return
 
     if action == "new_post":
@@ -643,22 +587,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post_for_approval()
         return
 
+# --- Запуск бота ---
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_with_download(
-        approval_bot,
-        TELEGRAM_APPROVAL_CHAT_ID,
-        post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS
-    )
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Выберите действие:",
-        reply_markup=main_keyboard()
-    )
+    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS)
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=main_keyboard())
     logging.info("Бот запущен и готов к работе.")
+
+def shutdown_bot_and_exit():
+    logging.info("Завершение работы бота через shutdown_bot_and_exit()")
+    try:
+        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"))
+    except Exception:
+        pass
+    import time; time.sleep(2)
+    os._exit(0)
 
 def main():
     logging.info("Старт Telegram бота модерации и публикации…")
