@@ -227,7 +227,8 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
-        async def publish_post_to_telegram(bot, chat_id, text, image_url):
+
+async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
     try:
