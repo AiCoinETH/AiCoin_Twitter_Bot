@@ -1,3 +1,5 @@
+# AI публикации и автоматизация — https://gptonline.ai/
+
 import os
 import asyncio
 import hashlib
@@ -12,6 +14,8 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
+from PIL import Image
+import io
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -50,10 +54,10 @@ TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 900
 
 test_images = [
-    "https://images.unsplash.com/photo-1506744038136-46273834b3fb",   # Природа
-    "https://images.unsplash.com/photo-1519125323398-675f0ddb6308",   # Горы
-    "https://images.unsplash.com/photo-1516979187457-637abb4f9353",   # Город
-    "https://images.unsplash.com/photo-1465101046530-73398c7f28ca"    # Озеро
+    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
+    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
 WELCOME_POST_RU = (
@@ -109,7 +113,12 @@ def post_end_keyboard():
 
 # --- Twitter ---
 def get_twitter_clients():
-    # Только v1.1
+    client_v2 = tweepy.Client(
+        consumer_key=TWITTER_API_KEY,
+        consumer_secret=TWITTER_API_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
+    )
     api_v1 = tweepy.API(
         tweepy.OAuth1UserHandler(
             TWITTER_API_KEY,
@@ -118,9 +127,9 @@ def get_twitter_clients():
             TWITTER_ACCESS_TOKEN_SECRET
         )
     )
-    return api_v1
+    return client_v2, api_v1
 
-twitter_api_v1 = get_twitter_clients()
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
     signature = (
@@ -198,22 +207,18 @@ async def save_post_to_db(text, image_url, db_file=DB_FILE):
         await db.execute(f"DELETE FROM posts WHERE id NOT IN (SELECT id FROM posts ORDER BY id DESC LIMIT {MAX_HISTORY_POSTS})")
         await db.commit()
 
-# --- Скачивание картинки ---
+# --- Скачивание картинки и ресайз для Telegram ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
-    if is_telegram_file:
-        # Здесь синхронная версия через requests, если нужно асинхронно — вынести логику выше!
-        # Для Telegram ID обычно не используется!
-        raise Exception("Telegram file download только в async режиме!")
-    else:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url_or_file_id, headers=headers)
-        r.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(r.content)
-        tmp.close()
-        if os.path.getsize(tmp.name) > TELEGRAM_PHOTO_LIMIT:
-            raise ValueError("❗️Файл слишком большой для Telegram (>10MB)!")
-        return tmp.name
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    r = requests.get(url_or_file_id, headers=headers)
+    r.raise_for_status()
+    img = Image.open(io.BytesIO(r.content))
+    img.thumbnail((1280, 1280))
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    img.save(tmp.name, "JPEG")
+    if os.path.getsize(tmp.name) > TELEGRAM_PHOTO_LIMIT:
+        raise ValueError("❗️Файл слишком большой для Telegram (>10MB)!")
+    return tmp.name
 
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
     file_path = None
@@ -224,9 +229,10 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
             file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
             r = requests.get(file_url)
             r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content))
+            img.thumbnail((1280, 1280))
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp.write(r.content)
-            tmp.close()
+            img.save(tmp.name, "JPEG")
             file_path = tmp.name
         else:
             file_path = download_image(url_or_file_id, False)
@@ -264,27 +270,50 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
 async def publish_message_with_no_preview(bot, chat_id, text):
     await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
 
+# --- ОБХОД X API: СНАЧАЛА ПРОБУЕМ POST С КАРТИНКОЙ, ЕСЛИ НЕ ПОЛУЧИЛОСЬ — ТОЛЬКО ТЕКСТ ---
 def publish_post_to_twitter(text, image_url=None):
     try:
+        media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
-            # download_image только синхронный!
             file_path = download_image(image_url, is_telegram, approval_bot if is_telegram else None)
             try:
-                twitter_api_v1.update_status_with_media(status=text, filename=file_path)
+                media = twitter_api_v1.media_upload(file_path)
+                media_ids = [media.media_id_string]
+                # Пытаемся обойти — твит с картинкой через v2
+                twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+                logging.info("Пост с картинкой успешно опубликован в Twitter (обход v1.1+v2).")
+                asyncio.create_task(approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="✅ В Twitter опубликован пост с картинкой (обход v1.1+v2).",
+                    disable_web_page_preview=True
+                ))
+                return True
+            except Exception as e:
+                logging.warning(f"Обход твита с картинкой не сработал: {e}")
+                asyncio.create_task(approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text=f"⚠️ Картинка в Twitter не опубликована (ошибка обхода: {e}). Публикуем только текст.",
+                    disable_web_page_preview=True
+                ))
             finally:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
-        else:
-            twitter_api_v1.update_status(status=text)
-        logging.info("Пост успешно опубликован в Twitter!")
+        # Фоллбэк: публикуем только текст
+        twitter_api_v1.update_status(status=text)
+        logging.info("В Twitter опубликован только текстовый пост.")
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="В Twitter опубликован только текст (без картинки).",
+            disable_web_page_preview=True
+        ))
         return True
     except Exception as e:
         pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
         asyncio.create_task(approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа.",
+            text=f"❌ Ошибка при публикации в Twitter: {e}",
             disable_web_page_preview=True
         ))
         return False
@@ -678,3 +707,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# AI и автоматизация на русском — https://gptonline.ai/
