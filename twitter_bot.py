@@ -167,13 +167,19 @@ def delete_image_from_github(filename):
     except Exception as e:
         logging.error(f"Ошибка удаления файла с GitHub: {e}")
 
-# --- Скачивание картинки ---
-async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
+# --- Скачивание картинки с повторными попытками для Telegram file_id ---
+async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
-        file = await bot.get_file(url_or_file_id)
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        await file.download_to_drive(tmp_file.name)
-        return tmp_file.name
+        for attempt in range(retries):
+            try:
+                file = await bot.get_file(url_or_file_id)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                await file.download_to_drive(tmp_file.name)
+                return tmp_file.name
+            except Exception as e:
+                logging.warning(f"Попытка {attempt + 1} загрузки Telegram файла не удалась: {e}")
+                await asyncio.sleep(1)
+        raise Exception("Не удалось скачать файл из Telegram после нескольких попыток")
     else:
         logging.info(f"Скачиваю изображение по URL: {url_or_file_id}")
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -627,4 +633,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
