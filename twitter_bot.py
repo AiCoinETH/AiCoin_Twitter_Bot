@@ -10,8 +10,21 @@ from datetime import datetime, timedelta, time as dt_time
 
 import tweepy
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    Bot,
+    ForceReply,
+    InputMediaPhoto
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters
+)
 import aiosqlite
 from github import Github
 
@@ -20,6 +33,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(funcName)s %(message)s'
 )
 
+# --- Переменные окружения ---
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -474,37 +488,60 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             logging.error(f"Ошибка отправки предпросмотра 'Сделай сам': {e}")
         return
 
-# --- Логика "Изменить пост" ---
-async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Новая функция для обработки редактирования поста ---
+async def handle_edit_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_edit':
-        text = update.message.text or update.message.caption or None
-        image_url = None
-        if update.message.photo:
-            image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
-        if text:
-            post_data["text_ru"] = text
-        if image_url:
-            post_data["image_url"] = image_url
-        user_self_post.pop(user_id, None)
-        try:
+    info = user_self_post.get(user_id)
+    if not info:
+        return
+
+    new_text = update.message.text or update.message.caption or info['text']
+    new_image_url = info['image_url']
+
+    if update.message.photo:
+        # загрузить новую фотографию на GitHub
+        new_image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+
+    # обновляем данные
+    user_self_post[user_id]['text'] = new_text
+    user_self_post[user_id]['image_url'] = new_image_url
+
+    # Отправляем предпросмотр и кнопки для подтверждения
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Сохранить", callback_data="save_edit_post")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
+        [InlineKeyboardButton("✏️ Изменить ещё", callback_data="edit_post")]
+    ])
+
+    try:
+        if new_image_url:
             await send_photo_with_download(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=post_data["text_ru"],
-                reply_markup=post_choice_keyboard()
+                new_image_url,
+                caption=new_text,
+                reply_markup=keyboard
             )
-        except Exception as e:
-            logging.error(f"Ошибка предпросмотра после изменения: {e}")
-        return
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=new_text,
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logging.error(f"Ошибка предпросмотра редактирования поста: {e}")
 
 # --- Routing сообщений ---
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in user_self_post and user_self_post[user_id].get('state') == 'wait_edit':
-        await edit_post_message_handler(update, context)
-        return
+    if user_id in user_self_post:
+        state = user_self_post[user_id].get('state')
+        if state == 'wait_edit':
+            await handle_edit_post_message(update, context)
+            return
+        if state == 'wait_post':
+            await self_post_message_handler(update, context)
+            return
     await self_post_message_handler(update, context)
 
 # --- Обработка кнопок ---
@@ -531,12 +568,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.delete()
         except Exception:
             pass
-        user_self_post[user_id] = {'state': 'wait_edit'}
+        user_self_post[user_id] = {
+            'state': 'wait_edit',
+            'message_id': update.callback_query.message.message_id,
+            'chat_id': update.callback_query.message.chat_id,
+            'text': post_data["text_ru"],
+            'image_url': post_data["image_url"]
+        }
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении).",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+            text="✏️ Отправьте новый текст и/или новую фотографию для редактирования поста (можно и то, и другое). Для отмены нажмите ❌ Отмена.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]]),
+            reply_to_message_id=update.callback_query.message.message_id,
+            reply_markup=ForceReply(selective=True)
         )
+        return
+
+    if action == "save_edit_post":
+        info = user_self_post.get(user_id)
+        if info:
+            post_data["text_ru"] = info['text']
+            post_data["image_url"] = info['image_url']
+
+            # Редактируем исходное сообщение бота в чате
+            try:
+                await approval_bot.edit_message_media(
+                    chat_id=info['chat_id'],
+                    message_id=info['message_id'],
+                    media=InputMediaPhoto(media=post_data["image_url"], caption=post_data["text_ru"])
+                )
+            except Exception as e:
+                logging.error(f"Ошибка редактирования сообщения бота: {e}")
+                # Если ошибка, пытаемся отредактировать текст и картинку по отдельности
+                try:
+                    await approval_bot.edit_message_caption(
+                        chat_id=info['chat_id'],
+                        message_id=info['message_id'],
+                        caption=post_data["text_ru"]
+                    )
+                except Exception as e2:
+                    logging.error(f"Ошибка редактирования подписи: {e2}")
+
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="✅ Пост успешно обновлен.",
+                reply_markup=main_keyboard()
+            )
+            user_self_post.pop(user_id, None)
         return
 
     if action == "finish_self_post":
@@ -602,6 +680,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logging.error(f"Ошибка при публикации в Twitter: {e}")
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Не удалось отправить в Twitter: {e}")
+
+        # Сохраняем в историю
+        await save_post_to_history(base_text, post_data["image_url"])
 
         pending_post["active"] = False
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Успешно отправлено в Telegram!" if telegram_success else "❌ Не удалось отправить в Telegram.")
