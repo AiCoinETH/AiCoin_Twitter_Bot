@@ -125,16 +125,20 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
     signature = (
-        "\nПодробнее в Telegram: t.me/AiCoin_ETH или на сайте: https://getaicoin.com/ "
-        "#AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
+        "Learn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
     )
     max_length = 280
-    reserve = max_length - len(signature)
+    # +1 — перенос строки, если надо, но здесь без перевода, всё одной строкой
+    reserve = max_length - len(signature) - 1
     if len(text_ru) > reserve:
         main_part = text_ru[:reserve - 3].rstrip() + "..."
     else:
         main_part = text_ru
-    return main_part + signature
+    return f"{main_part} {signature}"
+
+def build_telegram_post(text_ru: str) -> str:
+    # Подпись на английском для Telegram
+    return f"{text_ru}\n\nLearn more: https://getaicoin.com/"
 
 # --- Скачивание картинки ---
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
@@ -186,11 +190,9 @@ def publish_post_to_twitter(text, image_url=None):
         media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
-            # Для упрощения синхронно
             file_path = None
             if is_telegram:
-                # Тут можно сделать синхронное скачивание через requests
-                # Либо обойтись, если медиа уже на диске
+                # Обработка фото из Telegram здесь при необходимости
                 pass
             else:
                 headers = {'User-Agent': 'Mozilla/5.0'}
@@ -278,7 +280,7 @@ async def check_timer():
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
                     base_text = post_data["text_ru"].strip()
-                    telegram_text = f"{base_text}\n\nПодробнее: https://getaicoin.com/"
+                    telegram_text = build_telegram_post(base_text)
                     twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -507,7 +509,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
         base_text = post_data["text_ru"].strip()
-        telegram_text = f"{base_text}\n\nПодробнее: https://getaicoin.com/"
+        telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
 
         telegram_success = False
