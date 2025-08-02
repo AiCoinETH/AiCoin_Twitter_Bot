@@ -410,14 +410,19 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            # Предпросмотр для модератора: всегда фото + текст (caption) если фото есть!
-            if image:
+            # Предпросмотр для модератора: только то, что отправил пользователь
+            if image and text:
                 await approval_bot.send_photo(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     photo=image,
                     caption=text
                 )
-            else:
+            elif image and not text:
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=image
+                )
+            elif text and not image:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text=text
@@ -462,18 +467,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
-            # Итоговый предпросмотр с кнопками площадок (всегда текст+фото)!
-            if image:
+            # Итоговый предпросмотр с кнопками площадок — только то, что ввёл пользователь
+            if image and text:
                 await approval_bot.send_photo(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     photo=image,
-                    caption=post_data["text_ru"],
+                    caption=text,
                     reply_markup=post_choice_keyboard()
                 )
-            else:
+            elif image and not text:
+                await approval_bot.send_photo(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    photo=image,
+                    reply_markup=post_choice_keyboard()
+                )
+            elif text and not image:
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=post_data["text_ru"],
+                    text=text,
                     reply_markup=post_choice_keyboard()
                 )
         return
