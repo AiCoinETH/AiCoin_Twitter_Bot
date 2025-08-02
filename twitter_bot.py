@@ -50,10 +50,10 @@ TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 900
 
 test_images = [
-    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
-    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
+    "https://images.unsplash.com/photo-1506744038136-46273834b3fb",   # Природа
+    "https://images.unsplash.com/photo-1519125323398-675f0ddb6308",   # Горы
+    "https://images.unsplash.com/photo-1516979187457-637abb4f9353",   # Город
+    "https://images.unsplash.com/photo-1465101046530-73398c7f28ca"    # Озеро
 ]
 
 WELCOME_POST_RU = (
@@ -87,7 +87,7 @@ def main_keyboard(timer: int = None):
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
 def post_choice_keyboard():
@@ -109,12 +109,7 @@ def post_end_keyboard():
 
 # --- Twitter ---
 def get_twitter_clients():
-    client_v2 = tweepy.Client(
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
-    )
+    # Только v1.1
     api_v1 = tweepy.API(
         tweepy.OAuth1UserHandler(
             TWITTER_API_KEY,
@@ -123,9 +118,9 @@ def get_twitter_clients():
             TWITTER_ACCESS_TOKEN_SECRET
         )
     )
-    return client_v2, api_v1
+    return api_v1
 
-twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
     signature = (
@@ -206,17 +201,9 @@ async def save_post_to_db(text, image_url, db_file=DB_FILE):
 # --- Скачивание картинки ---
 def download_image(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
-        loop = asyncio.get_event_loop()
-        file = loop.run_until_complete(bot.get_file(url_or_file_id))
-        file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
-        r = requests.get(file_url)
-        r.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(r.content)
-        tmp.close()
-        if os.path.getsize(tmp.name) > TELEGRAM_PHOTO_LIMIT:
-            raise ValueError("❗️Файл слишком большой для Telegram (>10MB)!")
-        return tmp.name
+        # Здесь синхронная версия через requests, если нужно асинхронно — вынести логику выше!
+        # Для Telegram ID обычно не используется!
+        raise Exception("Telegram file download только в async режиме!")
     else:
         headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url_or_file_id, headers=headers)
@@ -232,7 +219,17 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None):
     file_path = None
     try:
         is_telegram = not (str(url_or_file_id).startswith("http"))
-        file_path = download_image(url_or_file_id, is_telegram, bot if is_telegram else None)
+        if is_telegram:
+            file = await bot.get_file(url_or_file_id)
+            file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+            r = requests.get(file_url)
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.write(r.content)
+            tmp.close()
+            file_path = tmp.name
+        else:
+            file_path = download_image(url_or_file_id, False)
         msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption)
         return msg
     except ValueError as ve:
@@ -269,17 +266,17 @@ async def publish_message_with_no_preview(bot, chat_id, text):
 
 def publish_post_to_twitter(text, image_url=None):
     try:
-        media_ids = None
         if image_url:
             is_telegram = not (str(image_url).startswith("http"))
+            # download_image только синхронный!
             file_path = download_image(image_url, is_telegram, approval_bot if is_telegram else None)
             try:
-                media = twitter_api_v1.media_upload(file_path)
-                media_ids = [media.media_id_string]
+                twitter_api_v1.update_status_with_media(status=text, filename=file_path)
             finally:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
-        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        else:
+            twitter_api_v1.update_status(status=text)
         logging.info("Пост успешно опубликован в Twitter!")
         return True
     except Exception as e:
