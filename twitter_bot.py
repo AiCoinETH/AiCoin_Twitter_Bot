@@ -658,8 +658,14 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS)
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=main_keyboard())
+    # ВАЖНО! Отправляем только одно стартовое сообщение — фото с подписью и главной клавиатурой!
+    await send_photo_with_download(
+        approval_bot,
+        TELEGRAM_APPROVAL_CHAT_ID,
+        post_data["image_url"],
+        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+        reply_markup=main_keyboard()
+    )
     logging.info("Бот запущен и готов к работе.")
 
 def shutdown_bot_and_exit():
