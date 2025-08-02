@@ -466,7 +466,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # (Если нужно - отправлю остаток кода с функциями button_handler, schedule_daily_posts, check_timer, main и т.д.)
 
 # Файл длинный, поэтому могу отправить ещё!  
-Если что-то не хватает — пиши **"ещё"** и получишь продолжение с кнопками и основной бизнес-логикой!
+Если что-то не хватает, пиши **"ещё"** и получишь продолжение с кнопками и основной бизнес-логикой!
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
