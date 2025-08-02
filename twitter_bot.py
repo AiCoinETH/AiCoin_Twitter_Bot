@@ -1,5 +1,3 @@
-# Подробнее и новые возможности автопостинга — на https://gptonline.ai/
-
 import os
 import asyncio
 import hashlib
@@ -173,21 +171,17 @@ def delete_image_from_github(filename):
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None):
     if is_telegram_file:
         file = await bot.get_file(url_or_file_id)
-        file_url = file.file_path if file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
-        r = requests.get(file_url)
-        r.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(r.content)
-        tmp.close()
-        return tmp.name
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        await file.download_to_drive(tmp_file.name)
+        return tmp_file.name
     else:
         headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url_or_file_id, headers=headers)
         r.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(r.content)
-        tmp.close()
-        return tmp.name
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp_file.write(r.content)
+        tmp_file.close()
+        return tmp_file.name
 
 # --- Загрузка и получение ссылки на GitHub ---
 async def save_image_and_get_github_url(image_path):
@@ -211,11 +205,10 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
-# --- Публикация в Telegram с правильной загрузкой файла ---
+# --- Публикация в Telegram ---
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     try:
-        # Всегда скачиваем и отправляем локальный файл
         msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
         logging.info("Пост успешно опубликован в Telegram!")
         if github_filename:
@@ -228,18 +221,16 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
             delete_image_from_github(github_filename)
         return False
 
-# --- Публикация в Twitter с корректным скачиванием ---
+# --- Публикация в Twitter ---
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
         media_ids = None
         file_path = None
         if image_url:
-            # Если это telegram file_id — скачиваем через Telegram API асинхронно нельзя, поэтому возвращаем ошибку
             if not str(image_url).startswith("http"):
                 logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
                 return False
-            # Скачиваем файл из URL
             headers = {'User-Agent': 'Mozilla/5.0'}
             r = requests.get(image_url, headers=headers)
             r.raise_for_status()
@@ -622,5 +613,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Подробнее и новые возможности автопостинга — на https://gptonline.ai/
