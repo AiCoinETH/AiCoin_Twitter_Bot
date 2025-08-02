@@ -32,7 +32,7 @@ TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
 
 GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
-GITHUB_IMAGE_PATH = "images_for_posts"  # Папка в репозитории для хранения картинок
+GITHUB_IMAGE_PATH = "images_for_posts"
 
 if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
     logging.error("Не заданы обязательные переменные окружения Telegram!")
@@ -85,7 +85,7 @@ last_action_time = {}
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
-# --- Главное меню ---
+# --- Клавиатуры ---
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -147,7 +147,7 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
-# --- GitHub upload/delete functions ---
+# --- GitHub upload/delete ---
 def upload_image_to_github(image_path, filename):
     with open(image_path, "rb") as img_file:
         content = img_file.read()
@@ -189,14 +189,14 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None)
         tmp.close()
         return tmp.name
 
-# --- Загрузка на GitHub и получение ссылки ---
+# --- Загрузка и получение ссылки на GitHub ---
 async def save_image_and_get_github_url(image_path):
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
 
-# --- Отправка фото с текстом в одном сообщении ---
-async def send_photo_with_caption(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+# --- Отправка фото с загрузкой ---
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     file_path = None
     github_url = None
     github_filename = None
@@ -204,17 +204,19 @@ async def send_photo_with_caption(bot, chat_id, url_or_file_id, caption=None, re
         is_telegram = not (str(url_or_file_id).startswith("http"))
         file_path = await download_image_async(url_or_file_id, is_telegram, bot if is_telegram else None)
         github_url, github_filename = await save_image_and_get_github_url(file_path)
-        msg = await bot.send_photo(chat_id=chat_id, photo=open(file_path, "rb"), caption=caption, reply_markup=reply_markup)
+        with open(file_path, "rb") as photo_file:
+            msg = await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, reply_markup=reply_markup)
         return msg, github_filename
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
-# --- Публикация в Telegram (текст и фото вместе) ---
+# --- Публикация в Telegram с правильной загрузкой файла ---
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     try:
-        msg, github_filename = await send_photo_with_caption(bot, chat_id, image_url, caption=text)
+        # Всегда скачиваем и отправляем локальный файл
+        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
         logging.info("Пост успешно опубликован в Telegram!")
         if github_filename:
             delete_image_from_github(github_filename)
@@ -226,30 +228,34 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
             delete_image_from_github(github_filename)
         return False
 
-# --- Публикация в Twitter ---
+# --- Публикация в Twitter с корректным скачиванием ---
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
         media_ids = None
+        file_path = None
         if image_url:
-            is_telegram = not (str(image_url).startswith("http"))
-            if is_telegram:
+            # Если это telegram file_id — скачиваем через Telegram API асинхронно нельзя, поэтому возвращаем ошибку
+            if not str(image_url).startswith("http"):
                 logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
                 return False
-            else:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                r = requests.get(image_url, headers=headers)
-                r.raise_for_status()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                tmp.write(r.content)
-                tmp.close()
-                file_path = tmp.name
-            if file_path:
-                media = twitter_api_v1.media_upload(file_path)
-                media_ids = [media.media_id_string]
-                os.remove(file_path)
+            # Скачиваем файл из URL
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(image_url, headers=headers)
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.write(r.content)
+            tmp.close()
+            file_path = tmp.name
+
+        if file_path:
+            media = twitter_api_v1.media_upload(file_path)
+            media_ids = [media.media_id_string]
+            os.remove(file_path)
+
         twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
         logging.info("Пост успешно опубликован в Twitter!")
+
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
@@ -340,7 +346,7 @@ async def send_post_for_approval():
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         try:
-            await send_photo_with_caption(
+            await send_photo_with_download(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["image_url"],
@@ -425,7 +431,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
-            # Отправляем фото и текст вместе в одном сообщении для предпросмотра
             if image and text:
                 await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=image, caption=text)
             elif image and not text:
@@ -489,7 +494,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_ru"])
-        await send_photo_with_caption(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
         return
 
@@ -592,7 +597,7 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_with_caption(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS)
+    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS)
     await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=main_keyboard())
     logging.info("Бот запущен и готов к работе.")
 
