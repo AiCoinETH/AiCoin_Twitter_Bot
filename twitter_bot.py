@@ -58,7 +58,6 @@ if not all([GITHUB_TOKEN, GITHUB_REPO]):
 
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
-
 approval_lock = asyncio.Lock()
 DB_FILE = "post_history.db"
 scheduled_posts_per_day = 6
@@ -309,6 +308,34 @@ async def init_db():
         await db.commit()
     logging.info("База данных инициализирована.")
 
+async def is_duplicate_post(text, image_url=None):
+    image_hash = None
+    try:
+        if image_url:
+            if not str(image_url).startswith("http"):
+                file_path = await download_image_async(image_url, True, approval_bot)
+                with open(file_path, "rb") as f:
+                    image_hash = hashlib.sha256(f.read()).hexdigest()
+                os.remove(file_path)
+            else:
+                r = requests.get(image_url, timeout=3)
+                r.raise_for_status()
+                image_hash = hashlib.sha256(r.content).hexdigest()
+    except Exception as e:
+        logging.warning(f"Не удалось получить хеш изображения для антидубля: {e}")
+        image_hash = None
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        if image_hash:
+            query = "SELECT COUNT(*) FROM posts WHERE text=? OR image_hash=?"
+            args = (text, image_hash)
+        else:
+            query = "SELECT COUNT(*) FROM posts WHERE text=?"
+            args = (text,)
+        async with db.execute(query, args) as cursor:
+            row = await cursor.fetchone()
+            return row[0] > 0
+
 async def save_post_to_history(text, image_url=None):
     image_hash = None
     logging.info(f"save_post_to_history: text='{text}', image_url={image_url}")
@@ -331,7 +358,7 @@ async def save_post_to_history(text, image_url=None):
         await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
         await db.commit()
     logging.info("Пост сохранён в историю.")
-    # --- Логика "Сделай сам" ---
+
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logging.info(f"self_post_message_handler: получено сообщение от user_id={user_id}")
@@ -344,6 +371,16 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image_url
         user_self_post[user_id]['state'] = 'wait_confirm'
+
+        # Антидубль
+        if await is_duplicate_post(text, image_url):
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="⛔️ Такой пост уже был опубликован (дубль по тексту или фото)!",
+                reply_markup=main_keyboard()
+            )
+            user_self_post.pop(user_id, None)
+            return
 
         try:
             if image_url:
@@ -367,7 +404,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             logging.error(f"Ошибка отправки предпросмотра 'Сделай сам': {e}")
         return
 
-# --- Обработка редактирования поста ---
 async def handle_edit_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     info = user_self_post.get(user_id)
@@ -407,7 +443,6 @@ async def handle_edit_post_message(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logging.error(f"Ошибка предпросмотра редактирования поста: {e}")
 
-# --- Routing сообщений ---
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_self_post:
@@ -420,9 +455,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     await self_post_message_handler(update, context)
 
-# ===============================
-# --- ОБРАБОТКА КНОПОК ---
-# ===============================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -465,6 +497,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'text': post_data["text_ru"],
             'image_url': image_url
         }
+
+        # Предпросмотр текущего поста (картинка + текст)
+        if image_url:
+            await send_photo_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                image_url,
+                caption=post_data["text_ru"]
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=post_data["text_ru"]
+            )
+
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✏️ Отправьте новый текст и/или новую фотографию для редактирования поста (можно и то, и другое). Для отмены нажмите ❌ Отмена.",
@@ -523,6 +570,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["post_id"] += 1
             post_data["is_manual"] = True
             user_self_post.pop(user_id, None)
+
+            # Антидубль перед публикацией (еще раз, для безопасности)
+            if await is_duplicate_post(text, image_url):
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="⛔️ Такой пост уже был опубликован (дубль по тексту или фото)!",
+                    reply_markup=main_keyboard()
+                )
+                return
+
             try:
                 if image_url:
                     logging.info(f"button_handler: предпросмотр finish_self_post image_url={image_url}, caption='{twitter_text}'")
@@ -685,13 +742,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         return
-        # --- schedule_daily_posts (если нужен, можно доработать под расписание) ---
+
 async def schedule_daily_posts():
-    # Функция-заглушка (для теста/развития). Можно настроить расписание через APScheduler или просто таймер.
-    # Пока не используется в логике (чтобы не мешать ручному управлению)
     pass
 
-# --- Таймер автопубликации (работает параллельно с ботом) ---
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -749,16 +803,11 @@ async def send_post_for_approval():
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
-# --- init_db (создаёт базу, если надо; был в блоке 1) ---
-# async def init_db() ...
-
-# --- delayed_start (стартует всё сразу) ---
 async def delayed_start(app: Application):
     logging.info("delayed_start: инициализация базы и запуск задач")
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    # Приветствие: сразу картинка + текст + кнопки
     await send_photo_with_download(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
