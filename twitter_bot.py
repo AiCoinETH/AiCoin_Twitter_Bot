@@ -175,12 +175,14 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None)
         await file.download_to_drive(tmp_file.name)
         return tmp_file.name
     else:
+        logging.info(f"Скачиваю изображение по URL: {url_or_file_id}")
         headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url_or_file_id, headers=headers)
         r.raise_for_status()
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
         tmp_file.write(r.content)
         tmp_file.close()
+        logging.info(f"Изображение сохранено во временный файл: {tmp_file.name}")
         return tmp_file.name
 
 # --- Загрузка и получение ссылки на GitHub ---
