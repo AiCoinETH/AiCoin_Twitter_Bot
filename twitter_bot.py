@@ -90,7 +90,6 @@ prev_data = post_data.copy()
 user_self_post = {}
 user_edit_state = {}
 edit_message_id = {}
-edit_file_wait = {}
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
@@ -99,6 +98,7 @@ last_action_time = {}
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
+# --- Keyboards ---
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -129,25 +129,7 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-def get_twitter_clients():
-    client_v2 = tweepy.Client(
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
-    )
-    api_v1 = tweepy.API(
-        tweepy.OAuth1UserHandler(
-            TWITTER_API_KEY,
-            TWITTER_API_SECRET,
-            TWITTER_ACCESS_TOKEN,
-            TWITTER_ACCESS_TOKEN_SECRET
-        )
-    )
-    return client_v2, api_v1
-
-twitter_client_v2, twitter_api_v1 = get_twitter_clients()
-
+# --- Utils ---
 def strip_html_tags(text: str) -> str:
     return re.sub('<[^<]+?>', '', text)
 
@@ -171,6 +153,25 @@ def build_twitter_post(text_ru: str) -> str:
     else:
         main_part = text_ru
     return main_part + signature
+
+def get_twitter_clients():
+    client_v2 = tweepy.Client(
+        consumer_key=TWITTER_API_KEY,
+        consumer_secret=TWITTER_API_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
+    )
+    api_v1 = tweepy.API(
+        tweepy.OAuth1UserHandler(
+            TWITTER_API_KEY,
+            TWITTER_API_SECRET,
+            TWITTER_ACCESS_TOKEN,
+            TWITTER_ACCESS_TOKEN_SECRET
+        )
+    )
+    return client_v2, api_v1
+
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
@@ -256,7 +257,8 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
-        async def publish_post_to_telegram(bot, chat_id, text, image_url):
+
+async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
     try:
@@ -510,15 +512,15 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     return
-    async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# ---------- button_handler ----------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
         await update.callback_query.answer()
     except Exception as e:
         logging.warning(f"Не удалось ответить на callback_query: {e}")
 
-    if pending_post["active"]:
-        reset_timer(TIMER_PUBLISH_EXTEND)
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
@@ -530,7 +532,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prev_data.update(post_data)
 
     if action == "edit_post":
-        # Ожидаем отправку файла или фото для замены!
         user_edit_state[user_id] = "wait_file"
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -637,8 +638,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "restore_previous":
         post_data.update(prev_data)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="↩️ Восстановлен предыдущий вариант.", reply_markup=main_keyboard())
-        if pending_post["active"]:
-            await send_post_for_approval()
         return
 
     if action == "end_day":
@@ -707,11 +706,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
-# --- Автопостинг, таймеры, старт/стоп, запуск ---
+# --- Запуск и остановка ---
 async def delayed_start(app: Application):
     await init_db()
-    asyncio.create_task(schedule_daily_posts())
-    asyncio.create_task(check_timer())
     msg, _ = await send_photo_with_download(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
