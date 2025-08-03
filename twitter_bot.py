@@ -149,9 +149,22 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
     signature = (
-        "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
+        "\nLearn more: https://getaicoin.com/ | Telegram: https://t.me/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
     )
     max_length = 280
+    reserve = max_length - len(signature)
+    if len(text_ru) > reserve:
+        main_part = text_ru[:reserve - 3].rstrip() + "..."
+    else:
+        main_part = text_ru
+    return main_part + signature
+
+def build_telegram_post(text_ru: str) -> str:
+    signature = (
+        '\n\nLearn more on <a href="https://getaicoin.com/">website</a> | '
+        '<a href="https://t.me/AiCoin_ETH">Telegram</a>'
+    )
+    max_length = 1024
     reserve = max_length - len(signature)
     if len(text_ru) > reserve:
         main_part = text_ru[:reserve - 3].rstrip() + "..."
@@ -223,7 +236,7 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     logging.info(f"process_telegram_photo: Получена ссылка на GitHub: {url}")
     return url
 
-async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None, use_html=False):
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
     try:
@@ -231,14 +244,14 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
             url = await process_telegram_photo(url_or_file_id, bot)
             github_filename = url.split('/')[-1]
             logging.info(f"send_photo_with_download: отправляю фото по url={url}, caption='{caption}'")
-            msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
+            msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup, parse_mode="HTML" if use_html else None)
             return msg, github_filename
         elif url_or_file_id:
             logging.info(f"send_photo_with_download: отправляю фото по url_or_file_id={url_or_file_id}, caption='{caption}'")
-            msg = await bot.send_photo(chat_id=chat_id, photo=url_or_file_id, caption=caption, reply_markup=reply_markup)
+            msg = await bot.send_photo(chat_id=chat_id, photo=url_or_file_id, caption=caption, reply_markup=reply_markup, parse_mode="HTML" if use_html else None)
             return msg, None
         else:
-            msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+            msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup, parse_mode="HTML" if use_html else None)
             return msg, None
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
@@ -248,7 +261,7 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
     try:
-        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text, use_html=True)
         logging.info("Пост успешно опубликован в Telegram!")
         if github_filename:
             delete_image_from_github(github_filename)
@@ -385,21 +398,22 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await approval_bot.edit_message_media(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     message_id=msg_id,
-                    media=InputMediaPhoto(media=image_url, caption=text),
+                    media=InputMediaPhoto(media=image_url, caption=build_telegram_post(text)),
                     reply_markup=post_choice_keyboard()
                 )
             else:
                 await approval_bot.edit_message_text(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     message_id=msg_id,
-                    text=text,
-                    reply_markup=post_choice_keyboard()
+                    text=build_telegram_post(text),
+                    reply_markup=post_choice_keyboard(),
+                    parse_mode="HTML"
                 )
             logging.info(f"Сообщение {msg_id} отредактировано успешно")
         except Exception as e:
             logging.error(f"Ошибка редактирования сообщения: {e}")
             # Если редактирование не удалось, отправим новое сообщение с кнопками и запомним message_id
-            msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
+            msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=build_telegram_post(text), reply_markup=post_choice_keyboard(), parse_mode="HTML")
             edit_message_id[user_id] = msg.message_id
         return
 
@@ -430,10 +444,11 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         approval_bot,
                         TELEGRAM_APPROVAL_CHAT_ID,
                         image_url,
-                        caption=text
+                        caption=build_telegram_post(text),
+                        use_html=True
                     )
                 elif text:
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=build_telegram_post(text), parse_mode="HTML")
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
@@ -460,7 +475,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     approval_bot,
                     TELEGRAM_APPROVAL_CHAT_ID,
                     user_self_post[user_id]['image'],
-                    caption=user_self_post[user_id]['text']
+                    caption=build_telegram_post(user_self_post[user_id]['text']),
+                    use_html=True
                 )
                 await approval_bot.send_message(
                     chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -501,8 +517,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Отправляем исходный текст поста и сохраняем ID сообщения для редактирования
         sent_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=post_data["text_ru"],
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+            text=build_telegram_post(post_data["text_ru"]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]]),
+            parse_mode="HTML"
         )
         edit_message_id[user_id] = sent_msg.message_id
         return
@@ -533,9 +550,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 if image_url:
-                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=twitter_text, reply_markup=post_choice_keyboard())
+                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=build_telegram_post(text), reply_markup=post_choice_keyboard(), use_html=True)
                 else:
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=twitter_text, reply_markup=post_choice_keyboard())
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=build_telegram_post(text), reply_markup=post_choice_keyboard(), parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
         return
@@ -549,14 +566,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_ru"])
-        msg, _ = await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        msg, _ = await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=build_telegram_post(post_data["text_ru"]), use_html=True)
         edit_message_id[user_id] = msg.message_id
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
         base_text = post_data["text_ru"].strip()
-        telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
+        telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
 
         telegram_success = False
@@ -641,8 +658,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
-            reply_markup=main_keyboard()
+            caption=build_telegram_post(post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS),
+            reply_markup=main_keyboard(),
+            use_html=True
         )
         edit_message_id[user_id] = msg.message_id
         pending_post.update({
@@ -662,8 +680,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
-            reply_markup=main_keyboard()
+            caption=build_telegram_post(post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS),
+            reply_markup=main_keyboard(),
+            use_html=True
         )
         edit_message_id[user_id] = msg.message_id
         pending_post.update({
@@ -744,7 +763,7 @@ async def check_timer():
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
                     base_text = post_data["text_ru"].strip()
-                    telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
+                    telegram_text = build_telegram_post(base_text)
                     twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
                     await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
@@ -781,8 +800,9 @@ async def send_post_for_approval():
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["image_url"],
-                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
-                reply_markup=main_keyboard()
+                caption=build_telegram_post(post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS),
+                reply_markup=main_keyboard(),
+                use_html=True
             )
             # Запоминаем message_id для редактирования, для user_id=0 (бот)
             edit_message_id[0] = msg.message_id
@@ -798,8 +818,9 @@ async def delayed_start(app: Application):
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
         post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
-        reply_markup=main_keyboard()
+        caption=build_telegram_post(post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS),
+        reply_markup=main_keyboard(),
+        use_html=True
     )
     # Запоминаем message_id для редактирования
     edit_message_id[0] = msg.message_id
