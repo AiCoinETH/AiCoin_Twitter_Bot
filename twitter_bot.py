@@ -6,7 +6,6 @@ import random
 import sys
 import tempfile
 import uuid
-import re
 from datetime import datetime, timedelta, time as dt_time
 
 import tweepy
@@ -27,6 +26,7 @@ from telegram.ext import (
 )
 import aiosqlite
 from github import Github
+import re
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,8 +88,10 @@ post_data = {
 }
 prev_data = post_data.copy()
 user_self_post = {}
+
 user_edit_state = {}
 edit_message_id = {}
+
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
 last_action_time = {}
@@ -127,9 +129,6 @@ def post_end_keyboard():
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
 
-def strip_html_tags(text: str) -> str:
-    return re.sub('<[^<]+?>', '', text)
-
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -149,11 +148,22 @@ def get_twitter_clients():
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
+def strip_html_tags(text: str) -> str:
+    return re.sub('<[^<]+?>', '', text)
+
+def build_telegram_post(text_ru: str) -> str:
+    signature = '\n\nLearn more on <a href="https://getaicoin.com/">веб сайт</a> | <a href="https://x.com/AiCoin_ETH">twitter/X</a>'
+    max_length = 1024
+    clean_sig = strip_html_tags(signature)
+    reserve = max_length - len(clean_sig)
+    if len(text_ru) > reserve:
+        main_part = text_ru[:reserve - 3].rstrip() + "..."
+    else:
+        main_part = text_ru
+    return main_part + signature
+
 def build_twitter_post(text_ru: str) -> str:
-    # Только текстовые ссылки! 280 символов максимум.
-    signature = (
-        "\nLearn more: https://getaicoin.com/ | Telegram: https://t.me/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
-    )
+    signature = "\nLearn more: https://getaicoin.com/ | Telegram: https://t.me/AiCoin_ETH"
     max_length = 280
     reserve = max_length - len(signature)
     if len(text_ru) > reserve:
@@ -162,25 +172,14 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
-def build_telegram_post(text_ru: str) -> str:
-    # Ограничение 1024 символа без учёта HTML тегов, подпись на русском, кликабельные ссылки через HTML
-    signature = (
-        '\n\nLearn more on <a href="https://getaicoin.com/">веб сайт</a> | <a href="https://x.com/AiCoin_ETH">twitter/X</a>'
-    )
-    max_length = 1024
-    # Вычитаем из лимита только видимый текст подписи
-    reserve = max_length - len(strip_html_tags(signature))
-    if len(text_ru) > reserve:
-        main_part = text_ru[:reserve - 3].rstrip() + "..."
-    else:
-        main_part = text_ru
-    return main_part + signature
+# -- далее твой код upload_image_to_github, delete_image_from_github, download_image_async, process_telegram_photo,
+# send_photo_with_download, publish_post_to_telegram, publish_post_to_twitter, is_duplicate_post, save_post_to_history, message_router, button_handler,
+# автопостинг, таймеры, send_post_for_approval, startup/shutdown, main() —
+# см. предыдущие сообщения: здесь всё включено!
 
-# --- ДАЛЬШЕ ВСЯ ЛОГИКА КАК БЫЛО ---
+# (Если нужен полный блок — дай знать, скину всё до конца файла одним куском.)
 
-# ... upload_image_to_github, delete_image_from_github, download_image_async, process_telegram_photo,
-# send_photo_with_download, publish_post_to_telegram, publish_post_to_twitter, is_duplicate_post,
-# save_post_to_history, message_router, button_handler, автопостинг, таймеры, send_post_for_approval, startup/shutdown, main()
+# --- Твой код продолжается далее, здесь просто куски не влезают в лимит! Если что-то не хватает — повтори запрос на оставшуюся часть.
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
     with open(image_path, "rb") as img_file:
@@ -322,6 +321,9 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return False
 
+# -- далее init_db, is_duplicate_post, save_post_to_history, message_router, button_handler,
+# автопостинг, таймеры, send_post_for_approval, startup/shutdown, main() --
+# смотри свои прошлые файлы, этот хвост должен идти до самого конца
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -386,11 +388,9 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
-# ========== Роутер сообщений =========
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Обработка режима редактирования
     if user_edit_state.get(user_id):
         text = update.message.text or update.message.caption or post_data["text_ru"]
         image_url = post_data["image_url"]
@@ -400,7 +400,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = image_url
         user_edit_state[user_id] = False
 
-        # Редактируем исходное сообщение бота по message_id
         msg_id = edit_message_id.get(user_id)
         try:
             if image_url and str(image_url).startswith("http"):
@@ -425,7 +424,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             edit_message_id[user_id] = msg.message_id
         return
 
-    # Логика «Сделай сам»
     if user_id in user_self_post:
         state = user_self_post[user_id].get('state')
         if state == 'wait_post':
@@ -497,11 +495,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logging.error(f"Ошибка предпросмотра после ручного редактирования: {e}")
             return
+
     return
 
-# (button_handler, автопостинг, таймеры, send_post_for_approval, startup/shutdown, main)
-# Оставлять сюда или выдать дальше — скажи!
-# ========== Callback/Кнопки ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -700,7 +696,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
-# ========== Автопостинг ===========
 def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23, min_offset=-20, max_offset=20):
     if day_end_hour > 23:
         day_end_hour = 23
@@ -762,7 +757,6 @@ async def schedule_daily_posts():
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
 
-# ========== Таймеры/Автопубликация ===========
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -816,7 +810,6 @@ async def send_post_for_approval():
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
-# ============= Startup/shutdown =====================
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
