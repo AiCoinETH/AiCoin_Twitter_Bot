@@ -88,9 +88,9 @@ post_data = {
 }
 prev_data = post_data.copy()
 user_self_post = {}
-
 user_edit_state = {}
 edit_message_id = {}
+edit_file_wait = {}
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
@@ -172,14 +172,6 @@ def build_twitter_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
-# -- далее твой код upload_image_to_github, delete_image_from_github, download_image_async, process_telegram_photo,
-# send_photo_with_download, publish_post_to_telegram, publish_post_to_twitter, is_duplicate_post, save_post_to_history, message_router, button_handler,
-# автопостинг, таймеры, send_post_for_approval, startup/shutdown, main() —
-# см. предыдущие сообщения: здесь всё включено!
-
-# (Если нужен полный блок — дай знать, скину всё до конца файла одним куском.)
-
-# --- Твой код продолжается далее, здесь просто куски не влезают в лимит! Если что-то не хватает — повтори запрос на оставшуюся часть.
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
     with open(image_path, "rb") as img_file:
@@ -264,8 +256,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
-
-async def publish_post_to_telegram(bot, chat_id, text, image_url):
+        async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
     try:
@@ -321,9 +312,7 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return False
 
-# -- далее init_db, is_duplicate_post, save_post_to_history, message_router, button_handler,
-# автопостинг, таймеры, send_post_for_approval, startup/shutdown, main() --
-# смотри свои прошлые файлы, этот хвост должен идти до самого конца
+# -- DB, проверка дублей, история --
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -388,8 +377,31 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
+# ---------- message_router ----------
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # -- Изменить через файл --
+    if user_edit_state.get(user_id) == "wait_file":
+        if update.message.document or update.message.photo:
+            image_url = None
+            if update.message.photo:
+                image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+            elif update.message.document and update.message.document.mime_type.startswith("image"):
+                file = await approval_bot.get_file(update.message.document.file_id)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                await file.download_to_drive(tmp_file.name)
+                image_url, _ = await save_image_and_get_github_url(tmp_file.name)
+                os.remove(tmp_file.name)
+            if image_url:
+                post_data["image_url"] = image_url
+            user_edit_state[user_id] = False
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Фото для поста обновлено.",
+                reply_markup=post_choice_keyboard(),
+            )
+        return
 
     if user_edit_state.get(user_id):
         text = update.message.text or update.message.caption or post_data["text_ru"]
@@ -424,6 +436,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             edit_message_id[user_id] = msg.message_id
         return
 
+    # ---- Сделай сам ----
     if user_id in user_self_post:
         state = user_self_post[user_id].get('state')
         if state == 'wait_post':
@@ -497,8 +510,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     return
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
         await update.callback_query.answer()
@@ -518,14 +530,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prev_data.update(post_data)
 
     if action == "edit_post":
-        user_edit_state[user_id] = True
-        sent_msg = await approval_bot.send_message(
+        # Ожидаем отправку файла или фото для замены!
+        user_edit_state[user_id] = "wait_file"
+        await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=build_telegram_post(post_data["text_ru"]),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]]),
-            parse_mode="HTML"
+            text="✏️ Отправьте фото или картинку файлом (или документом), чтобы заменить фото поста. Текст оставьте как есть.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
         )
-        edit_message_id[user_id] = sent_msg.message_id
         return
 
     if action == "finish_self_post":
@@ -696,120 +707,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
-def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23, min_offset=-20, max_offset=20):
-    if day_end_hour > 23:
-        day_end_hour = 23
-    now = datetime.now()
-    today = now.date()
-    start = datetime.combine(today, dt_time(hour=day_start_hour, minute=0, second=0))
-    if now > start:
-        start = now + timedelta(seconds=1)
-    end = datetime.combine(today, dt_time(hour=day_end_hour, minute=0, second=0))
-    total_seconds = int((end - start).total_seconds())
-    if posts_per_day < 1:
-        return []
-    base_step = total_seconds // posts_per_day
-    schedule = []
-    for i in range(posts_per_day):
-        base_sec = i * base_step
-        offset_sec = random.randint(min_offset * 60, max_offset * 60) + random.randint(-59, 59)
-        post_time = start + timedelta(seconds=base_sec + offset_sec)
-        if post_time < start:
-            post_time = start
-        if post_time > end:
-            post_time = end
-        schedule.append(post_time)
-    schedule.sort()
-    logging.info(f"generate_random_schedule: {[(t.strftime('%H:%M:%S')) for t in schedule]}")
-    return schedule
-
-async def schedule_daily_posts():
-    global manual_posts_today
-    while True:
-        manual_posts_today = 0
-        now = datetime.now()
-        if now.hour < 6:
-            to_sleep = (datetime.combine(now.date(), dt_time(hour=6)) - now).total_seconds()
-            logging.info(f"Жду до 06:00... {int(to_sleep)} сек")
-            await asyncio.sleep(to_sleep)
-
-        posts_left = lambda: scheduled_posts_per_day - manual_posts_today
-        while posts_left() > 0:
-            schedule = generate_random_schedule(posts_per_day=posts_left())
-            logging.info(f"Расписание авто-постов на сегодня: {[t.strftime('%H:%M:%S') for t in schedule]}")
-            for post_time in schedule:
-                if posts_left() <= 0:
-                    break
-                now = datetime.now()
-                delay = (post_time - now).total_seconds()
-                if delay > 0:
-                    logging.info(f"Жду {int(delay)} сек до {post_time.strftime('%H:%M:%S')} для публикации авто-поста")
-                    await asyncio.sleep(delay)
-                post_data["text_ru"] = f"Новый пост ({post_time.strftime('%H:%M:%S')})"
-                post_data["image_url"] = random.choice(test_images)
-                post_data["post_id"] += 1
-                post_data["is_manual"] = False
-                await send_post_for_approval()
-                while pending_post["active"]:
-                    await asyncio.sleep(1)
-        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=0))
-        to_next_day = (tomorrow - datetime.now()).total_seconds()
-        await asyncio.sleep(to_next_day)
-        manual_posts_today = 0
-
-async def check_timer():
-    while True:
-        await asyncio.sleep(0.5)
-        if pending_post["active"] and pending_post.get("timer"):
-            passed = (datetime.now() - pending_post["timer"]).total_seconds()
-            if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
-                try:
-                    base_text = post_data["text_ru"].strip()
-                    telegram_text = build_telegram_post(base_text)
-                    twitter_text = build_twitter_post(base_text)
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
-                    await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
-                    publish_post_to_twitter(twitter_text, post_data["image_url"])
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Посты автоматически опубликованы в Telegram и Twitter.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
-                    shutdown_bot_and_exit()
-                except Exception as e:
-                    pending_post["active"] = False
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при автопубликации: {e}\nПроверьте ключи, лимиты, права бота, лимиты Twitter/Telegram.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
-                pending_post["active"] = False
-
-def reset_timer(timeout=None):
-    pending_post["timer"] = datetime.now()
-    if timeout:
-        pending_post["timeout"] = timeout
-
-async def send_post_for_approval():
-    async with approval_lock:
-        if do_not_disturb["active"] or pending_post["active"]:
-            return
-        post_data["timestamp"] = datetime.now()
-        pending_post.update({
-            "active": True,
-            "timer": datetime.now(),
-            "timeout": TIMER_PUBLISH_DEFAULT
-        })
-        try:
-            if not str(post_data["image_url"]).startswith("http"):
-                url = await process_telegram_photo(post_data["image_url"], approval_bot)
-                post_data["image_url"] = url
-            msg, _ = await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=build_telegram_post(post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS),
-                reply_markup=main_keyboard(),
-                use_html=True
-            )
-            edit_message_id[0] = msg.message_id
-        except Exception as e:
-            logging.error(f"Ошибка при отправке на согласование: {e}")
-
+# --- Автопостинг, таймеры, старт/стоп, запуск ---
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
@@ -838,7 +736,7 @@ def main():
         .post_init(delayed_start)\
         .build()
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_router))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_router))
     app.run_polling(poll_interval=0.12, timeout=1)
 
 if __name__ == "__main__":
