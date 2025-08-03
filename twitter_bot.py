@@ -374,16 +374,15 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if image_url:
             post_data["image_url"] = image_url
         user_edit_state[user_id] = False
-        # Предпросмотр после редактирования с кнопками
+        # Показываем предпросмотр после редактирования с КНОПКАМИ публикации!
         await send_photo_with_download(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             post_data["image_url"],
             caption=post_data["text_ru"],
-            reply_markup=main_keyboard()
+            reply_markup=post_choice_keyboard()  # <--- ТУТ ИЗМЕНЕНИЕ!
         )
         return
-
     # ====== Стандартные пути ======
     if user_id in user_self_post and user_self_post[user_id].get('state') == 'wait_edit':
         await edit_post_message_handler(update, context)
