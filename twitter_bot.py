@@ -368,6 +368,7 @@ async def save_post_to_history(text, image_url=None):
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # Обработка режима редактирования
     if user_edit_state.get(user_id):
         text = update.message.text or update.message.caption or post_data["text_ru"]
         image_url = post_data["image_url"]
@@ -397,11 +398,12 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Сообщение {msg_id} отредактировано успешно")
         except Exception as e:
             logging.error(f"Ошибка редактирования сообщения: {e}")
-            # Если редактирование не удалось, просто отправим новое сообщение с кнопками и запомним message_id
+            # Если редактирование не удалось, отправим новое сообщение с кнопками и запомним message_id
             msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text, reply_markup=post_choice_keyboard())
             edit_message_id[user_id] = msg.message_id
         return
 
+    # Логика «Сделай сам» (ручной режим)
     if user_id in user_self_post:
         state = user_self_post[user_id].get('state')
         if state == 'wait_post':
@@ -496,6 +498,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "edit_post":
         user_edit_state[user_id] = True
+        # Отправляем исходный текст поста и сохраняем ID сообщения для редактирования
         sent_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=post_data["text_ru"],
@@ -546,7 +549,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_ru"])
-        await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        msg, _ = await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        edit_message_id[user_id] = msg.message_id
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
         return
 
@@ -633,13 +637,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = False
-        await send_photo_with_download(
+        msg, _ = await send_photo_with_download(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             post_data["image_url"],
             caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
             reply_markup=main_keyboard()
         )
+        edit_message_id[user_id] = msg.message_id
         pending_post.update({
             "active": True,
             "timer": datetime.now(),
@@ -653,13 +658,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = True
-        await send_photo_with_download(
+        msg, _ = await send_photo_with_download(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             post_data["image_url"],
             caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
             reply_markup=main_keyboard()
         )
+        edit_message_id[user_id] = msg.message_id
         pending_post.update({
             "active": True,
             "timer": datetime.now(),
@@ -778,8 +784,8 @@ async def send_post_for_approval():
                 caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
                 reply_markup=main_keyboard()
             )
-            # Запоминаем message_id для редактирования
-            edit_message_id[update.effective_user.id] = msg.message_id
+            # Запоминаем message_id для редактирования, для user_id=0 (бот)
+            edit_message_id[0] = msg.message_id
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
 
@@ -795,8 +801,7 @@ async def delayed_start(app: Application):
         caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
         reply_markup=main_keyboard()
     )
-    # Запомним message_id для редактирования
-    # Если бот запущен не от пользователя, ставим dummy user_id=0
+    # Запоминаем message_id для редактирования
     edit_message_id[0] = msg.message_id
 
 def shutdown_bot_and_exit():
