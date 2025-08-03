@@ -86,7 +86,9 @@ post_data = {
 }
 prev_data = post_data.copy()
 user_self_post = {}
+
 user_edit_state = {}
+edit_message_id = {}
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
 do_not_disturb = {"active": False}
@@ -115,8 +117,7 @@ def post_choice_keyboard():
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
-
-def post_end_keyboard():
+    def post_end_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post_manual")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
@@ -256,8 +257,7 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
         if github_filename:
             delete_image_from_github(github_filename)
         return False
-
-def publish_post_to_twitter(text, image_url=None):
+        def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     logging.info(f"publish_post_to_twitter: text='{text}', image_url={image_url}")
     try:
@@ -361,21 +361,21 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
-# ========= Роутер сообщений (универсальный для всех сценариев) =========
+# ========= Роутер сообщений =========
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # === Edit mode для обычного поста ===
+    # --- Новый режим редактирования после нажатия "Изменить" ---
     if user_edit_state.get(user_id):
-        text = update.message.text or update.message.caption or ""
-        image_url = None
+        text = update.message.text or update.message.caption or post_data["text_ru"]
+        image_url = post_data["image_url"]
         if update.message.photo:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
-        if text:
-            post_data["text_ru"] = text
-        if image_url:
-            post_data["image_url"] = image_url
+        post_data["text_ru"] = text
+        post_data["image_url"] = image_url
         user_edit_state[user_id] = False
+
+        # Отправка обновлённого поста с кнопками
         await send_photo_with_download(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
@@ -384,8 +384,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=post_choice_keyboard()
         )
         return
-
-    # === "Сделай сам" (ручной режим) ===
+            # --- "Сделай сам" (ручной режим) ---
     if user_id in user_self_post:
         state = user_self_post[user_id].get('state')
         if state == 'wait_post':
@@ -456,7 +455,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Ошибка предпросмотра после ручного редактирования: {e}")
             return
 
-    # Если ни одно условие не сработало — ничего не делаем
     return
 
 # ========== Callback/Кнопки ==========
@@ -478,21 +476,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"button_handler: user_id={user_id}, action={action}")
     prev_data.update(post_data)
 
+    # --- Новый обработчик кнопки "Изменить" ---
     if action == "edit_post":
-        if user_id in user_self_post and user_self_post[user_id].get("state") == "wait_confirm":
-            user_self_post[user_id]["state"] = "wait_edit"
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении).",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
-            )
-        else:
-            user_edit_state[user_id] = True
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении).",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
-            )
+        user_edit_state[user_id] = True
+        sent = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=post_data["text_ru"],
+        )
+        edit_message_id[user_id] = sent.message_id
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✏️ Отредактируй сообщение выше и/или пришли новую картинку. Всё в одном сообщении.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+        )
         return
 
     if action == "finish_self_post":
@@ -540,8 +536,159 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
         return
+            # --- "Сделай сам" (ручной режим) ---
+    if user_id in user_self_post:
+        state = user_self_post[user_id].get('state')
+        if state == 'wait_post':
+            text = update.message.text or update.message.caption or ""
+            image_url = None
+            if update.message.photo:
+                image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+            user_self_post[user_id]['text'] = text
+            user_self_post[user_id]['image'] = image_url
+            user_self_post[user_id]['state'] = 'wait_confirm'
 
-    if action in ["post_twitter", "post_telegram", "post_both"]:
+            if await is_duplicate_post(text, image_url):
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="⛔️ Такой пост уже был опубликован (дубль по тексту или фото)!",
+                    reply_markup=main_keyboard()
+                )
+                user_self_post.pop(user_id, None)
+                return
+
+            try:
+                if image_url:
+                    await send_photo_with_download(
+                        approval_bot,
+                        TELEGRAM_APPROVAL_CHAT_ID,
+                        image_url,
+                        caption=text
+                    )
+                elif text:
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                    ])
+                )
+            except Exception as e:
+                logging.error(f"Ошибка предпросмотра 'Сделай сам': {e}")
+            return
+        elif state == 'wait_edit':
+            text = update.message.text or update.message.caption or ""
+            image_url = None
+            if update.message.photo:
+                image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+            if text:
+                user_self_post[user_id]['text'] = text
+            if image_url:
+                user_self_post[user_id]['image'] = image_url
+            user_self_post[user_id]['state'] = 'wait_confirm'
+            try:
+                await send_photo_with_download(
+                    approval_bot,
+                    TELEGRAM_APPROVAL_CHAT_ID,
+                    user_self_post[user_id]['image'],
+                    caption=user_self_post[user_id]['text']
+                )
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="Проверь отредактированный пост. Если всё ок — нажми 📤 Завершить генерацию.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
+                        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                    ])
+                )
+            except Exception as e:
+                logging.error(f"Ошибка предпросмотра после ручного редактирования: {e}")
+            return
+
+    return
+
+# ========== Callback/Кнопки ==========
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_action_time, prev_data, manual_posts_today
+    try:
+        await update.callback_query.answer()
+    except Exception as e:
+        logging.warning(f"Не удалось ответить на callback_query: {e}")
+    if pending_post["active"]:
+        reset_timer(TIMER_PUBLISH_EXTEND)
+    user_id = update.effective_user.id
+    now = datetime.now()
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=main_keyboard())
+        return
+    last_action_time[user_id] = now
+    action = update.callback_query.data
+    logging.info(f"button_handler: user_id={user_id}, action={action}")
+    prev_data.update(post_data)
+
+    # --- Новый обработчик кнопки "Изменить" ---
+    if action == "edit_post":
+        user_edit_state[user_id] = True
+        sent = await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=post_data["text_ru"],
+        )
+        edit_message_id[user_id] = sent.message_id
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✏️ Отредактируй сообщение выше и/или пришли новую картинку. Всё в одном сообщении.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+        )
+        return
+
+    if action == "finish_self_post":
+        info = user_self_post.get(user_id)
+        logging.info(f"button_handler: finish_self_post info={info}")
+        if info and info["state"] == "wait_confirm":
+            text = info.get("text", "")
+            image_url = info.get("image", None)
+            twitter_text = build_twitter_post(text)
+            post_data["text_ru"] = text
+            if image_url:
+                post_data["image_url"] = image_url
+            else:
+                post_data["image_url"] = random.choice(test_images)
+            post_data["post_id"] += 1
+            post_data["is_manual"] = True
+            user_self_post.pop(user_id, None)
+
+            if await is_duplicate_post(text, image_url):
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="⛔️ Такой пост уже был опубликован (дубль по тексту или фото)!",
+                    reply_markup=main_keyboard()
+                )
+                return
+
+            try:
+                if image_url:
+                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=twitter_text, reply_markup=post_choice_keyboard())
+                else:
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=twitter_text, reply_markup=post_choice_keyboard())
+            except Exception as e:
+                logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+        return
+
+    if action == "shutdown_bot":
+        logging.info("Останавливаю бота по кнопке!")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!")
+        await asyncio.sleep(2)
+        shutdown_bot_and_exit()
+        return
+
+    if action == "approve":
+        twitter_text = build_twitter_post(post_data["text_ru"])
+        await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
+        return
+            if action in ["post_twitter", "post_telegram", "post_both"]:
         base_text = post_data["text_ru"].strip()
         telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
         twitter_text = build_twitter_post(base_text)
@@ -585,7 +732,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         user_self_post.pop(user_id, None)
-        user_edit_state[user_id] = False  # сбросить edit режим!
+        user_edit_state[user_id] = False
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=main_keyboard())
         return
 
@@ -685,8 +832,7 @@ def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23,
     schedule.sort()
     logging.info(f"generate_random_schedule: {[(t.strftime('%H:%M:%S')) for t in schedule]}")
     return schedule
-
-async def schedule_daily_posts():
+    async def schedule_daily_posts():
     global manual_posts_today
     while True:
         manual_posts_today = 0
