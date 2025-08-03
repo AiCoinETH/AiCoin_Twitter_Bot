@@ -357,7 +357,7 @@ async def save_post_to_history(text, image_url=None):
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
-# ========== "Сделай сам" и "Изменить" ===========
+# ======= "Сделай сам" и "Изменить" =======
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logging.info(f"self_post_message_handler: получено сообщение от user_id={user_id}")
@@ -414,6 +414,12 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         if image_url:
             post_data["image_url"] = image_url
         user_self_post.pop(user_id, None)
+        # ВАЖНО: включаем предпросмотр и меню публикации после редактирования!
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         try:
             await send_photo_with_download(
                 approval_bot,
@@ -433,7 +439,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await self_post_message_handler(update, context)
 
-# ========== Кнопки/Callback ===========
+# ======= Кнопки/Callback =======
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
