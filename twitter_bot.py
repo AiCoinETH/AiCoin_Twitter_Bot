@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
-TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
 TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
 
@@ -34,9 +34,11 @@ GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
 GITHUB_IMAGE_PATH = "images_for_posts"
 
-if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
+if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID_STR, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
     logging.error("Не заданы обязательные переменные окружения Telegram!")
     sys.exit(1)
+    
+TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID_STR)
 if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET]):
     logging.error("Не заданы обязательные переменные окружения для Twitter!")
     sys.exit(1)
@@ -448,18 +450,31 @@ async def schedule_daily_posts():
 # --- Логика "Сделай сам" ---
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logging.info(f"self_post_message_handler: получено сообщение от user_id={user_id}")
-    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_post':
+    state = user_self_post.get(user_id, {}).get('state')
+    logging.info(f"self_post_message_handler: user_id={user_id}, state={state}, user_self_post={user_self_post.get(user_id)}")
+    
+    if state == 'wait_post':
         text = update.message.text or update.message.caption or ""
         image_url = None
         if update.message.photo:
-            image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
-        logging.info(f"self_post_message_handler: сохранение text='{text}', image_url={image_url}")
+            try:
+                image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+            except Exception as e:
+                logging.error(f"Ошибка обработки фото: {e}")
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Попробуйте ещё раз.")
+                return
+
+        # Если оба пусто — просим пользователя прислать текст или фото
+        if not text and not image_url:
+            await approval_bot.send_message(chat_id=update.effective_chat.id, text="❗️Пришлите хотя бы текст или фотографию для поста.")
+            return
+
         user_self_post[user_id]['text'] = text
         user_self_post[user_id]['image'] = image_url
         user_self_post[user_id]['state'] = 'wait_confirm'
 
         try:
+            # Сначала фото + текст, иначе только текст
             if image_url:
                 await send_photo_with_download(
                     approval_bot,
@@ -467,7 +482,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
                     image_url,
                     caption=text
                 )
-            elif text:
+            else:
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -478,9 +493,21 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
                 ])
             )
         except Exception as e:
-            logging.error(f"Ошибка отправки предпросмотра 'Сделай сам': {e}")
+            logging.error(f"Ошибка предпросмотра 'Сделай сам': {e}")
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр поста. Попробуйте снова.")
         return
 
+    # Не в режиме self_post — сразу подсказываем как начать
+    if user_id not in user_self_post or not state:
+        logging.info(f"self_post_message_handler: user_id={user_id} не вызвал self_post — уведомление")
+        await approval_bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✍️ Чтобы отправить свой пост, сначала нажмите кнопку 'Сделай сам'!"
+        )
+        return
+    else:
+        logging.info(f"self_post_message_handler: user_id={user_id} state='{state}' не обработан")
+        return
 # --- Логика "Изменить пост" ---
 async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
