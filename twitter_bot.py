@@ -214,12 +214,19 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
     try:
-        if not str(url_or_file_id).startswith("http"):
+        # Новый блок для локальных файлов из images_for_posts
+        if isinstance(url_or_file_id, str) and url_or_file_id.startswith("images_for_posts/") and os.path.exists(url_or_file_id):
+            with open(url_or_file_id, "rb") as img:
+                msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, reply_markup=reply_markup)
+            return msg, None
+        # Если это file_id Telegram
+        elif not str(url_or_file_id).startswith("http"):
             url = await process_telegram_photo(url_or_file_id, bot)
             github_filename = url.split('/')[-1]
             logging.info(f"send_photo_with_download: отправляю фото по url={url}, caption='{caption}'")
             msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
             return msg, github_filename
+        # Если это ссылка http(s)
         else:
             logging.info(f"send_photo_with_download: отправляю фото по url_or_file_id={url_or_file_id}, caption='{caption}'")
             msg = await bot.send_photo(chat_id=chat_id, photo=url_or_file_id, caption=caption, reply_markup=reply_markup)
