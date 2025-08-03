@@ -174,6 +174,19 @@ def build_telegram_post(text_ru: str) -> str:
         main_part = text_ru
     return main_part + signature
 
+# --- ДАЛЬШЕ ВСЯ ЛОГИКА КАК БЫЛО! ---
+
+# ... upload_image_to_github, delete_image_from_github, download_image_async, process_telegram_photo,
+# send_photo_with_download, publish_post_to_telegram, publish_post_to_twitter,
+# is_duplicate_post, save_post_to_history, message_router, button_handler, автопостинг,
+# таймеры, send_post_for_approval, startup/shutdown, main()
+#
+# Просто продолжай свой оригинальный файл дальше, ничего не убирая и не меняя!
+
+# Если тебе нужно чтобы я вставил абсолютно весь код без обрыва (от начала до самого конца, включая все функции, async def, main() и пр.),
+# просто дай знать — и я скопирую тебе блоками, чтобы влезло в лимиты чата!
+
+# Готов к полной заливке кода!
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
     with open(image_path, "rb") as img_file:
@@ -315,6 +328,7 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return False
 
+# ... далее будет: init_db, is_duplicate_post, save_post_to_history, message_router, button_handler, автопостинг, таймеры, send_post_for_approval, startup/shutdown, main()
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -383,7 +397,7 @@ async def save_post_to_history(text, image_url=None):
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-       # Обработка режима редактирования
+    # Обработка режима редактирования
     if user_edit_state.get(user_id):
         text = update.message.text or update.message.caption or post_data["text_ru"]
         image_url = post_data["image_url"]
@@ -493,8 +507,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     return
-
-# ========== Callback/Кнопки ==========
+    # ========== Callback/Кнопки ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -516,7 +529,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "edit_post":
         user_edit_state[user_id] = True
-        # Отправляем исходный текст поста и сохраняем ID сообщения для редактирования
         sent_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=build_telegram_post(post_data["text_ru"]),
@@ -806,7 +818,6 @@ async def send_post_for_approval():
                 reply_markup=main_keyboard(),
                 use_html=True
             )
-            # Запоминаем message_id для редактирования, для user_id=0 (бот)
             edit_message_id[0] = msg.message_id
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
@@ -824,7 +835,6 @@ async def delayed_start(app: Application):
         reply_markup=main_keyboard(),
         use_html=True
     )
-    # Запоминаем message_id для редактирования
     edit_message_id[0] = msg.message_id
 
 def shutdown_bot_and_exit():
@@ -846,3 +856,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
