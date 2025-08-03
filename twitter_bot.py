@@ -148,6 +148,7 @@ def get_twitter_clients():
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
+    # Подпись с ссылкой на сайт и Telegram, лимит 280 символов
     signature = (
         "\nLearn more: https://getaicoin.com/ | Telegram: https://t.me/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
     )
@@ -160,8 +161,9 @@ def build_twitter_post(text_ru: str) -> str:
     return main_part + signature
 
 def build_telegram_post(text_ru: str) -> str:
+    # Подпись с кликабельными ссылками на сайт и Telegram, лимит 1024 символа
     signature = (
-        '\n\nLearn more on <a href="https://getaicoin.com/">website</a> | '
+        '\n\nLearn more on <a href="https://getaicoin.com/">Website</a> | '
         '<a href="https://t.me/AiCoin_ETH">Telegram</a>'
     )
     max_length = 1024
@@ -381,7 +383,7 @@ async def save_post_to_history(text, image_url=None):
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Режим редактирования
+       # Обработка режима редактирования
     if user_edit_state.get(user_id):
         text = update.message.text or update.message.caption or post_data["text_ru"]
         image_url = post_data["image_url"]
@@ -412,11 +414,12 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Сообщение {msg_id} отредактировано успешно")
         except Exception as e:
             logging.error(f"Ошибка редактирования сообщения: {e}")
+            # Если редактирование не удалось, отправим новое сообщение с кнопками и запомним message_id
             msg = await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=build_telegram_post(text), reply_markup=post_choice_keyboard(), parse_mode="HTML")
             edit_message_id[user_id] = msg.message_id
         return
 
-    # Логика «Сделай сам»
+    # Логика «Сделай сам» (ручной режим)
     if user_id in user_self_post:
         state = user_self_post[user_id].get('state')
         if state == 'wait_post':
@@ -513,6 +516,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "edit_post":
         user_edit_state[user_id] = True
+        # Отправляем исходный текст поста и сохраняем ID сообщения для редактирования
         sent_msg = await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=build_telegram_post(post_data["text_ru"]),
@@ -802,6 +806,7 @@ async def send_post_for_approval():
                 reply_markup=main_keyboard(),
                 use_html=True
             )
+            # Запоминаем message_id для редактирования, для user_id=0 (бот)
             edit_message_id[0] = msg.message_id
         except Exception as e:
             logging.error(f"Ошибка при отправке на согласование: {e}")
@@ -819,6 +824,7 @@ async def delayed_start(app: Application):
         reply_markup=main_keyboard(),
         use_html=True
     )
+    # Запоминаем message_id для редактирования
     edit_message_id[0] = msg.message_id
 
 def shutdown_bot_and_exit():
