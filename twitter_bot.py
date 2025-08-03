@@ -193,23 +193,25 @@ async def save_image_and_get_github_url(image_path):
 
 # --- Отправка фото с загрузкой ---
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
-    file_path = None
-    github_url = None
     github_filename = None
     try:
         if not str(url_or_file_id).startswith("http"):
-            # Если file_id, скачиваем и загружаем на GitHub
+            # file_id — скачиваем, загружаем на GitHub, получаем URL
             file_path = await download_image_async(url_or_file_id, True, bot)
-            github_url, github_filename = await save_image_and_get_github_url(file_path)
-            url_or_file_id = github_url
+            url, github_filename = await save_image_and_get_github_url(file_path)
             os.remove(file_path)
-        file_path = await download_image_async(url_or_file_id, False)
-        with open(file_path, "rb") as photo_file:
-            msg = await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, reply_markup=reply_markup)
-        return msg, github_filename
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            if not url:
+                raise Exception("Не удалось получить URL после загрузки на GitHub")
+            # Отправляем фото по URL
+            msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
+            return msg, github_filename
+        else:
+            # Если URL — отправляем напрямую
+            msg = await bot.send_photo(chat_id=chat_id, photo=url_or_file_id, caption=caption, reply_markup=reply_markup)
+            return msg, None
+    except Exception as e:
+        logging.error(f"Ошибка в send_photo_with_download: {e}")
+        raise
 
 # --- Публикация в Telegram ---
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
@@ -343,7 +345,7 @@ async def send_post_for_approval():
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         try:
-            # Если image_url - это file_id, конвертируем в URL
+            # Конвертация file_id в URL если нужно
             if not str(post_data["image_url"]).startswith("http"):
                 file_path = await download_image_async(post_data["image_url"], True, approval_bot)
                 url, filename = await save_image_and_get_github_url(file_path)
