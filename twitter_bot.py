@@ -337,7 +337,8 @@ async def save_post_to_history(text, image_url=None):
         await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
         await db.commit()
     logging.info("Пост сохранён в историю.")
-    async def check_timer():
+    
+async def check_timer():
     while True:
         await asyncio.sleep(0.5)
         if pending_post["active"] and pending_post.get("timer"):
