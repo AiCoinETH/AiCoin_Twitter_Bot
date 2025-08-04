@@ -134,7 +134,6 @@ def get_twitter_clients():
     return client_v2, api_v1
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
-
 def build_twitter_post(text_ru: str) -> str:
     signature = (
         "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
@@ -233,11 +232,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
 
-# =================== НОВАЯ ФУНКЦИЯ ПРЕДПРОСМОТРА ====================
 async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=None):
-    """
-    Отправляет предпросмотр: если фото не удаётся — отправляет текст, всегда с reply_markup.
-    """
     try:
         if image_url:
             try:
@@ -250,7 +245,6 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
     except Exception as e:
         logging.error(f"[safe_preview_post] Ошибка предпросмотра: {e}")
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
-# =====================================================================
 
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
@@ -343,8 +337,7 @@ async def save_post_to_history(text, image_url=None):
         await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
         await db.commit()
     logging.info("Пост сохранён в историю.")
-
-async def check_timer():
+    async def check_timer():
     while True:
         await asyncio.sleep(0.5)
         if pending_post["active"] and pending_post.get("timer"):
@@ -461,8 +454,7 @@ async def schedule_daily_posts():
         to_next_day = (tomorrow - datetime.now()).total_seconds()
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
-
-# --- Главное: обработчики ---
+        # --- Главное: обработчики ---
 
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -549,7 +541,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ====== Кнопки =======
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -586,7 +577,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = info.get("text", "")
         image_url = info.get("image", None)
-        twitter_text = build_twitter_post(text)
         post_data["text_ru"] = text
         if image_url:
             post_data["image_url"] = image_url
@@ -595,6 +585,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["post_id"] += 1
         post_data["is_manual"] = True
         user_self_post.pop(user_id, None)
+        # Удаляем старое сообщение с кнопкой "Завершить", чтобы новое меню гарантированно появилось
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
         try:
             await safe_preview_post(
                 approval_bot,
@@ -623,6 +618,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_url=post_data["image_url"],
             reply_markup=post_choice_keyboard()
         )
+        logging.info("finish_self_post: предпросмотр успешно отправлен")
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
@@ -741,6 +737,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
+# ---- Стартовая функция и основной запуск ----
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
@@ -772,4 +769,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
