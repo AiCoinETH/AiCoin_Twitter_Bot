@@ -448,7 +448,8 @@ async def schedule_daily_posts():
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_self_post.get(user_id, {}).get('state')
-    if state != 'wait_post':
+    # Принимаем сообщения и в wait_post, и в wait_confirm, пока не нажата "Завершить генерацию"
+    if state not in ['wait_post', 'wait_confirm']:
         await approval_bot.send_message(
             chat_id=update.effective_chat.id,
             text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
@@ -465,10 +466,12 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Попробуйте ещё раз.")
             return
 
+    # Нужно хоть что-то
     if not text and not image_url:
         await approval_bot.send_message(chat_id=update.effective_chat.id, text="❗️Пришлите хотя бы текст или фотографию для поста.")
         return
 
+    # Всегда перезаписываем данные (даже если уже был wait_confirm)
     user_self_post[user_id]['text'] = text
     user_self_post[user_id]['image'] = image_url
     user_self_post[user_id]['state'] = 'wait_confirm'
@@ -525,14 +528,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == 'wait_edit':
         await edit_post_message_handler(update, context)
         return
-    if state == 'wait_post':
+    # Исправлено! Теперь можно отправлять сообщения и на стадии wait_confirm
+    if state in ['wait_post', 'wait_confirm']:
         await self_post_message_handler(update, context)
-        return
-    if state == 'wait_confirm':
-        await approval_bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Ожидаю нажатия кнопки 📤 Завершить генерацию поста или ❌ Отмена."
-        )
         return
     await approval_bot.send_message(
         chat_id=update.effective_chat.id,
