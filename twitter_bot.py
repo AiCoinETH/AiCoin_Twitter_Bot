@@ -522,13 +522,18 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             logging.error(f"Ошибка предпросмотра после изменения: {e}")
         return
 
+# --- ВАЖНО: Исправленный обработчик сообщений! ---
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    state = user_self_post.get(user_id, {}).get('state')
+
+    # Фикс: инициализируем self-пост по первому сообщению от юзера
+    if not user_self_post.get(user_id):
+        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
+
+    state = user_self_post[user_id]['state']
     if state == 'wait_edit':
         await edit_post_message_handler(update, context)
         return
-    # Исправлено! Теперь можно отправлять сообщения и на стадии wait_confirm
     if state in ['wait_post', 'wait_confirm']:
         await self_post_message_handler(update, context)
         return
@@ -536,6 +541,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
+
+# --- Остальной код (button_handler и main) не менялся ---
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
