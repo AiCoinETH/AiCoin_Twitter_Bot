@@ -451,7 +451,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     if state != 'wait_post':
         await approval_bot.send_message(
             chat_id=update.effective_chat.id,
-            text="✍️ Чтобы отправить свой пост, сначала нажмите кнопку 'Сделай сам'!"
+            text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
         )
         return
 
@@ -530,7 +530,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await approval_bot.send_message(
         chat_id=update.effective_chat.id,
-        text="✍️ Чтобы отправить свой пост, сначала нажмите кнопку 'Сделай сам'!"
+        text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -550,8 +550,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data
     prev_data.update(post_data)
 
-    # Вот здесь идет полный большой обработчик action из твоего кода:
-    # например:
     if action == "edit_post":
         try:
             await update.callback_query.message.delete()
