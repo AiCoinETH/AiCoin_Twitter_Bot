@@ -568,28 +568,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if action == "finish_self_post":
-        info = user_self_post.get(user_id)
-        if info and info["state"] == "wait_confirm":
-            text = info.get("text", "")
-            image_url = info.get("image", None)
-            twitter_text = build_twitter_post(text)
-            post_data["text_ru"] = text
-            if image_url:
-                post_data["image_url"] = image_url
-            else:
-                post_data["image_url"] = random.choice(test_images)
-            post_data["post_id"] += 1
-            post_data["is_manual"] = True
-            user_self_post.pop(user_id, None)
-            try:
-                if image_url:
-                    await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, image_url, caption=twitter_text, reply_markup=post_choice_keyboard())
-                else:
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=twitter_text, reply_markup=post_choice_keyboard())
-            except Exception as e:
-                logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
-        return
+if action == "finish_self_post":
+    info = user_self_post.get(user_id)
+    if not (info and info["state"] == "wait_confirm"):
+        return  # если не то состояние — просто игнорируем
+    text = info.get("text", "")
+    image_url = info.get("image", None)
+    twitter_text = build_twitter_post(text)
+    post_data["text_ru"] = text
+    if image_url:
+        post_data["image_url"] = image_url
+    else:
+        post_data["image_url"] = random.choice(test_images)
+    post_data["post_id"] += 1
+    post_data["is_manual"] = True
+    user_self_post.pop(user_id, None)
+    try:
+        if image_url:
+            await send_photo_with_download(
+                approval_bot, TELEGRAM_APPROVAL_CHAT_ID,
+                image_url, caption=text, reply_markup=post_choice_keyboard()
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=text, reply_markup=post_choice_keyboard()
+            )
+    except Exception as e:
+        logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+    return
 
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
