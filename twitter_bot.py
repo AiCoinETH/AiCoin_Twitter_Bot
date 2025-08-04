@@ -233,6 +233,25 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         raise
 
+# =================== НОВАЯ ФУНКЦИЯ ПРЕДПРОСМОТРА ====================
+async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=None):
+    """
+    Отправляет предпросмотр: если фото не удаётся — отправляет текст, всегда с reply_markup.
+    """
+    try:
+        if image_url:
+            try:
+                await send_photo_with_download(bot, chat_id, image_url, caption=text, reply_markup=reply_markup)
+            except Exception as e:
+                logging.error(f"[safe_preview_post] Ошибка с фото, fallback на текст: {e}")
+                await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    except Exception as e:
+        logging.error(f"[safe_preview_post] Ошибка предпросмотра: {e}")
+        await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
+# =====================================================================
+
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     logging.info(f"publish_post_to_telegram: chat_id={chat_id}, text='{text}', image_url={image_url}")
@@ -371,11 +390,11 @@ async def send_post_for_approval():
                 url = await process_telegram_photo(post_data["image_url"], approval_bot)
                 post_data["image_url"] = url
             logging.info(f"send_post_for_approval: отправка на согласование image_url={post_data['image_url']}, text_ru='{post_data['text_ru']}'")
-            await send_photo_with_download(
+            await safe_preview_post(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+                post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+                image_url=post_data["image_url"],
                 reply_markup=main_keyboard()
             )
             logging.info("Пост отправлен на согласование.")
@@ -474,18 +493,11 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_self_post[user_id]['state'] = 'wait_confirm'
 
     try:
-        if image_url:
-            await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                image_url,
-                caption=text
-            )
-        else:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Проверь пост. Если всё ок — нажми 📤 Завершить генерацию.",
+        await safe_preview_post(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            text,
+            image_url=image_url,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
                 [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
@@ -508,11 +520,11 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             post_data["image_url"] = image_url
         user_self_post.pop(user_id, None)
         try:
-            await send_photo_with_download(
+            await safe_preview_post(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
-                post_data["image_url"],
-                caption=post_data["text_ru"],
+                post_data["text_ru"],
+                image_url=post_data["image_url"],
                 reply_markup=post_choice_keyboard()
             )
         except Exception as e:
@@ -584,16 +596,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["is_manual"] = True
         user_self_post.pop(user_id, None)
         try:
-            if image_url:
-                await send_photo_with_download(
-                    approval_bot, TELEGRAM_APPROVAL_CHAT_ID,
-                    image_url, caption=text, reply_markup=post_choice_keyboard()
-                )
-            else:
-                await approval_bot.send_message(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                    text=text, reply_markup=post_choice_keyboard()
-                )
+            await safe_preview_post(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                text,
+                image_url=image_url,
+                reply_markup=post_choice_keyboard()
+            )
         except Exception as e:
             logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
         return
@@ -607,8 +616,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
         twitter_text = build_twitter_post(post_data["text_ru"])
-        await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["image_url"], caption=twitter_text)
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите площадку:", reply_markup=post_choice_keyboard())
+        await safe_preview_post(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            twitter_text,
+            image_url=post_data["image_url"],
+            reply_markup=post_choice_keyboard()
+        )
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
@@ -693,11 +707,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = False
-        await send_photo_with_download(
+        await safe_preview_post(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
-            post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            image_url=post_data["image_url"],
             reply_markup=main_keyboard()
         )
         pending_post.update({
@@ -713,11 +727,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = True
-        await send_photo_with_download(
+        await safe_preview_post(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
-            post_data["image_url"],
-            caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+            image_url=post_data["image_url"],
             reply_markup=main_keyboard()
         )
         pending_post.update({
@@ -731,11 +745,11 @@ async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
     asyncio.create_task(check_timer())
-    await send_photo_with_download(
+    await safe_preview_post(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
-        post_data["image_url"],
-        caption=post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+        post_data["text_ru"] + "\n\n" + WELCOME_HASHTAGS,
+        image_url=post_data["image_url"],
         reply_markup=main_keyboard()
     )
 
