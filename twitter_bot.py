@@ -115,8 +115,7 @@ def post_end_keyboard():
         [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
         [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
     ])
-
-def get_twitter_clients():
+    def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
         consumer_secret=TWITTER_API_SECRET,
@@ -134,6 +133,7 @@ def get_twitter_clients():
     return client_v2, api_v1
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+
 def build_twitter_post(text_ru: str) -> str:
     signature = (
         "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
@@ -324,12 +324,14 @@ def publish_post_to_twitter(text, image_url=None):
     except Exception as e:
         pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
-        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."))
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Twitter: {e}\nПроверьте ключи/токены, лимиты публикаций, формат медиа и права доступа."
+        ))
         if github_filename:
             delete_image_from_github(github_filename)
         return False
-
-async def init_db():
+        async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
@@ -361,7 +363,10 @@ async def save_post_to_history(text, image_url=None):
             logging.warning(f"Не удалось получить хеш изображения: {e}")
             image_hash = None
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
+        await db.execute(
+            "INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)",
+            (text, datetime.now().isoformat(), image_hash)
+        )
         await db.commit()
     logging.info("Пост сохранён в историю.")
 
@@ -376,17 +381,36 @@ async def check_timer():
                     telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
                     twitter_text = build_twitter_post(base_text)
                     logging.info("check_timer: Время ожидания истекло, начинаю автопубликацию.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⌛ Время ожидания истекло. Публикую автоматически.")
-                    await publish_post_to_telegram(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"])
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="⌛ Время ожидания истекло. Публикую автоматически."
+                    )
+                    await publish_post_to_telegram(
+                        channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, telegram_text, post_data["image_url"]
+                    )
                     publish_post_to_twitter(twitter_text, post_data["image_url"])
                     logging.info("Автоматическая публикация произведена.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Посты автоматически опубликованы в Telegram и Twitter.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="✅ Посты автоматически опубликованы в Telegram и Twitter."
+                    )
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="Выберите действие:",
+                        reply_markup=post_end_keyboard()
+                    )
                     shutdown_bot_and_exit()
                 except Exception as e:
                     pending_post["active"] = False
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при автопубликации: {e}\nПроверьте ключи, лимиты, права бота, лимиты Twitter/Telegram.")
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Выберите действие:", reply_markup=post_end_keyboard())
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text=f"❌ Ошибка при автопубликации: {e}\nПроверьте ключи, лимиты, права бота, лимиты Twitter/Telegram."
+                    )
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="Выберите действие:",
+                        reply_markup=post_end_keyboard()
+                    )
                     logging.error(f"Ошибка при автопубликации: {e}")
                 pending_post["active"] = False
 
@@ -482,7 +506,6 @@ async def schedule_daily_posts():
         to_next_day = (tomorrow - datetime.now()).total_seconds()
         await asyncio.sleep(to_next_day)
         manual_posts_today = 0
-        # --- Главное: обработчики ---
 
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -567,8 +590,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
-
-# ====== Кнопки =======
+    # ====== Кнопки =======
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
@@ -773,8 +795,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         return
-
-# ---- Стартовая функция и основной запуск ----
+        # ---- Стартовая функция и основной запуск ----
 async def delayed_start(app: Application):
     await init_db()
     asyncio.create_task(schedule_daily_posts())
@@ -806,3 +827,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
