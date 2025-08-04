@@ -209,7 +209,8 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
         raise Exception("Не удалось загрузить фото на GitHub")
     logging.info(f"process_telegram_photo: Получена ссылка на GitHub: {url}")
     return url
-    async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
 
