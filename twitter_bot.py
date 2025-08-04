@@ -528,6 +528,12 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == 'wait_post':
         await self_post_message_handler(update, context)
         return
+    if state == 'wait_confirm':
+        await approval_bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Ожидаю нажатия кнопки 📤 Завершить генерацию поста или ❌ Отмена."
+        )
+        return
     await approval_bot.send_message(
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
