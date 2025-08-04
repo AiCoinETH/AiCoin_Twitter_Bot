@@ -213,11 +213,21 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
+
+    def is_valid_image_url(url):
+        try:
+            resp = requests.head(url, timeout=5)
+            return resp.headers.get('Content-Type', '').startswith('image/')
+        except Exception:
+            return False
+
     try:
+        # Локальный файл, созданный самим ботом (например, из GitHub или Telegram)
         if isinstance(url_or_file_id, str) and url_or_file_id.startswith("images_for_posts/") and os.path.exists(url_or_file_id):
             with open(url_or_file_id, "rb") as img:
                 msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, reply_markup=reply_markup)
             return msg, None
+        # file_id Telegram
         elif not str(url_or_file_id).startswith("http"):
             url = await process_telegram_photo(url_or_file_id, bot)
             github_filename = url.split('/')[-1]
@@ -225,12 +235,29 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
             msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
             return msg, github_filename
         else:
-            logging.info(f"send_photo_with_download: отправляю фото по url_or_file_id={url_or_file_id}, caption='{caption}'")
-            msg = await bot.send_photo(chat_id=chat_id, photo=url_or_file_id, caption=caption, reply_markup=reply_markup)
-            return msg, None
+            # Проверяем, что ссылка действительно на картинку, иначе фолбэк на текст
+            if not is_valid_image_url(url_or_file_id):
+                logging.warning(f"send_photo_with_download: {url_or_file_id} не является валидной картинкой. Фолбэк на текст.")
+                await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+                return None, None
+            try:
+                response = requests.get(url_or_file_id, timeout=10)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                tmp_file.write(response.content)
+                tmp_file.close()
+                with open(tmp_file.name, "rb") as img:
+                    msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, reply_markup=reply_markup)
+                os.remove(tmp_file.name)
+                return msg, None
+            except Exception as e:
+                logging.error(f"Ошибка при скачивании картинки: {e}")
+                await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+                return None, None
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
-        raise
+        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+        return None, None
 
 async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=None):
     try:
@@ -337,7 +364,7 @@ async def save_post_to_history(text, image_url=None):
         await db.execute("INSERT INTO posts (text, timestamp, image_hash) VALUES (?, ?, ?)", (text, datetime.now().isoformat(), image_hash))
         await db.commit()
     logging.info("Пост сохранён в историю.")
-    
+
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -601,6 +628,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         return
 
     if action == "shutdown_bot":
@@ -620,6 +652,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=post_choice_keyboard()
         )
         logging.info("finish_self_post: предпросмотр успешно отправлен")
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
         return
 
     if action in ["post_twitter", "post_telegram", "post_both"]:
