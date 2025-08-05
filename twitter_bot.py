@@ -595,23 +595,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "finish_self_post":
-    info = user_self_post.get(user_id)
-    if not (info and info["state"] == "wait_confirm"):
-        return
-    text = info.get("text", "")
-    image_url = info.get("image", None)
-    post_data["text_ru"] = text
-    if image_url:
-        post_data["image_url"] = image_url
-    else:
-        post_data["image_url"] = random.choice(test_images)
-    post_data["post_id"] += 1
-    post_data["is_manual"] = True
-    user_self_post.pop(user_id, None)
-    try:
-        await update.callback_query.message.delete()
-    except Exception:
-        pass
+        info = user_self_post.get(user_id)
+        if not (info and info["state"] == "wait_confirm"):
+            return
+        text = info.get("text", "")
+        image_url = info.get("image", None)
+        post_data["text_ru"] = text
+        if image_url:
+            post_data["image_url"] = image_url
+        else:
+            post_data["image_url"] = random.choice(test_images)
+        post_data["post_id"] += 1
+        post_data["is_manual"] = True
+        user_self_post.pop(user_id, None)
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
 
     # Всегда логируем!
     logging.info(f"finish_self_post: показываю предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
