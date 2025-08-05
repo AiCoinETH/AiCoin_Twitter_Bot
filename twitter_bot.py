@@ -481,10 +481,12 @@ async def schedule_daily_posts():
         manual_posts_today = 0
 
 # --- Self post / редактирование / роутер сообщений ---
+SESSION_KEY = "self_approval"  # Всегда одна сессия на approval-чат!
+
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = user_self_post.get(user_id, {}).get('state')
-    logging.info(f"[self_post_message_handler] user_id={user_id} state={state}")
+    key = SESSION_KEY
+    state = user_self_post.get(key, {}).get('state')
+    logging.info(f"[self_post_message_handler] key={key} state={state}")
     if state not in ['wait_post', 'wait_confirm']:
         await approval_bot.send_message(
             chat_id=update.effective_chat.id,
@@ -503,16 +505,16 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             return
 
     if not text and not image_url:
-        logging.warning(f"[self_post_message_handler] Не получен текст или фото от user_id={user_id}")
+        logging.warning(f"[self_post_message_handler] Не получен текст или фото")
         await approval_bot.send_message(chat_id=update.effective_chat.id, text="❗️Пришлите хотя бы текст или фотографию для поста.")
         return
 
-    user_self_post[user_id]['text'] = text
-    user_self_post[user_id]['image'] = image_url
-    user_self_post[user_id]['state'] = 'wait_confirm'
+    user_self_post[key]['text'] = text
+    user_self_post[key]['image'] = image_url
+    user_self_post[key]['state'] = 'wait_confirm'
 
     try:
-        logging.info(f"[self_post_message_handler] Отправляем предпросмотр self-поста для user_id={user_id}, text={text[:40]}..., image_url={image_url}")
+        logging.info(f"[self_post_message_handler] Отправляем предпросмотр self-поста, text={text[:40]}..., image_url={image_url}")
         await safe_preview_post(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
@@ -528,8 +530,8 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр поста. Попробуйте снова.")
 
 async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in user_self_post and user_self_post[user_id]['state'] == 'wait_edit':
+    key = SESSION_KEY
+    if key in user_self_post and user_self_post[key]['state'] == 'wait_edit':
         text = update.message.text or update.message.caption or None
         image_url = None
         if update.message.photo:
@@ -538,7 +540,7 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             post_data["text_ru"] = text
         if image_url:
             post_data["image_url"] = image_url
-        user_self_post.pop(user_id, None)
+        user_self_post.pop(key, None)
         try:
             await safe_preview_post(
                 approval_bot,
@@ -551,11 +553,11 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             pass
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not user_self_post.get(user_id):
-        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
+    key = SESSION_KEY
+    if not user_self_post.get(key):
+        user_self_post[key] = {'text': '', 'image': None, 'state': 'wait_post'}
 
-    state = user_self_post[user_id]['state']
+    state = user_self_post[key]['state']
     if state == 'wait_edit':
         await edit_post_message_handler(update, context)
         return
@@ -567,10 +569,10 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
 
-# ...остальной код обработчиков кнопок и запуска main (как в твоем шаблоне выше)...
 # ==== НАЧАЛО button_handler ====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
+    key = SESSION_KEY
     try:
         await update.callback_query.answer()
     except Exception as e:
@@ -593,7 +595,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.delete()
         except Exception:
             pass
-        user_self_post[user_id] = {'state': 'wait_edit'}
+        user_self_post[key] = {'state': 'wait_edit'}
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении).",
@@ -602,9 +604,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "finish_self_post":
-        info = user_self_post.get(user_id)
+        info = user_self_post.get(key)
         if not (info and info["state"] == "wait_confirm"):
-            logging.warning(f"[button_handler] Некорректный вызов finish_self_post от user_id={user_id}")
+            logging.warning(f"[button_handler] Некорректный вызов finish_self_post")
             return
         text = info.get("text", "")
         image_url = info.get("image", None)
@@ -615,7 +617,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
         post_data["is_manual"] = True
-        user_self_post.pop(user_id, None)
+        user_self_post.pop(key, None)
         try:
             await update.callback_query.message.delete()
         except Exception:
@@ -699,7 +701,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.delete()
         except Exception:
             pass
-        user_self_post[user_id] = {'text': '', 'image': None, 'state': 'wait_post'}
+        user_self_post[key] = {'text': '', 'image': None, 'state': 'wait_post'}
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.")
         return
 
@@ -708,7 +710,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.delete()
         except Exception:
             pass
-        user_self_post.pop(user_id, None)
+        user_self_post.pop(key, None)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=main_keyboard())
         return
 
