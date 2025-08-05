@@ -595,39 +595,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "finish_self_post":
-        info = user_self_post.get(user_id)
-        if not (info and info["state"] == "wait_confirm"):
-            return
-        text = info.get("text", "")
-        image_url = info.get("image", None)
-        post_data["text_ru"] = text
-        if image_url:
-            post_data["image_url"] = image_url
-        else:
-            post_data["image_url"] = random.choice(test_images)
-        post_data["post_id"] += 1
-        post_data["is_manual"] = True
-        user_self_post.pop(user_id, None)
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-        try:
-            await safe_preview_post(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                text,
-                image_url=image_url,
-                reply_markup=post_choice_keyboard()
-            )
-        except Exception as e:
-            logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
-        pending_post.update({
-            "active": True,
-            "timer": datetime.now(),
-            "timeout": TIMER_PUBLISH_DEFAULT
-        })
+    info = user_self_post.get(user_id)
+    if not (info and info["state"] == "wait_confirm"):
         return
+    text = info.get("text", "")
+    image_url = info.get("image", None)
+    post_data["text_ru"] = text
+    if image_url:
+        post_data["image_url"] = image_url
+    else:
+        post_data["image_url"] = random.choice(test_images)
+    post_data["post_id"] += 1
+    post_data["is_manual"] = True
+    user_self_post.pop(user_id, None)
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        pass
+
+    # Всегда логируем!
+    logging.info(f"finish_self_post: показываю предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
+
+    try:
+        await safe_preview_post(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            post_data["text_ru"],
+            image_url=post_data["image_url"],
+            reply_markup=post_choice_keyboard()
+        )
+    except Exception as e:
+        logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+
+    pending_post.update({
+        "active": True,
+        "timer": datetime.now(),
+        "timeout": TIMER_PUBLISH_DEFAULT
+    })
+    return
 
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
