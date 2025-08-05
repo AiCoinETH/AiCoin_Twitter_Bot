@@ -481,7 +481,7 @@ async def schedule_daily_posts():
         manual_posts_today = 0
 
 # --- Self post / редактирование / роутер сообщений ---
-SESSION_KEY = "self_approval"  # Всегда одна сессия на approval-чат!
+SESSION_KEY = "self_approval"
 
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = SESSION_KEY
@@ -531,6 +531,29 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = SESSION_KEY
+    # Если reply на сообщение бота (редактирование по reply)
+    if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
+        text = update.message.text or update.message.caption or None
+        image_url = None
+        if update.message.photo:
+            image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+        if text:
+            post_data["text_ru"] = text
+        if image_url:
+            post_data["image_url"] = image_url
+        try:
+            await safe_preview_post(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                post_data["text_ru"],
+                image_url=post_data["image_url"],
+                reply_markup=post_choice_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
+    # Стандартное редактирование (через кнопку "Изменить")
     if key in user_self_post and user_self_post[key]['state'] == 'wait_edit':
         text = update.message.text or update.message.caption or None
         image_url = None
@@ -554,6 +577,11 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = SESSION_KEY
+    # Если reply на сообщение бота в чате согласования — воспринимать как команду редактирования
+    if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
+        await edit_post_message_handler(update, context)
+        return
+
     if not user_self_post.get(key):
         user_self_post[key] = {'text': '', 'image': None, 'state': 'wait_post'}
 
@@ -598,7 +626,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_self_post[key] = {'state': 'wait_edit'}
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении).",
+            text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении), либо просто отправь новое сообщение в reply на текущий предпросмотр.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
         )
         return
