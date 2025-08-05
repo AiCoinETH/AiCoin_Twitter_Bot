@@ -146,7 +146,6 @@ def build_twitter_post(text_ru: str) -> str:
     else:
         main_part = text_ru
     return main_part + signature
-
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
     with open(image_path, "rb") as img_file:
@@ -211,7 +210,6 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     logging.info(f"process_telegram_photo: Получена ссылка на GitHub: {url}")
     return url
 
-# ---- Дальше? ----
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
@@ -360,7 +358,6 @@ def reset_timer(timeout=None):
     pending_post["timer"] = datetime.now()
     if timeout:
         pending_post["timeout"] = timeout
-
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -613,26 +610,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Всегда логируем!
-    logging.info(f"finish_self_post: показываю предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
+        # Всегда логируем!
+        logging.info(f"finish_self_post: показываю предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
 
-    try:
-        await safe_preview_post(
-            approval_bot,
-            TELEGRAM_APPROVAL_CHAT_ID,
-            post_data["text_ru"],
-            image_url=post_data["image_url"],
-            reply_markup=post_choice_keyboard()
-        )
-    except Exception as e:
-        logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+        try:
+            await safe_preview_post(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                post_data["text_ru"],
+                image_url=post_data["image_url"],
+                reply_markup=post_choice_keyboard()
+            )
+        except Exception as e:
+            logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
 
-    pending_post.update({
-        "active": True,
-        "timer": datetime.now(),
-        "timeout": TIMER_PUBLISH_DEFAULT
-    })
-    return
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
+        return
 
     if action == "shutdown_bot":
         logging.info("Останавливаю бота по кнопке!")
