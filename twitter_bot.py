@@ -146,6 +146,7 @@ def build_twitter_post(text_ru: str) -> str:
     else:
         main_part = text_ru
     return main_part + signature
+
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
     with open(image_path, "rb") as img_file:
@@ -213,14 +214,12 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     github_filename = None
     logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
-
     def is_valid_image_url(url):
         try:
             resp = requests.head(url, timeout=5)
             return resp.headers.get('Content-Type', '').startswith('image/')
         except Exception:
             return False
-
     try:
         if isinstance(url_or_file_id, str) and url_or_file_id.startswith("images_for_posts/") and os.path.exists(url_or_file_id):
             with open(url_or_file_id, "rb") as img:
@@ -254,6 +253,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         return None, None
 
 async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=None):
+    logging.info(f"[safe_preview_post] Запрос предпросмотра: text='{text[:40]}...', image_url={image_url}")
     try:
         if image_url:
             try:
@@ -358,6 +358,7 @@ def reset_timer(timeout=None):
     pending_post["timer"] = datetime.now()
     if timeout:
         pending_post["timeout"] = timeout
+
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -483,6 +484,7 @@ async def schedule_daily_posts():
 async def self_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_self_post.get(user_id, {}).get('state')
+    logging.info(f"[self_post_message_handler] user_id={user_id} state={state}")
     if state not in ['wait_post', 'wait_confirm']:
         await approval_bot.send_message(
             chat_id=update.effective_chat.id,
@@ -496,10 +498,12 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
         except Exception as e:
+            logging.error(f"[self_post_message_handler] Ошибка обработки фото: {e}")
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Попробуйте ещё раз.")
             return
 
     if not text and not image_url:
+        logging.warning(f"[self_post_message_handler] Не получен текст или фото от user_id={user_id}")
         await approval_bot.send_message(chat_id=update.effective_chat.id, text="❗️Пришлите хотя бы текст или фотографию для поста.")
         return
 
@@ -508,6 +512,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
     user_self_post[user_id]['state'] = 'wait_confirm'
 
     try:
+        logging.info(f"[self_post_message_handler] Отправляем предпросмотр self-поста для user_id={user_id}, text={text[:40]}..., image_url={image_url}")
         await safe_preview_post(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
@@ -518,7 +523,8 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
                 [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
             ])
         )
-    except Exception:
+    except Exception as e:
+        logging.error(f"[self_post_message_handler] Ошибка предпросмотра self-поста: {e}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр поста. Попробуйте снова.")
 
 async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -560,6 +566,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
+
+# ...остальной код обработчиков кнопок и запуска main (как в твоем шаблоне выше)...
 # ==== НАЧАЛО button_handler ====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
@@ -572,11 +580,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
+        logging.info(f"User {user_id} слишком часто нажимает кнопки")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⏳ Подождите немного...", reply_markup=main_keyboard())
         return
     last_action_time[user_id] = now
     action = update.callback_query.data
     prev_data.update(post_data)
+    logging.info(f"[button_handler] action={action} user_id={user_id}")
 
     if action == "edit_post":
         try:
@@ -594,6 +604,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "finish_self_post":
         info = user_self_post.get(user_id)
         if not (info and info["state"] == "wait_confirm"):
+            logging.warning(f"[button_handler] Некорректный вызов finish_self_post от user_id={user_id}")
             return
         text = info.get("text", "")
         image_url = info.get("image", None)
@@ -610,8 +621,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Всегда логируем!
-        logging.info(f"finish_self_post: показываю предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
+        logging.info(f"[button_handler] finish_self_post: предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
 
         try:
             await safe_preview_post(
@@ -622,7 +632,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=post_choice_keyboard()
             )
         except Exception as e:
-            logging.error(f"Ошибка предпросмотра после завершения 'Сделай сам': {e}")
+            logging.error(f"[button_handler] Ошибка предпросмотра после finish_self_post: {e}")
 
         pending_post.update({
             "active": True,
@@ -785,6 +795,7 @@ async def delayed_start(app: Application):
         image_url=post_data["image_url"],
         reply_markup=main_keyboard()
     )
+    logging.info("Бот успешно запущен и готов принимать сообщения")
 
 def shutdown_bot_and_exit():
     try:
