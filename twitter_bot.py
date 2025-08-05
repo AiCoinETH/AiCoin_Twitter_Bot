@@ -136,9 +136,7 @@ def get_twitter_clients():
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
 def build_twitter_post(text_ru: str) -> str:
-    signature = (
-        "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
-    )
+    signature = "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
     max_length = 280
     reserve = max_length - len(signature)
     if len(text_ru) > reserve:
@@ -146,6 +144,10 @@ def build_twitter_post(text_ru: str) -> str:
     else:
         main_part = text_ru
     return main_part + signature
+
+def build_telegram_post(text_ru: str) -> str:
+    signature = "\n\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH"
+    return text_ru.strip() + signature
 
 def upload_image_to_github(image_path, filename):
     logging.info(f"upload_image_to_github: image_path={image_path}, filename={filename}")
@@ -267,56 +269,13 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
         logging.error(f"[safe_preview_post] Ошибка предпросмотра: {e}")
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
 
-async def publish_post_to_telegram(bot, chat_id, text, image_url):
-    github_filename = None
-    try:
-        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
-        if github_filename:
-            delete_image_from_github(github_filename)
-        return True
-    except Exception as e:
-        logging.error(f"Ошибка при публикации в Telegram: {e}")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Telegram: {e}")
-        if github_filename:
-            delete_image_from_github(github_filename)
-        return False
-
-def publish_post_to_twitter(text, image_url=None):
-    github_filename = None
-    try:
-        media_ids = None
-        file_path = None
-        if image_url:
-            if not str(image_url).startswith("http"):
-                logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
-                return False
-            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp.write(r.content)
-            tmp.close()
-            file_path = tmp.name
-
-        if file_path:
-            media = twitter_api_v1.media_upload(file_path)
-            media_ids = [media.media_id_string]
-            os.remove(file_path)
-
-        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
-        if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
-            github_filename = image_url.split('/')[-1]
-            delete_image_from_github(github_filename)
-        return True
-    except Exception as e:
-        pending_post["active"] = False
-        logging.error(f"Ошибка публикации в Twitter: {e}")
-        asyncio.create_task(approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Twitter: {e}"
-        ))
-        if github_filename:
-            delete_image_from_github(github_filename)
-        return False
+# --------- Новый предпросмотр для self-post/edit: две версии ---------
+async def preview_dual(bot, chat_id, text, image_url=None, reply_markup=None):
+    preview = (
+        f"<b>Telegram:</b>\n{build_telegram_post(text)}\n\n"
+        f"<b>Twitter:</b>\n{build_twitter_post(text)}"
+    )
+    await safe_preview_post(bot, chat_id, preview, image_url=image_url, reply_markup=reply_markup)
 
 # --- DB, SCHEDULER & TIMER ---
 async def init_db():
@@ -367,7 +326,7 @@ async def check_timer():
             if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                 try:
                     base_text = post_data["text_ru"].strip()
-                    telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
+                    telegram_text = build_telegram_post(base_text)
                     twitter_text = build_twitter_post(base_text)
                     await approval_bot.send_message(
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -515,7 +474,7 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
     try:
         logging.info(f"[self_post_message_handler] Отправляем предпросмотр self-поста, text={text[:40]}..., image_url={image_url}")
-        await safe_preview_post(
+        await preview_dual(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
             text,
@@ -542,7 +501,7 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
         if image_url:
             post_data["image_url"] = image_url
         try:
-            await safe_preview_post(
+            await preview_dual(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["text_ru"],
@@ -565,7 +524,7 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             post_data["image_url"] = image_url
         user_self_post.pop(key, None)
         try:
-            await safe_preview_post(
+            await preview_dual(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["text_ru"],
@@ -654,7 +613,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"[button_handler] finish_self_post: предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
 
         try:
-            await safe_preview_post(
+            await preview_dual(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
                 post_data["text_ru"],
@@ -679,11 +638,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "approve":
-        twitter_text = build_twitter_post(post_data["text_ru"])
-        await safe_preview_post(
+        await preview_dual(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
-            twitter_text,
+            post_data["text_ru"],
             image_url=post_data["image_url"],
             reply_markup=post_choice_keyboard()
         )
@@ -705,7 +663,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         base_text = post_data["text_ru"].strip()
-        telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
+        telegram_text = build_telegram_post(base_text)
         twitter_text = build_twitter_post(base_text)
 
         telegram_success = False
@@ -819,6 +777,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 # ==== КОНЕЦ button_handler ====
+
+def publish_post_to_twitter(text, image_url=None):
+    github_filename = None
+    try:
+        media_ids = None
+        file_path = None
+        if image_url:
+            if not str(image_url).startswith("http"):
+                logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
+                return False
+            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.write(r.content)
+            tmp.close()
+            file_path = tmp.name
+
+        if file_path:
+            media = twitter_api_v1.media_upload(file_path)
+            media_ids = [media.media_id_string]
+            os.remove(file_path)
+
+        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
+            github_filename = image_url.split('/')[-1]
+            delete_image_from_github(github_filename)
+        return True
+    except Exception as e:
+        pending_post["active"] = False
+        logging.error(f"Ошибка публикации в Twitter: {e}")
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Twitter: {e}"
+        ))
+        if github_filename:
+            delete_image_from_github(github_filename)
+        return False
+
+async def publish_post_to_telegram(bot, chat_id, text, image_url):
+    github_filename = None
+    try:
+        msg, github_filename = await send_photo_with_download(bot, chat_id, image_url, caption=text)
+        if github_filename:
+            delete_image_from_github(github_filename)
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при публикации в Telegram: {e}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Telegram: {e}")
+        if github_filename:
+            delete_image_from_github(github_filename)
+        return False
 
 # --- Запуск всего приложения ---
 
