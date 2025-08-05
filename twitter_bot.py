@@ -695,7 +695,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
+    # === КЛЮЧЕВОЙ ФИКС: ГАРАНТИРУЕМ pending_post["active"] = True ===
     if action in ["post_twitter", "post_telegram", "post_both"]:
+        # фикс: активируем флаг перед публикацией всегда
+        pending_post.update({
+            "active": True,
+            "timer": datetime.now(),
+            "timeout": TIMER_PUBLISH_DEFAULT
+        })
+
         base_text = post_data["text_ru"].strip()
         telegram_text = f"{base_text}\n\nLearn more: https://getaicoin.com/"
         twitter_text = build_twitter_post(base_text)
