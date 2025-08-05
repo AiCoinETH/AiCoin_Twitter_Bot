@@ -563,7 +563,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
-    async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==== НАЧАЛО button_handler ====
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     try:
         await update.callback_query.answer()
@@ -767,6 +768,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         return
+# ==== КОНЕЦ button_handler ====
 
 # --- Запуск всего приложения ---
 
