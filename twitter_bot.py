@@ -268,7 +268,6 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
     except Exception as e:
         logging.error(f"[safe_preview_post] Ошибка предпросмотра: {e}")
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
-
 # --------- Новый предпросмотр для self-post/edit: две версии ---------
 async def preview_dual(bot, chat_id, text, image_url=None, reply_markup=None):
     preview = (
@@ -555,7 +554,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
-
 # ==== НАЧАЛО button_handler ====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
@@ -828,7 +826,6 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
         if github_filename:
             delete_image_from_github(github_filename)
         return False
-
 # --- Запуск всего приложения ---
 
 async def delayed_start(app: Application):
@@ -846,7 +843,10 @@ async def delayed_start(app: Application):
 
 def shutdown_bot_and_exit():
     try:
-        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"))
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"
+        ))
     except Exception:
         pass
     import time; time.sleep(2)
