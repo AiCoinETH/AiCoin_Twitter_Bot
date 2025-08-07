@@ -742,44 +742,77 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         return
-
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
+    file_path = None
     try:
         media_ids = None
-        file_path = None
+
+        # --- Проверка и скачивание картинки ---
         if image_url:
             if not str(image_url).startswith("http"):
-                logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
+                logging.error("Telegram file_id не поддерживается напрямую для публикации в Twitter.")
                 return False
-            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp.write(r.content)
-            tmp.close()
-            file_path = tmp.name
+            try:
+                response = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                response.raise_for_status()
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                tmp.write(response.content)
+                tmp.close()
+                file_path = tmp.name
+            except Exception as e:
+                logging.error(f"Ошибка при скачивании картинки: {e}")
+                return False
 
-        if file_path:
-            media = twitter_api_v1.media_upload(file_path)
-            media_ids = [media.media_id_string]
-            os.remove(file_path)
+            # --- Загрузка в Twitter через Tweepy v1 ---
+            try:
+                media = twitter_api_v1.media_upload(file_path)
+                media_ids = [media.media_id_string]
+            except Exception as e:
+                logging.error(f"Ошибка загрузки медиа в Twitter: {e}")
+                return False
+            finally:
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
 
-        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        # --- Публикация твита через Tweepy v2 ---
+        try:
+            twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        except Exception as e:
+            logging.error(f"Ошибка публикации твита: {e}")
+            return False
+
+        # --- Удаление картинки с GitHub (если была) ---
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
-            delete_image_from_github(github_filename)
+            try:
+                delete_image_from_github(github_filename)
+            except Exception as e:
+                logging.warning(f"Ошибка удаления картинки с GitHub: {e}")
+
         return True
+
     except Exception as e:
         pending_post["active"] = False
-        logging.error(f"Ошибка публикации в Twitter: {e}")
+        logging.error(f"Ошибка публикации в Twitter (общая): {e}")
         asyncio.create_task(approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"❌ Ошибка при публикации в Twitter: {e}"
         ))
+        # На всякий случай ещё раз пробуем удалить файл
+        if file_path:
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
         if github_filename:
-            delete_image_from_github(github_filename)
+            try:
+                delete_image_from_github(github_filename)
+            except Exception:
+                pass
         return False
-
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     try:
