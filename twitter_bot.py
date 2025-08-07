@@ -52,7 +52,7 @@ approval_lock = asyncio.Lock()
 DB_FILE = "post_history.db"
 scheduled_posts_per_day = 6
 manual_posts_today = 0
-TIMER_PUBLISH_DEFAULT = 180
+TIMER_PUBLISH_DEFAULT = 900  # 15 минут для автопостинга!
 TIMER_PUBLISH_EXTEND = 900
 
 WELCOME_HASHTAGS = "#AiCoin #AI #crypto #тренды #бот #новости"
@@ -97,7 +97,8 @@ def post_choice_keyboard():
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 def post_end_keyboard():
     return InlineKeyboardMarkup([
@@ -105,10 +106,11 @@ def post_end_keyboard():
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
+        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
-# --- Twitter и GitHub
+# --- Twitter и GitHub ---
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -242,11 +244,11 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
         if image_url:
             try:
                 await send_photo_with_download(bot, chat_id, image_url, caption=text, reply_markup=reply_markup)
-            except Exception as e:
+            except Exception:
                 await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         else:
             await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    except Exception as e:
+    except Exception:
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
 
 async def preview_dual(bot, chat_id, text, image_url=None, reply_markup=None):
@@ -291,6 +293,7 @@ async def save_post_to_history(text, image_url=None):
             (text, datetime.now().isoformat(), image_hash)
         )
         await db.commit()
+
 def reset_timer(timeout=None):
     pending_post["timer"] = datetime.now()
     if timeout:
@@ -336,7 +339,6 @@ async def check_timer():
                         reply_markup=post_end_keyboard()
                     )
                 pending_post["active"] = False
-
 def generate_random_schedule(posts_per_day=6, day_start_hour=6, day_end_hour=23, min_offset=-20, max_offset=20):
     if day_end_hour > 23:
         day_end_hour = 23
@@ -455,7 +457,8 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             image_url=image_url,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📤 Завершить генерацию поста", callback_data="finish_self_post")],
-                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
+                [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
             ])
         )
     except Exception:
@@ -532,8 +535,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
     except Exception as e:
         logging.warning(f"Не удалось ответить на callback_query: {e}")
+
+    # ОТКЛЮЧАЕМ авто-выключение, если была любая кнопка!
     if pending_post["active"]:
+        # Если была активная публикация, сбрасываем таймер на максимальное значение
         reset_timer(TIMER_PUBLISH_EXTEND)
+    else:
+        pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+
     user_id = update.effective_user.id
     now = datetime.now()
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 3:
@@ -546,15 +555,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"[button_handler] action={action} user_id={user_id}")
 
     if action == "edit_post":
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
+        try: await update.callback_query.message.delete()
+        except Exception: pass
         user_self_post[key] = {'state': 'wait_edit'}
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✏️ Пришли новый текст и/или фото для редактирования поста (в одном сообщении), либо просто отправь новое сообщение в reply на текущий предпросмотр.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
+                [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+            ])
         )
         return
 
@@ -573,13 +583,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["post_id"] += 1
         post_data["is_manual"] = True
         user_self_post.pop(key, None)
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-
+        try: await update.callback_query.message.delete()
+        except Exception: pass
         logging.info(f"[button_handler] finish_self_post: предпросмотр self-поста: text='{post_data['text_ru'][:60]}...', image_url={post_data['image_url']}")
-
         try:
             await preview_dual(
                 approval_bot,
@@ -590,7 +596,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logging.error(f"[button_handler] Ошибка предпросмотра после finish_self_post: {e}")
-
         pending_post.update({
             "active": True,
             "timer": datetime.now(),
@@ -657,19 +662,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "self_post":
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
+        try: await update.callback_query.message.delete()
+        except Exception: pass
         user_self_post[key] = {'text': '', 'image': None, 'state': 'wait_post'}
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✍️ Напиши свой текст поста и (опционально) приложи фото — всё одним сообщением. После этого появится предпросмотр с кнопками.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+        ]))
         return
 
     if action == "cancel_to_main":
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
+        try: await update.callback_query.message.delete()
+        except Exception: pass
         user_self_post.pop(key, None)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=main_keyboard())
         return
@@ -743,6 +746,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
+# --- Публикация в Twitter ---
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
@@ -780,6 +784,7 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return False
 
+# --- Публикация в Telegram ---
 async def publish_post_to_telegram(bot, chat_id, text, image_url):
     github_filename = None
     try:
