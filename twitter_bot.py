@@ -268,7 +268,7 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
     except Exception as e:
         logging.error(f"[safe_preview_post] Ошибка предпросмотра: {e}")
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text, reply_markup=reply_markup)
-# --------- Новый предпросмотр для self-post/edit: две версии ---------
+
 async def preview_dual(bot, chat_id, text, image_url=None, reply_markup=None):
     preview = (
         f"<b>Telegram:</b>\n{build_telegram_post(text)}\n\n"
@@ -489,7 +489,6 @@ async def self_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = SESSION_KEY
-    # Если reply на сообщение бота (редактирование по reply)
     if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
         text = update.message.text or update.message.caption or None
         image_url = None
@@ -511,7 +510,6 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
             pass
         return
 
-    # Стандартное редактирование (через кнопку "Изменить")
     if key in user_self_post and user_self_post[key]['state'] == 'wait_edit':
         text = update.message.text or update.message.caption or None
         image_url = None
@@ -535,7 +533,6 @@ async def edit_post_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = SESSION_KEY
-    # Если reply на сообщение бота в чате согласования — воспринимать как команду редактирования
     if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
         await edit_post_message_handler(update, context)
         return
@@ -554,7 +551,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text="✍️ Чтобы отправить свой пост, сначала нажми кнопку 'Сделай сам'!"
     )
-# ==== НАЧАЛО button_handler ====
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_action_time, prev_data, manual_posts_today
     key = SESSION_KEY
@@ -651,9 +648,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
-    # === КЛЮЧЕВОЙ ФИКС: ГАРАНТИРУЕМ pending_post["active"] = True ===
     if action in ["post_twitter", "post_telegram", "post_both"]:
-        # фикс: активируем флаг перед публикацией всегда
         pending_post.update({
             "active": True,
             "timer": datetime.now(),
@@ -774,7 +769,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timeout": TIMER_PUBLISH_DEFAULT
         })
         return
-# ==== КОНЕЦ button_handler ====
 
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
@@ -826,7 +820,6 @@ async def publish_post_to_telegram(bot, chat_id, text, image_url):
         if github_filename:
             delete_image_from_github(github_filename)
         return False
-# --- Запуск всего приложения ---
 
 async def delayed_start(app: Application):
     await init_db()
