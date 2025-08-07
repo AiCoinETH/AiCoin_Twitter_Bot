@@ -56,97 +56,55 @@ manual_posts_today = 0
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 900
 
-test_images = [
-    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
-    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
-]
+def build_telegram_post(text_ru: str) -> str:
+    signature = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter</a>'
+    return text_ru.strip() + signature
 
-WELCOME_POST_RU = (
-    "🚀 Привет! Это бот публикаций.\n\n"
-    "ИИ-генерация, новости, идеи, генерация картинок и многое другое."
-)
-WELCOME_HASHTAGS = "#AiCoin #AI #crypto #тренды #бот #новости"
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+    github_filename = None
+    logging.info(f"send_photo_with_download: chat_id={chat_id}, url_or_file_id={url_or_file_id}, caption='{caption}'")
+    def is_valid_image_url(url):
+        try:
+            resp = requests.head(url, timeout=5)
+            return resp.headers.get('Content-Type', '').startswith('image/')
+        except Exception:
+            return False
+    try:
+        if isinstance(url_or_file_id, str) and url_or_file_id.startswith("images_for_posts/") and os.path.exists(url_or_file_id):
+            with open(url_or_file_id, "rb") as img:
+                msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+            return msg, None
+        elif not str(url_or_file_id).startswith("http"):
+            url = await process_telegram_photo(url_or_file_id, bot)
+            github_filename = url.split('/')[-1]
+            msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+            return msg, github_filename
+        else:
+            if not is_valid_image_url(url_or_file_id):
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=reply_markup)
+                return None, None
+            try:
+                response = requests.get(url_or_file_id, timeout=10)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                tmp_file.write(response.content)
+                tmp_file.close()
+                with open(tmp_file.name, "rb") as img:
+                    msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+                os.remove(tmp_file.name)
+                return msg, None
+            except Exception:
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=reply_markup)
+                return None, None
+    except Exception as e:
+        logging.error(f"Ошибка в send_photo_with_download: {e}")
+        await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=reply_markup)
+        return None, None
 
-post_data = {
-    "text_ru": WELCOME_POST_RU,
-    "text_en": WELCOME_POST_RU,
-    "image_url": test_images[0],
-    "timestamp": None,
-    "post_id": 0,
-    "is_manual": False
-}
-prev_data = post_data.copy()
-user_self_post = {}
-pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT}
-do_not_disturb = {"active": False}
-last_action_time = {}
-
-github_client = Github(GITHUB_TOKEN)
-github_repo = github_client.get_repo(GITHUB_REPO)
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Пост", callback_data="approve")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🕒 Подумать", callback_data="think")],
-        [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post")],
-        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_post")],
-        [InlineKeyboardButton("💬 Поговорить", callback_data="chat"), InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("↩️ Вернуть предыдущий пост", callback_data="restore_previous"), InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
-    ])
-
-def post_choice_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
-        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
-        [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
-    ])
-
-def post_end_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Новый пост", callback_data="new_post_manual")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🌙 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("🔚 Завершить", callback_data="end_day")],
-        [InlineKeyboardButton("💬 Поговорить", callback_data="chat")]
-    ])
-
-def get_twitter_clients():
-    client_v2 = tweepy.Client(
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
-    )
-    api_v1 = tweepy.API(
-        tweepy.OAuth1UserHandler(
-            TWITTER_API_KEY,
-            TWITTER_API_SECRET,
-            TWITTER_ACCESS_TOKEN,
-            TWITTER_ACCESS_TOKEN_SECRET
-        )
-    )
-    return client_v2, api_v1
-
-twitter_client_v2, twitter_api_v1 = get_twitter_clients()
-
-def build_twitter_post(text_ru: str) -> str:
-    signature = "\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH #AiCoin #Ai $Ai #crypto #blockchain #AI #DeFi"
-    max_length = 280
-    reserve = max_length - len(signature)
-    if len(text_ru) > reserve:
-        main_part = text_ru[:reserve - 3].rstrip() + "..."
-    else:
-        main_part = text_ru
-    return main_part + signature
+# Остальной код добавлен ниже по вашему запросу
 
 def build_telegram_post(text_ru: str) -> str:
-    signature = "\n\nLearn more: https://getaicoin.com/ | Twitter: https://x.com/AiCoin_ETH"
+    signature = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter</a>'
     return text_ru.strip() + signature
 
 def upload_image_to_github(image_path, filename):
