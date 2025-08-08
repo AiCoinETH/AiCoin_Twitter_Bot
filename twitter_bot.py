@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
+import io
+import re
 import asyncio
 import hashlib
 import logging
@@ -8,6 +10,8 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime, timedelta, time as dt_time
+from unicodedata import normalize
+from zoneinfo import ZoneInfo
 
 import tweepy
 import requests
@@ -60,24 +64,61 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 approval_lock = asyncio.Lock()
 
 DB_FILE = "post_history.db"
+TZ = ZoneInfo("Europe/Kyiv")
 
 # расписание/таймеры
 scheduled_posts_per_day = 6
 manual_posts_today = 0
-TIMER_PUBLISH_DEFAULT = 900   # 15 минут — авто режим (ожидание решения)
-TIMER_PUBLISH_EXTEND  = 900   # продление при действиях
+TIMER_PUBLISH_DEFAULT = 180   # 3 минуты — автопост (если ничего не нажали)
+TIMER_PUBLISH_EXTEND  = 180   # не используется как продление авто— мы авто отменяем при любом клике
 AUTO_SHUTDOWN_AFTER_SECONDS = 600  # 10 минут после последней кнопки (ручной режим)
 
 # предпросмотр ссылок в Telegram — отключаем
 DISABLE_WEB_PREVIEW = True
 
 # -----------------------------------------------------------------------------
-# ЗАГЛУШКА НА СТАРТЕ (≈200 символов) + картинка
+# ЛИМИТЫ ДЛИНЫ ТЕКСТА
+# -----------------------------------------------------------------------------
+_TCO_LEN = 23
+_URL_RE = re.compile(r'https?://\S+')
+
+def twitter_len(s: str) -> int:
+    if not s:
+        return 0
+    s = normalize("NFC", s)
+    s = _URL_RE.sub('X' * _TCO_LEN, s)  # каждая ссылка как 23 символа (t.co)
+    return len(s)
+
+def enforce_twitter_280(text: str) -> str:
+    if not text:
+        return text
+    t = normalize("NFC", text).strip()
+    if twitter_len(t) <= 280:
+        return t
+    ell = '…'
+    while t and twitter_len(t + ell) > 280:
+        t = t[:-1]
+    return (t + ell).rstrip()
+
+def enforce_telegram_666(text: str) -> str:
+    if not text:
+        return text
+    t = normalize("NFC", text).strip()
+    if len(t) <= 666:
+        return t
+    ell = '…'
+    return (t[: max(0, 666 - len(ell))] + ell).rstrip()
+
+# -----------------------------------------------------------------------------
+# ЗАГЛУШКА НА СТАРТЕ (~650 символов) + картинка
 # -----------------------------------------------------------------------------
 PLACEHOLDER_TEXT = (
-    "AiCoin — мост между AI и криптой. Мы превращаем сигналы рынка в понятные решения: "
-    "алерты, генерации, аналитика. Подключайся к комьюнити, следи за апдейтами и "
-    "будь на шаг впереди. Learn more: https://getaicoin.com/ Twitter X: https://x.com/aicoin_eth"
+    "AI Coin — симбиоз блокчейна и искусственного интеллекта. Мы создаём экосистему, "
+    "в которой алгоритмы ищут тренды, подсказывают инсайты и помогают принимать решения. "
+    "Прозрачность, скорость и сообщество — три кита нашего развития. Присоединяйтесь к "
+    "новой эре цифровой экономики: релизы, коллаборации и гайды уже на подходе. "
+    "Следите за обновлениями, делитесь идеями и становитесь частью движения. "
+    "Будущее строится вместе. Подробнее на сайте и в X."
 )
 PLACEHOLDER_IMAGE = "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg"
 
@@ -88,10 +129,7 @@ test_images = [
     "https://upload.wikimedia.org/wikipedia/commons/1/17/Google-flutter-logo.png",
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
-WELCOME_POST_RU = (
-    "🚀 Привет! Это бот публикаций.\n\n"
-    "ИИ-генерация, новости, идеи, генерация картинок и многое другое."
-)
+WELCOME_POST_RU = PLACEHOLDER_TEXT  # одно стартовое сообщение
 
 post_data = {
     "text_ru": WELCOME_POST_RU,
@@ -147,7 +185,6 @@ def telegram_preview_keyboard():
     ])
 
 def post_choice_keyboard():
-    # универсальная — если захочешь одним нажатием отправлять в оба
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
@@ -192,38 +229,22 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# ПОСТОСТРОИТЕЛИ (твои требования)
+# ПОСТОСТРОИТЕЛИ (жёсткие лимиты)
 # -----------------------------------------------------------------------------
-TWITTER_SIGNATURE = " Learn more: https://getaicoin.com/ | Twirret X: https://x.com/aicoin_eth #AiCoin #AI $Ai #crypto"
-TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twittr X </a>'
+TWITTER_SIGNATURE = " Learn more: https://getaicoin.com/ | X: https://x.com/aicoin_eth #AiCoin #AI $Ai #crypto"
+TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">X (Twitter)</a>'
 
 def build_twitter_post(user_text_ru: str) -> str:
-    """
-    Обрезаем так, чтобы ВСЁ вместе с подписью умещалось в 280.
-    (Обрезка происходит на этапе предпросмотра/перед публикацией.)
-    """
     base = (user_text_ru or "").strip()
-    max_len = 280
-    spare = max_len - len(TWITTER_SIGNATURE)
-    if spare < 0:
-        # если внезапно подпись длиннее 280 — жестко тронкаем подпись
-        return TWITTER_SIGNATURE[:max_len]
-    if len(base) > spare:
-        base = base[:max(0, spare - 1)].rstrip() + "…"
-    return base + TWITTER_SIGNATURE
+    composed = (base + " " + TWITTER_SIGNATURE).strip() if base else TWITTER_SIGNATURE
+    return enforce_twitter_280(composed)
 
 def build_twitter_preview(user_text_ru: str) -> str:
     return build_twitter_post(user_text_ru)
 
 def build_telegram_post(user_text_ru: str) -> str:
-    """
-    Телеграм: ограничиваем тело 750 символами (без подписи),
-    добавляем HTML-подпись. Превью сайтов отключаем при отправке.
-    """
-    base = (user_text_ru or "").strip()
-    if len(base) > 750:
-        base = base[:749].rstrip() + "…"
-    return base + TELEGRAM_SIGNATURE_HTML
+    composed = ((user_text_ru or "").strip() + TELEGRAM_SIGNATURE_HTML)
+    return enforce_telegram_666(composed)
 
 def build_telegram_preview(user_text_ru: str) -> str:
     return build_telegram_post(user_text_ru)
@@ -367,8 +388,6 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
 # -----------------------------------------------------------------------------
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        # Храним нормализованный хеш текста + хеш изображения,
-        # и накрываем их уникальным индексом.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -402,9 +421,6 @@ async def compute_image_hash_from_url(url: str) -> str | None:
         return None
 
 async def is_duplicate_post(text: str, image_url: str | None) -> bool:
-    """
-    Проверяем дубль по (text_hash, image_hash). Текст нормализуем.
-    """
     text_norm = normalize_text_for_hashing(text)
     text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
     image_hash = None
@@ -423,9 +439,6 @@ async def is_duplicate_post(text: str, image_url: str | None) -> bool:
             return row is not None
 
 async def save_post_to_history(text, image_url=None):
-    """
-    Сохраняем (если ещё не сохранён) по уникальности (text_hash, image_hash).
-    """
     text_norm = normalize_text_for_hashing(text)
     text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
 
@@ -442,26 +455,19 @@ async def save_post_to_history(text, image_url=None):
         try:
             await db.execute(
                 "INSERT INTO posts (text, text_hash, timestamp, image_hash) VALUES (?, ?, ?, ?)",
-                (text, text_hash, datetime.now().isoformat(), image_hash)
+                (text, text_hash, datetime.now(TZ).isoformat(), image_hash)
             )
             await db.commit()
         except Exception as e:
-            # Скорее всего дубликат — гасим в лог
             logging.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
 # ПРЕДПРОСМОТР: РАЗДЕЛЁННЫЙ (Twitter/Telegram — два сообщения)
 # -----------------------------------------------------------------------------
 async def preview_split(bot, chat_id, text, image_url=None):
-    """
-    1) Отдельное сообщение под Twitter (≤280 с подписью)
-    2) Отдельное сообщение под Telegram (≤750 + HTML подпись)
-    У ссылок web-preview выключен (через send_message fallback'ом).
-    """
     twitter_txt = build_twitter_preview(text)
     telegram_txt = build_telegram_preview(text)
 
-    # Twitter карточка
     tw_markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
@@ -478,7 +484,6 @@ async def preview_split(bot, chat_id, text, image_url=None):
         await bot.send_message(chat_id=chat_id, text=f"<b>Twitter:</b>\n{twitter_txt}", parse_mode="HTML",
                                reply_markup=tw_markup, disable_web_page_preview=True)
 
-    # Telegram карточка
     tg_markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
@@ -569,22 +574,23 @@ def get_start_menu():
     ])
 
 # -----------------------------------------------------------------------------
-# ЗАГЛУШКА ПРИ СТАРТЕ
+# ЗАГЛУШКА ПРИ СТАРТЕ (одно сообщение + меню, запуск 3-мин. таймера)
 # -----------------------------------------------------------------------------
 async def send_start_placeholder():
-    placeholders = [
-        ("🚀 AiCoin — это революция в мире криптовалют и AI! Подключайтесь к нам сегодня и будьте в тренде будущего финансов.", "images_for_posts/placeholder1.jpg"),
-        ("💡 AiCoin объединяет блокчейн и искусственный интеллект, чтобы сделать криптомир умнее и быстрее.", "images_for_posts/placeholder2.jpg"),
-        ("🌐 С AiCoin вы получаете доступ к технологиям, которые меняют правила игры.", "images_for_posts/placeholder3.jpg"),
-        ("🔥 Присоединяйтесь к AiCoin — станьте частью новой эры криптовалют!", "images_for_posts/placeholder4.jpg")
-    ]
-    text, img_path = random.choice(placeholders)
+    text = PLACEHOLDER_TEXT
+    img_url = PLACEHOLDER_IMAGE
+    post_data["text_ru"] = text
+    post_data["image_url"] = img_url
     try:
-        if os.path.exists(img_path):
-            with open(img_path, "rb") as img:
-                await approval_bot.send_photo(chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=img, caption=text)
-        else:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text)
+        await safe_preview_post(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"<b>Стартовое сообщение</b>\n\n{build_telegram_preview(text)}",
+            image_url=img_url,
+            reply_markup=get_start_menu()
+        )
+        # включаем 3-минутный авто-таймер
+        pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT})
     except Exception as e:
         logging.error(f"Ошибка отправки заглушки: {e}")
 
@@ -592,15 +598,11 @@ async def send_start_placeholder():
 # ТАЙМЕР АВТОПУБЛИКАЦИИ (для авто-режима)
 # -----------------------------------------------------------------------------
 async def check_timer():
-    """
-    Следит за pending_post["active"] + timeout.
-    Если истекло — автопубликация в оба канала и выключение (авторежим).
-    """
     while True:
         await asyncio.sleep(0.5)
         try:
             if pending_post["active"] and pending_post.get("timer"):
-                passed = (datetime.now() - pending_post["timer"]).total_seconds()
+                passed = (datetime.now(TZ) - pending_post["timer"]).total_seconds()
                 if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
                     base_text = (post_data.get("text_ru") or "").strip()
                     twitter_text = build_twitter_preview(base_text)
@@ -617,7 +619,6 @@ async def check_timer():
                         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                         text=f"Статус автопубликации — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}"
                     )
-                    # авто-режим — выключаемся сразу
                     shutdown_bot_and_exit()
         except asyncio.CancelledError:
             raise
@@ -628,17 +629,13 @@ async def check_timer():
 # АВТОВЫКЛЮЧЕНИЕ ПО НЕАКТИВНОСТИ (ручной режим)
 # -----------------------------------------------------------------------------
 async def check_inactivity_shutdown():
-    """
-    Если 10 минут нет нажатий/сообщений — выключаемся.
-    Работает для ручного режима, когда pending_post уже не активен.
-    """
     global last_button_pressed_at
     while True:
         try:
             await asyncio.sleep(5)
             if last_button_pressed_at is None:
                 continue
-            idle = (datetime.now() - last_button_pressed_at).total_seconds()
+            idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
             if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
                 try:
                     await approval_bot.send_message(
@@ -654,6 +651,51 @@ async def check_inactivity_shutdown():
             logging.warning(f"check_inactivity_shutdown error: {e}")
 
 # -----------------------------------------------------------------------------
+# ВСПОМОГАТЕЛЬНОЕ: планирование 3 тестовых автопостов (23:30, 23:45, 00:00)
+# -----------------------------------------------------------------------------
+def _next_dt_at(hour: int, minute: int) -> datetime:
+    now = datetime.now(TZ)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        # для 00:00 — всегда следующий день; для остальных — если уже прошло, переносим на завтра
+        target += timedelta(days=1)
+    return target
+
+async def schedule_post_at(when: datetime, text: str, image_url: str | None, tag: str):
+    await approval_bot.send_message(
+        TELEGRAM_APPROVAL_CHAT_ID,
+        f"⏰ Запланировано: {tag} на {when.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    )
+    await asyncio.sleep((when - datetime.now(TZ)).total_seconds())
+    # публикуем сразу в оба канала (без ожидания)
+    post_data["text_ru"] = text
+    post_data["image_url"] = image_url
+    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"▶️ Автозапуск: {tag}")
+    tg_ok = await publish_post_to_telegram(build_telegram_preview(text), image_url)
+    tw_ok = publish_post_to_twitter(build_twitter_preview(text), image_url)
+    await approval_bot.send_message(
+        TELEGRAM_APPROVAL_CHAT_ID,
+        f"Готово: {tag} — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}"
+    )
+
+async def schedule_test_runs():
+    # 3 публикации
+    texts = [
+        "AI Coin запускает серию тестов. Проверяем автопост, лимиты и медиа. Следите за апдейтами и присоединяйтесь. #AiCoin #AI #crypto",
+        "Эксперимент №2: публикации по расписанию каждые 15 минут. Текст+хештеги и проверка длины. #AiCoin #automation",
+        "Финальный шаг теста: публикация на полуночной отметке. Спасибо за участие! #AiCoin #test"
+    ]
+    imgs = [random.choice(test_images), None, random.choice(test_images)]
+
+    t1 = _next_dt_at(23, 30)
+    t2 = _next_dt_at(23, 45)
+    t3 = _next_dt_at(0, 0)  # 00:00 следующего дня
+
+    asyncio.create_task(schedule_post_at(t1, texts[0], imgs[0], "Тест-1 (23:30)"))
+    asyncio.create_task(schedule_post_at(t2, texts[1], imgs[1], "Тест-2 (23:45)"))
+    asyncio.create_task(schedule_post_at(t3, texts[2], imgs[2], "Тест-3 (00:00)"))
+
+# -----------------------------------------------------------------------------
 # CALLBACK HANDLER (единый)
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -663,16 +705,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     # фикс активности
-    last_button_pressed_at = datetime.now()
+    last_button_pressed_at = datetime.now(TZ)
 
-    # продлеваем таймер ожидания решения, если мы в pending_post
+    # ЛЮБОЕ нажатие отменяет автопост (чтобы не улетел сам через 3 минуты)
     if pending_post["active"]:
-        pending_post["timer"] = datetime.now()
-        pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+        pending_post["active"] = False
 
     # анти-спам по кнопкам
     user_id = update.effective_user.id
-    now = datetime.now()
+    now = datetime.now(TZ)
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 2:
         return
     last_action_time[user_id] = now
@@ -705,7 +746,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "self_post":
         pending_post["active"] = True  # ждём ввода для предпросмотра
-        pending_post["timer"] = datetime.now()
+        pending_post["timer"] = datetime.now(TZ)  # включим, но автопост всё равно отменяется при нажатиях
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                                         text="✍️ Введите текст поста и (опционально) приложите фото одним сообщением:",
                                         reply_markup=InlineKeyboardMarkup([
@@ -714,22 +755,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "new_post_ai":
-        # генерируем заглушку ИИ
-        text, img = await new_post_ai()
-        # показываем split-предпросмотр и сразу меню
+        # здесь твоя генерация — пока используем текущие данные
+        text, img = post_data["text_ru"], post_data["image_url"]
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, text, image_url=img)
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Главное меню:",
             reply_markup=get_start_menu()
         )
-        pending_post.update({"active": True, "timer": datetime.now(), "timeout": TIMER_PUBLISH_DEFAULT})
         return
 
     if data == "approve":
-        # показать split-предпросмотр по текущему post_data
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_ru"], image_url=post_data["image_url"])
-        pending_post.update({"active": True, "timer": datetime.now(), "timeout": TIMER_PUBLISH_DEFAULT})
         return
 
     if data in ("post_twitter", "post_telegram", "post_both"):
@@ -740,13 +777,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "new_post":
-        # сгенерить черновой новый пост и показать предпросмотр
         post_data["text_ru"] = f"Тестовый новый пост #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
-        post_data["is_manual"] = False
+        post_data["is_manual"] = True  # ручной сценарий
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_ru"], image_url=post_data["image_url"])
-        pending_post.update({"active": True, "timer": datetime.now(), "timeout": TIMER_PUBLISH_DEFAULT})
         return
 
     if data == "do_not_disturb":
@@ -762,10 +797,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "end_day":
         pending_post["active"] = False
         do_not_disturb["active"] = True
-        tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), dt_time(hour=9))
+        tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M')}",
+            text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML",
             reply_markup=main_keyboard()
         )
@@ -792,14 +827,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # РУЧНОЙ ВВОД ПОСЛЕ «Сделай сам»
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Пользователь прислал текст/фото после нажатия 'Сделай сам'.
-    Готовим post_data и показываем раздельный предпросмотр (Twitter/Telegram).
-    """
     text = update.message.text or update.message.caption or ""
     image_url = None
 
-    # если прислали фото — грузим в GitHub и получаем URL
     if update.message.photo:
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
@@ -811,16 +841,14 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-    # заполняем текущий контекст поста
-    post_data["text_ru"] = text if text else post_data["text_ru"]
-    post_data["image_url"] = image_url if image_url else post_data.get("image_url", None)
+    # публикуем ровно то, что прислал пользователь (текст/фото/оба)
+    post_data["text_ru"] = text if text else ""
+    post_data["image_url"] = image_url if image_url else (None)
     post_data["post_id"] += 1
     post_data["is_manual"] = True
 
-    # показываем split-предпросмотр (Twitter/Telegram двумя сообщениями)
     try:
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_ru"], image_url=post_data["image_url"])
-        # панель действий под предпросмотрами
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Выберите действие:",
@@ -832,7 +860,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
             ])
         )
-        pending_post.update({"active": True, "timer": datetime.now(), "timeout": TIMER_PUBLISH_EXTEND})
     except Exception as e:
         logging.error(f"handle_manual_input preview failed: {e}")
         await approval_bot.send_message(
@@ -845,7 +872,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 # -----------------------------------------------------------------------------
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text = (post_data.get("text_ru") or "").strip()
-    img = post_data.get("image_url")
+    img = post_data.get("image_url") or None
 
     twitter_text = build_twitter_preview(base_text)
     telegram_text = build_telegram_preview(base_text)
@@ -871,7 +898,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             if tw_status:
                 await save_post_to_history(twitter_text, img)
 
-    # статусы
     if publish_tg:
         await approval_bot.send_message(
             TELEGRAM_APPROVAL_CHAT_ID,
@@ -883,10 +909,9 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."
         )
 
-    # меню после публикации
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Выберите действие:", reply_markup=get_start_menu())
 
-    # авто-режим — выключаемся сразу; ручной — останется и вырубится по неактивности
+    # если это не автопост (ручной сценарий) — не выключаемся сразу; авто выключается таймером неактивности
     if not post_data.get("is_manual"):
         shutdown_bot_and_exit()
 
@@ -895,7 +920,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at
-    last_button_pressed_at = datetime.now()
+    last_button_pressed_at = datetime.now(TZ)
 
     # если пользователь пришёл после кнопки self_post — обрабатываем как ручной ввод
     if pending_post.get("active"):
@@ -909,23 +934,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # -----------------------------------------------------------------------------
-# STARTUP: одна заглушка (~200 символов + картинка) и стартовое меню
+# STARTUP: одно сообщение (текст+картинка) и стартовое меню + расписание
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-    # фоновые задачи: таймер автопостинга (для авторежима) и автоотключение по неактивности
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # одна заглушка
-    await send_start_placeholder()
+    await send_start_placeholder()  # стартовое сообщение + запуск 3-мин таймера
+    await schedule_test_runs()      # план: 23:30, 23:45, 00:00 по Киеву
 
-    # показать стартовое меню сразу
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Главное меню:",
-        reply_markup=get_start_menu()
-    )
     logging.info("Бот запущен. Заглушка отправлена. Главное меню показано.")
 
 # -----------------------------------------------------------------------------
@@ -951,7 +969,6 @@ def main():
         .post_init(on_start)\
         .build()
 
-    # кнопки и сообщения
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_handler))
 
@@ -962,4 +979,3 @@ def main():
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
-    
