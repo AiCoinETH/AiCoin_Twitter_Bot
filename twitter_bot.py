@@ -77,7 +77,7 @@ DISABLE_WEB_PREVIEW = True
 PLACEHOLDER_TEXT = (
     "AiCoin — мост между AI и криптой. Мы превращаем сигналы рынка в понятные решения: "
     "алерты, генерации, аналитика. Подключайся к комьюнити, следи за апдейтами и "
-    "будь на шаг впереди. Learn more: https://getaicoin.com/ Join Telegram: https://t.me/AiCoin_ETH"
+    "будь на шаг впереди. Learn more: https://getaicoin.com/ Twitter X: https://x.com/aicoin_eth"
 )
 PLACEHOLDER_IMAGE = "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg"
 
