@@ -8,7 +8,7 @@ import random
 import sys
 import tempfile
 import uuid
-import math
+import base64
 from datetime import datetime, timedelta, time as dt_time
 from unicodedata import normalize
 from zoneinfo import ZoneInfo
@@ -19,6 +19,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
 from github import Github
+from openai import OpenAI  # openai>=1.35.0
 
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -42,6 +43,8 @@ GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
 GITHUB_IMAGE_PATH = "images_for_posts"
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID_STR, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
     logging.error("Не заданы обязательные переменные окружения Telegram!")
     sys.exit(1)
@@ -51,6 +54,9 @@ if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_A
     sys.exit(1)
 if not all([GITHUB_TOKEN, GITHUB_REPO]):
     logging.error("Не заданы обязательные переменные окружения GitHub!")
+    sys.exit(1)
+if not OPENAI_API_KEY:
+    logging.error("Не задан OPENAI_API_KEY!")
     sys.exit(1)
 
 # -----------------------------------------------------------------------------
@@ -63,6 +69,8 @@ approval_lock = asyncio.Lock()
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
 
+client_oa = OpenAI(api_key=OPENAI_API_KEY)
+
 # расписание/таймеры
 scheduled_posts_per_day = 6
 manual_posts_today = 0
@@ -73,19 +81,19 @@ AUTO_SHUTDOWN_AFTER_SECONDS = 600
 DISABLE_WEB_PREVIEW = True
 
 # -----------------------------------------------------------------------------
-# ТЕСТОВЫЕ КАРТИНКИ (фолбэк)
+# КАРТИНКИ-ФОЛБЭКИ (на случай, если генерация ляжет)
 # -----------------------------------------------------------------------------
 fallback_images = [
-    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
 # -----------------------------------------------------------------------------
 # ТЕКУЩЕЕ СОСТОЯНИЕ ПОСТА
 # -----------------------------------------------------------------------------
 post_data = {
-    "text_en": "AI Coin blends blockchain with AI to find trends, surface insights, and power smarter, faster decisions. Transparent. Fast. Community-driven.",
+    "text_en": "AI Coin blends blockchain with AI for smarter, faster, community-driven decisions.",
     "ai_hashtags": ["#AiCoin", "#AI", "$Ai", "#crypto"],
     "image_url": random.choice(fallback_images),
     "timestamp": None,
@@ -178,13 +186,13 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# ЛИМИТЫ/ПОМОЩНИКИ (TG<=666, TW<=279 с учётом t.co)
+# ПОСТОСТРОИТЕЛИ: EN-контент, TG=полный, TW<=279, тело<=666
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
-TW_MAX = 279
-LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | X: https://x.com/aicoin_eth"
+LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | telegram: https://t.me/AiCoin_ETH"
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
+TW_MAX = 279  # общий лимит для X
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -294,65 +302,7 @@ def delete_image_from_github(filename):
         logging.error(f"Ошибка удаления файла на GitHub: {e}")
 
 # -----------------------------------------------------------------------------
-# ГЕНЕРАЦИЯ КАРТИНОК (без текста/брендов) — Pillow или фолбэк
-# -----------------------------------------------------------------------------
-def _try_import_pil():
-    try:
-        from PIL import Image, ImageDraw, ImageFilter
-        return Image, ImageDraw, ImageFilter
-    except Exception:
-        return None, None, None
-
-def generate_abstract_image(theme:int=0, size=(1200,675)) -> str | None:
-    Image, ImageDraw, ImageFilter = _try_import_pil()
-    if not Image:
-        return None
-    w,h = size
-    img = Image.new("RGB", size, (242, 246, 255))
-    draw = ImageDraw.Draw(img)
-
-    # радиальные контуры (светлая техно-атмосфера)
-    cx, cy = w//2, h//2
-    max_r = int((w*w + h*h)**0.5 / 2)
-    for r in range(0, max_r, 6):
-        shade = 255 - int(60 * (r/max_r))
-        draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline=(shade, shade, 255), width=2)
-
-    # узлы и связи (AI/graph)
-    random.seed(100+theme)
-    nodes = []
-    for _ in range(60):
-        x = random.randint(60, w-60)
-        y = random.randint(40, h-40)
-        nodes.append((x,y))
-        draw.ellipse((x-2, y-2, x+2, y+2), fill=(180,190,255))
-    for _ in range(120):
-        a = random.choice(nodes); b = random.choice(nodes)
-        if a==b: continue
-        draw.line([a,b], fill=(210,220,255), width=1)
-
-    # «монеты»-кольца
-    for R in [220,160,110]:
-        x = cx + random.randint(-120,120)
-        y = cy + random.randint(-60,60)
-        draw.ellipse((x-R, y-R, x+R, y+R), outline=(200,210,255), width=3)
-
-    img = img.filter(ImageFilter.GaussianBlur(0.6))
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    img.save(tmp.name, "JPEG", quality=92, optimize=True)
-    return tmp.name
-
-async def make_or_fallback_image(theme:int) -> str:
-    local = generate_abstract_image(theme)
-    if local:
-        url, _fname = await save_image_and_get_github_url(local)
-        try: os.remove(local)
-        except Exception: pass
-        if url: return url
-    return random.choice(fallback_images)
-
-# -----------------------------------------------------------------------------
-# СКАЧИВАНИЕ/ЗАЛИВКА ИЗОБРАЖЕНИЙ
+# СКАЧИВАНИЕ ИЗОБРАЖЕНИЙ
 # -----------------------------------------------------------------------------
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
@@ -371,7 +321,8 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None,
         r = requests.get(url_or_file_id, headers=headers, timeout=15)
         r.raise_for_status()
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp_file.write(r.content); tmp_file.close()
+        tmp_file.write(r.content)
+        tmp_file.close()
         return tmp_file.name
 
 async def save_image_and_get_github_url(image_path):
@@ -382,8 +333,10 @@ async def save_image_and_get_github_url(image_path):
 async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     file_path = await download_image_async(file_id, is_telegram_file=True, bot=bot)
     url, filename = await save_image_and_get_github_url(file_path)
-    try: os.remove(file_path)
-    except Exception: pass
+    try:
+        os.remove(file_path)
+    except Exception:
+        pass
     if not url:
         raise Exception("Не удалось загрузить фото на GitHub")
     return url
@@ -429,8 +382,11 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
             msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
             return msg, github_filename
         else:
+            if not is_valid_image_url(url_or_file_id):
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                return None, None
             try:
-                response = requests.get(url_or_file_id, timeout=12)
+                response = requests.get(url_or_file_id, timeout=10)
                 response.raise_for_status()
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
                 tmp_file.write(response.content); tmp_file.close()
@@ -519,43 +475,88 @@ async def save_post_to_history(text, image_url=None):
             logging.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# ИИ-ГЕНЕРАЦИЯ КОНТЕНТА (EN, ≤666) + 3 варианта на ночь
+# ИИ: генерация текста и картинки (OpenAI 1.35+)
 # -----------------------------------------------------------------------------
-def _night_promos_en() -> list[dict]:
-    return [
-        {
-            "text": (
-                "AI Coin is your gateway to an AI-driven crypto community. Propose ideas, let our AI analyze the impact, "
-                "and join on-chain voting to shape what ships next. Fast, transparent, community-first — we’re building tools "
-                "that turn signals into action and ideas into launches."
-            ),
-            "tags": ["#AiCoin", "#AI", "$Ai", "#crypto", "#Web3AI", "#DeFiAI"]
-        },
-        {
-            "text": (
-                "From insight to execution — AI Coin connects real AI with real token governance. Track trends, surface alpha, "
-                "and vote on priorities with the holders. If the community says yes, we build it. Simple as that."
-            ),
-            "tags": ["#AiCoin", "#AI", "$Ai", "#crypto", "#AIGovernance", "#Onchain"]
-        },
-        {
-            "text": (
-                "Builders wanted. With AI Coin, holders steer the roadmap: submit ideas, our AI ranks impact, the community votes — "
-                "and the winners go live. Smarter cycles, faster launches, stronger community."
-            ),
-            "tags": ["#AiCoin", "#AI", "$Ai", "#crypto", "#AIxCrypto", "#Roadmap"]
-        }
-    ]
+def _oa_chat_text(prompt: str) -> str:
+    """
+    Генерим короткий EN промо-текст 1–3 предложения, без слов 'google/trends',
+    максимум ~500 символов (дальше режем до 666 на уровне билдеров).
+    """
+    try:
+        resp = client_oa.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.9,
+            max_tokens=220,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        # убираем лишние кавычки/код-блоки
+        txt = txt.strip('"\n` ')
+        return txt
+    except Exception as e:
+        logging.warning(f"_oa_chat_text error: {e}")
+        return "Ai Coin fuses AI with blockchain to turn community ideas into real actions. Join builders shaping the next wave of crypto utility."
 
-async def ai_generate_content_en() -> tuple[str, list[str], str | None]:
-    # По умолчанию — общий промо-текст (≤666 будет обрезано при сборке)
-    text_en = (
-        "AI Coin blends blockchain with real AI use cases: on-chain analytics, trend detection, and automated insights. "
-        "We are building a transparent, fast, community-first stack for smarter crypto decisions."
+def _oa_image_b64(prompt: str, size: str = "1024x1024") -> bytes | None:
+    try:
+        img = client_oa.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size=size,
+            n=1
+        )
+        b64 = img.data[0].b64_json
+        return base64.b64decode(b64)
+    except Exception as e:
+        logging.warning(f"_oa_image_b64 error: {e}")
+        return None
+
+async def generate_image_to_github(prompt: str) -> str:
+    """
+    Генерит картинку и заливает в GitHub, возвращает RAW URL.
+    """
+    raw = _oa_image_b64(prompt)
+    if not raw:
+        return random.choice(fallback_images)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    with open(tmp.name, "wb") as f:
+        f.write(raw)
+    filename = f"{uuid.uuid4().hex}.png"
+    url = upload_image_to_github(tmp.name, filename)
+    try:
+        os.remove(tmp.name)
+    except Exception:
+        pass
+    return url or random.choice(fallback_images)
+
+async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
+    """
+    Генерация EN-текста (≤666 режем далее), AI/crypto-хештегов и картинки.
+    """
+    text_prompt = (
+        "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
+        "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon."
+        f" Emphasize: {topic_hint}. No words like 'google' or 'trends'."
     )
-    ai_tags = ["#AiCoin", "#AI", "$Ai", "#crypto", "#AITrading", "#DeFiAI"]
-    img_url = await make_or_fallback_image(theme=0)
-    return text_en, ai_tags, img_url
+    text_en = _oa_chat_text(text_prompt)
+
+    # 2–4 релевантных хештега поверх наших
+    extra_tags_prompt = (
+        "Give me 3 short, relevant crypto+AI hashtags for a social post about Ai Coin (no duplicates of #AiCoin, #AI, #crypto, $Ai), "
+        "single line, space-separated, each begins with #, only AI/crypto topics."
+    )
+    tags_line = _oa_chat_text(extra_tags_prompt)
+    ai_tags = [t for t in tags_line.split() if t.startswith("#") and len(t) > 1][:4]
+
+    image_prompt = (
+        "futuristic cityscape with soft light, shimmering blockchain networks, floating AI coin symbols, clean minimal style, "
+        "light pastel tones, cinematic depth, high-detail, no text, no logos, modern technology aesthetic"
+    )
+    image_url = await generate_image_to_github(image_prompt)
+    return (text_en, ai_tags, image_url)
 
 # -----------------------------------------------------------------------------
 # ПРЕДПРОСМОТР (две карточки)
@@ -597,57 +598,39 @@ async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=No
                                reply_markup=tg_markup, disable_web_page_preview=True)
 
 # -----------------------------------------------------------------------------
-# ПУБЛИКАЦИЯ В TWITTER (с ретраями/фолбэком без медиа)
+# ПУБЛИКАЦИЯ В TWITTER
 # -----------------------------------------------------------------------------
-def _is_retryable_twitter_error(e: Exception) -> bool:
-    s = str(e).lower()
-    return ("500" in s) or ("internal" in s) or ("131" in s) or ("timeout" in s) or ("temporarily" in s)
-
-def publish_post_to_twitter(text, image_url=None, max_retries=3):
+def publish_post_to_twitter(text, image_url=None):
     github_filename = None
-    backoff = [2, 5, 12]
-    try_media = True if image_url else False
+    try:
+        media_ids = None
+        file_path = None
+        if image_url:
+            if not str(image_url).startswith("http"):
+                logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
+                return False
+            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.write(r.content); tmp.close()
+            file_path = tmp.name
 
-    for attempt in range(1, max_retries+1):
-        try:
-            media_ids = None
-            file_path = None
+        if file_path:
+            media = twitter_api_v1.media_upload(file_path)
+            media_ids = [media.media_id_string]
+            os.remove(file_path)
 
-            if try_media and image_url:
-                if not str(image_url).startswith("http"):
-                    logging.error("Telegram file_id не поддерживается напрямую для Twitter публикации.")
-                    try_media = False
-                else:
-                    r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
-                    r.raise_for_status()
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                    tmp.write(r.content); tmp.close()
-                    file_path = tmp.name
-
-            if file_path:
-                media = twitter_api_v1.media_upload(file_path)
-                media_ids = [media.media_id_string]
-                os.remove(file_path)
-
-            twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
-            if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
-                github_filename = image_url.split('/')[-1]
-                delete_image_from_github(github_filename)
-            return True
-
-        except Exception as e:
-            logging.error(f"Попытка {attempt}/{max_retries} — ошибка Twitter: {e}")
-            if attempt < max_retries and _is_retryable_twitter_error(e):
-                asyncio.run(asyncio.sleep(backoff[min(attempt-1, len(backoff)-1)]))
-                continue
-            if try_media:
-                logging.warning("Публикация с медиа не удалась. Пробую без медиа.")
-                try_media = False
-                continue
-            asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
-            if github_filename:
-                delete_image_from_github(github_filename)
-            return False
+        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
+            github_filename = image_url.split('/')[-1]
+            delete_image_from_github(github_filename)
+        return True
+    except Exception as e:
+        pending_post["active"] = False
+        logging.error(f"Ошибка публикации в Twitter: {e}")
+        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
+        if github_filename: delete_image_from_github(github_filename)
+        return False
 
 # -----------------------------------------------------------------------------
 # ПУБЛИКАЦИЯ В TELEGRAM
@@ -748,7 +731,7 @@ async def check_inactivity_shutdown():
             logging.warning(f"check_inactivity_shutdown error: {e}")
 
 # -----------------------------------------------------------------------------
-# ПЛАНИРОВЩИК: ночные посты 02:00, 03:00, 05:00 (Kyiv)
+# ВРЕМЯ/РАСПИСАНИЕ
 # -----------------------------------------------------------------------------
 def _next_dt_at(hour: int, minute: int) -> datetime:
     now = datetime.now(TZ)
@@ -784,20 +767,30 @@ async def schedule_post_at(when: datetime, text_en: str, ai_hashtags: list[str] 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"Готово: {tag} — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}")
 
 async def schedule_night_posts():
-    promos = _night_promos_en()
-    # картинки заранее (3 штуки, разные темы → разные паттерны)
-    img_urls = [
-        await make_or_fallback_image(theme=1),
-        await make_or_fallback_image(theme=2),
-        await make_or_fallback_image(theme=3),
+    """
+    3 разных EN промо + 3 разных картинки:
+    02:00 — utility & community,
+    03:00 — governance & voting,
+    05:00 — AI-powered proposals & speed.
+    """
+    topics = [
+        "Utility, community growth and joining early to hit 2,000 followers fast.",
+        "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
+        "Direct dialog: Telegram gated by MetaMask balance; you + AI co-create live ideas."
     ]
-    times = [
-        _next_dt_at(2, 0),
-        _next_dt_at(3, 0),
-        _next_dt_at(5, 0),
-    ]
-    for (p, when, img, idx) in zip(promos, times, img_urls, range(1,4)):
-        asyncio.create_task(schedule_post_at(when, p["text"], p["tags"], img, f"Ночной пост #{idx} ({when.strftime('%H:%M')})"))
+    # генерим контент и картинки заранее
+    bundles = []
+    for t in topics:
+        text_en, tags, img = await ai_generate_content_en(t)
+        bundles.append((text_en, tags, img))
+
+    t_02 = _next_dt_at(2, 0)
+    t_03 = _next_dt_at(3, 0)
+    t_05 = _next_dt_at(5, 0)
+
+    asyncio.create_task(schedule_post_at(t_02, bundles[0][0], bundles[0][1], bundles[0][2], "Ночной пост (02:00)"))
+    asyncio.create_task(schedule_post_at(t_03, bundles[1][0], bundles[1][1], bundles[1][2], "Ночной пост (03:00)"))
+    asyncio.create_task(schedule_post_at(t_05, bundles[2][0], bundles[2][1], bundles[2][2], "Ночной пост (05:00)"))
 
 # -----------------------------------------------------------------------------
 # CALLBACK HANDLER
@@ -851,7 +844,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "new_post_ai":
-        text_en, ai_tags, img = await ai_generate_content_en()
+        # сгенерировать новый EN пост прямо сейчас
+        text_en, ai_tags, img = await ai_generate_content_en("General awareness and community invite.")
         post_data["text_en"] = text_en
         post_data["ai_hashtags"] = ai_tags
         post_data["image_url"] = img
@@ -923,7 +917,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     post_data["text_en"] = text.strip()
-    post_data["ai_hashtags"] = []
+    post_data["ai_hashtags"] = []  # можно парсить из текста, но по умолчанию пусто — добавятся твои базовые
     post_data["image_url"] = image_url if image_url else None
     post_data["post_id"] += 1
     post_data["is_manual"] = True
@@ -1003,14 +997,14 @@ async def on_start(app: Application):
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Сгенерировать стартовый EN-контент и картинку
-    text_en, ai_tags, img = await ai_generate_content_en()
+    # Сразу генерим EN-контент и картинку для заглушки
+    text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
 
-    await send_start_placeholder()   # стартовый превью/таймер
-    await schedule_night_posts()     # 02:00, 03:00, 05:00 по Киеву
+    await send_start_placeholder()     # стартовое сообщение + таймер
+    await schedule_night_posts()       # автопосты 02:00, 03:00, 05:00 по Киеву
 
     logging.info("Бот запущен. Заглушка отправлена. Ночные посты запланированы.")
 
