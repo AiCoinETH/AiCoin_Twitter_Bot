@@ -194,8 +194,8 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 # -----------------------------------------------------------------------------
 # ПОСТОСТРОИТЕЛИ (твои требования)
 # -----------------------------------------------------------------------------
-TWITTER_SIGNATURE = " Learn more: https://getaicoin.com/ | Join Telegram: https://t.me/AiCoin_ETH #AiCoin #AI $Ai #crypto #blockchain #DeFi"
-TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://t.me/AiCoin_ETH">Join Telegram</a>'
+TWITTER_SIGNATURE = " Learn more: https://getaicoin.com/ | Twirret X: https://x.com/aicoin_eth #AiCoin #AI $Ai #crypto"
+TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twittr X </a>'
 
 def build_twitter_post(user_text_ru: str) -> str:
     """
