@@ -182,7 +182,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
-LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | X: https://x.com/aicoin_eth"
+LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | telegram: https://t.me/AiCoin_ETH"
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 TW_MAX = 279  # общий лимит для X
 
