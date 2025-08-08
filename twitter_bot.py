@@ -77,28 +77,33 @@ AUTO_SHUTDOWN_AFTER_SECONDS = 600  # 10 минут после последней
 DISABLE_WEB_PREVIEW = True
 
 # -----------------------------------------------------------------------------
-# ЛИМИТЫ ДЛИНЫ ТЕКСТА
+# ЛИМИТЫ ДЛИНЫ ТЕКСТА / ПОМОЩНИКИ ДЛЯ X(Twitter)
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
-_URL_RE = re.compile(r'https?://\S+')
+_URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 
 def twitter_len(s: str) -> int:
+    """Длина для X: любая URL учитывается как 23 символа; остальное — фактическая длина."""
     if not s:
         return 0
     s = normalize("NFC", s)
-    s = _URL_RE.sub('X' * _TCO_LEN, s)  # каждая ссылка как 23 символа (t.co)
-    return len(s)
+    return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
-def enforce_twitter_280(text: str) -> str:
-    if not text:
-        return text
-    t = normalize("NFC", text).strip()
-    if twitter_len(t) <= 280:
-        return t
+def trim_to_twitter_len(s: str, max_len: int) -> str:
+    """
+    Обрезает строку s так, чтобы её twitter_len <= max_len.
+    Если пришлось резать, добавляет '…' и гарантирует, что вместе с '…' тоже <= max_len.
+    """
+    if not s:
+        return s
+    s = normalize("NFC", s).strip()
+    if twitter_len(s) <= max_len:
+        return s
     ell = '…'
-    while t and twitter_len(t + ell) > 280:
-        t = t[:-1]
-    return (t + ell).rstrip()
+    # Режем посимвольно с конца, пока вместе с многоточием не влезет.
+    while s and twitter_len(s + ell) > max_len:
+        s = s[:-1]
+    return (s + ell).rstrip()
 
 def enforce_telegram_666(text: str) -> str:
     if not text:
@@ -235,9 +240,37 @@ TWITTER_SIGNATURE = " Learn more: https://getaicoin.com/ | X: https://x.com/aico
 TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">X (Twitter)</a>'
 
 def build_twitter_post(user_text_ru: str) -> str:
+    """
+    Режем ТОЛЬКО пользовательский текст так, чтобы:
+    twitter_len(user_text) + (1, если есть текст и подпись) + twitter_len(signature) <= 280
+    URL считаются как 23 символа (t.co). Хэштеги — обычные символы.
+    """
     base = (user_text_ru or "").strip()
-    composed = (base + " " + TWITTER_SIGNATURE).strip() if base else TWITTER_SIGNATURE
-    return enforce_twitter_280(composed)
+    sig = TWITTER_SIGNATURE.strip()
+
+    if not base:
+        # нет пользовательского текста — публикуем только подпись (подрежем на всякий случай)
+        return trim_to_twitter_len(sig, 280)
+
+    # считаем доступный лимит под base с учётом пробела между base и подписью
+    sep = " "
+    sig_len = twitter_len(sig)
+    # минимум 1 символ на разделитель
+    allowed_for_base = 280 - sig_len - len(sep)
+    if allowed_for_base < 0:
+        # подпись сама не влазит — урежем её и вернём без base
+        return trim_to_twitter_len(sig, 280)
+
+    base_trimmed = trim_to_twitter_len(base, allowed_for_base)
+    composed = f"{base_trimmed}{sep}{sig}".strip()
+    # safety: если внезапно не влезло (из-за многоточия и т.д.) — доурежем базу
+    while twitter_len(composed) > 280 and base_trimmed:
+        base_trimmed = trim_to_twitter_len(base_trimmed[:-1], allowed_for_base)
+        composed = f"{base_trimmed}{sep}{sig}".strip()
+    # если базу обнулили — публикуем только подпись
+    if not base_trimmed:
+        return trim_to_twitter_len(sig, 280)
+    return composed
 
 def build_twitter_preview(user_text_ru: str) -> str:
     return build_twitter_post(user_text_ru)
@@ -272,7 +305,7 @@ def delete_image_from_github(filename):
         github_repo.delete_file(contents.path, "delete image after posting", contents.sha, branch="main")
         logging.info(f"delete_image_from_github: Удалён файл с GitHub: {filename}")
     except Exception as e:
-        logging.error(f"Ошибка удаления файла с GitHub: {e}")
+        logging.error(f"Ошибка удаления файла на GitHub: {e}")
 
 # -----------------------------------------------------------------------------
 # СКАЧИВАНИЕ ИЗОБРАЖЕНИЙ
@@ -657,7 +690,6 @@ def _next_dt_at(hour: int, minute: int) -> datetime:
     now = datetime.now(TZ)
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if target <= now:
-        # для 00:00 — всегда следующий день; для остальных — если уже прошло, переносим на завтра
         target += timedelta(days=1)
     return target
 
@@ -667,7 +699,6 @@ async def schedule_post_at(when: datetime, text: str, image_url: str | None, tag
         f"⏰ Запланировано: {tag} на {when.strftime('%Y-%m-%d %H:%M:%S %Z')}"
     )
     await asyncio.sleep((when - datetime.now(TZ)).total_seconds())
-    # публикуем сразу в оба канала (без ожидания)
     post_data["text_ru"] = text
     post_data["image_url"] = image_url
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"▶️ Автозапуск: {tag}")
@@ -679,7 +710,6 @@ async def schedule_post_at(when: datetime, text: str, image_url: str | None, tag
     )
 
 async def schedule_test_runs():
-    # 3 публикации
     texts = [
         "AI Coin запускает серию тестов. Проверяем автопост, лимиты и медиа. Следите за апдейтами и присоединяйтесь. #AiCoin #AI #crypto",
         "Эксперимент №2: публикации по расписанию каждые 15 минут. Текст+хештеги и проверка длины. #AiCoin #automation",
@@ -704,21 +734,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
-    # фикс активности
     last_button_pressed_at = datetime.now(TZ)
 
-    # ЛЮБОЕ нажатие отменяет автопост (чтобы не улетел сам через 3 минуты)
     if pending_post["active"]:
         pending_post["active"] = False
 
-    # анти-спам по кнопкам
     user_id = update.effective_user.id
     now = datetime.now(TZ)
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 2:
         return
     last_action_time[user_id] = now
 
-    # маршрутизация
     if data == "shutdown_bot":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
         await asyncio.sleep(1)
@@ -745,8 +771,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
-        pending_post["active"] = True  # ждём ввода для предпросмотра
-        pending_post["timer"] = datetime.now(TZ)  # включим, но автопост всё равно отменяется при нажатиях
+        pending_post["active"] = True
+        pending_post["timer"] = datetime.now(TZ)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                                         text="✍️ Введите текст поста и (опционально) приложите фото одним сообщением:",
                                         reply_markup=InlineKeyboardMarkup([
@@ -755,7 +781,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "new_post_ai":
-        # здесь твоя генерация — пока используем текущие данные
         text, img = post_data["text_ru"], post_data["image_url"]
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, text, image_url=img)
         await approval_bot.send_message(
@@ -780,7 +805,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["text_ru"] = f"Тестовый новый пост #{post_data['post_id'] + 1}"
         post_data["image_url"] = random.choice(test_images)
         post_data["post_id"] += 1
-        post_data["is_manual"] = True  # ручной сценарий
+        post_data["is_manual"] = True
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_ru"], image_url=post_data["image_url"])
         return
 
@@ -911,7 +936,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Выберите действие:", reply_markup=get_start_menu())
 
-    # если это не автопост (ручной сценарий) — не выключаемся сразу; авто выключается таймером неактивности
     if not post_data.get("is_manual"):
         shutdown_bot_and_exit()
 
@@ -922,11 +946,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at
     last_button_pressed_at = datetime.now(TZ)
 
-    # если пользователь пришёл после кнопки self_post — обрабатываем как ручной ввод
     if pending_post.get("active"):
         return await handle_manual_input(update, context)
 
-    # иначе просто подсказываем меню
     await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         text="Открой меню и выбери действие:",
