@@ -114,6 +114,11 @@ last_action_time = {}
 last_button_pressed_at = None
 
 # -----------------------------------------------------------------------------
+# ДНЕВНОЙ ПЛАН: 14:00, 15:00, 16:00 (Kyiv)
+# -----------------------------------------------------------------------------
+day_plan = []  # каждый слот: {"time": dt, "text": str, "tags": list[str], "img": str|None, "status": "scheduled|published|skipped", "note": str}
+
+# -----------------------------------------------------------------------------
 # КЛАВИАТУРЫ
 # -----------------------------------------------------------------------------
 def main_keyboard():
@@ -191,23 +196,22 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# ПОСТОСТРОИТЕЛИ: EN-контент, TG=полный, TW<=260, тело<=666
+# ПОСТОСТРОИТЕЛИ: EN, TG=полный, TW<=233, тело<=666
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 
-# Подпись/хвосты для Twitter (Telegram получает свою подпись отдельно при отправке)
-LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | telegram: https://t.me/AiCoin_ETH"
+# Twitter-хвост
+LINKS_SIGNATURE = "Learn more | telegram: https://t.me/AiCoin_ETH https://getaicoin.com/"
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 
-# Жёсткий лимит твита
-TW_MAX = 260  # <= 260 символов с учётом t.co
+# Жёсткий лимит твита — 233
+TW_MAX = 233
 
 def twitter_len(s: str) -> int:
     if not s: return 0
     s = normalize("NFC", s)
-    # учитываем, что все URL считаются длиной _TCO_LEN
-    return len(_URL_RE.sub('X' * _TCO_LEN, s))
+    return len(_URL_RE.sub('X' * _TCO_LEN, s))  # URL считаются как 23 символа
 
 def trim_plain_to(s: str, max_len: int) -> str:
     if not s: return s
@@ -250,7 +254,6 @@ def _dedup_hashtags(*tags_groups):
     return " ".join(out)
 
 def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
-    """Тело + хештеги, БЕЗ ссылочного хвоста (для Telegram; подпись добавится при отправке)."""
     body = trim_plain_to((ai_text_en or "").strip(), 666)
     tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
     if body and tags:
@@ -258,7 +261,6 @@ def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
     return body or tags
 
 def compose_full_text_with_links(ai_text_en: str, ai_hashtags=None) -> str:
-    """Тело + хвост со ссылками + хештеги (для Twitter)."""
     body = trim_plain_to((ai_text_en or "").strip(), 666)
     tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
     suffix_parts = [LINKS_SIGNATURE]
@@ -268,31 +270,22 @@ def compose_full_text_with_links(ai_text_en: str, ai_hashtags=None) -> str:
     return body or suffix
 
 def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
-    """Строго вписываемся в TW_MAX=260 с учётом t.co."""
-    suffix_text = compose_full_text_with_links("", ai_hashtags)  # получим хвост (links + hashtags)
+    suffix_text = compose_full_text_with_links("", ai_hashtags)  # хвост
     body = trim_plain_to((ai_text_en or "").strip(), 666)
-
-    # Посчитаем допустимую длину для body
     sep = " " if body and suffix_text else ""
     allowed_for_body = TW_MAX - (1 if sep else 0) - twitter_len(suffix_text)
     if allowed_for_body < 0:
-        # если хвост сам по себе длиннее лимита — ужмём весь текст до лимита
         return trim_to_twitter_len(suffix_text, TW_MAX)
-
     body_trimmed = trim_to_twitter_len(body, allowed_for_body)
     composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
-
-    # Безопасно ещё раз прогарантируем лимит
     while twitter_len(composed) > TW_MAX and body_trimmed:
         body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
         composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
-
     if not body_trimmed and twitter_len(suffix_text) > TW_MAX:
         composed = trim_to_twitter_len(suffix_text, TW_MAX)
     return composed
 
 def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
-    """Тело + хештеги (БЕЗ ссылок). Подпись добавим при фактической отправке."""
     return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
@@ -384,6 +377,45 @@ async def safe_preview_post(bot, chat_id, text, image_url=None, reply_markup=Non
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text="Ошибка предпросмотра. Вот текст поста:\n\n" + text,
                                reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW, parse_mode="HTML")
+
+# -----------------------------------------------------------------------------
+# ПРЕДПРОСМОТР (две карточки)
+# -----------------------------------------------------------------------------
+async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=None):
+    twitter_txt = build_twitter_preview(ai_text_en, ai_hashtags)
+    telegram_txt = build_telegram_preview(ai_text_en, ai_hashtags)
+
+    tw_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
+         InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")]
+    ])
+    try:
+        if image_url:
+            await send_photo_with_download(bot, chat_id, image_url, caption=f"<b>Twitter:</b>\n{twitter_txt}", reply_markup=tw_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"<b>Twitter:</b>\n{twitter_txt}", parse_mode="HTML",
+                                   reply_markup=tw_markup, disable_web_page_preview=True)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=f"<b>Twitter:</b>\n{twitter_txt}", parse_mode="HTML",
+                               reply_markup=tw_markup, disable_web_page_preview=True)
+
+    tg_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
+         InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")]
+    ])
+    try:
+        if image_url:
+            await send_photo_with_download(bot, chat_id, image_url, caption=f"<b>Telegram:</b>\n{telegram_txt}", reply_markup=tg_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"<b>Telegram:</b>\n{telegram_txt}", parse_mode="HTML",
+                                   reply_markup=tg_markup, disable_web_page_preview=True)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=f"<b>Telegram:</b>\n{telegram_txt}", parse_mode="HTML",
+                               reply_markup=tg_markup, disable_web_page_preview=True)
 
 # -----------------------------------------------------------------------------
 # ОТПРАВКА ФОТО (и fallback)
@@ -500,14 +532,14 @@ async def save_post_to_history(text, image_url=None):
             logging.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# ИИ: генерация текста и картинки (OpenAI 1.35+)
+# ИИ: генерация текста и картинки (сейчас заглушки; завтра включим полноценную генерацию)
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
         resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical."},
+                {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
                 {"role":"user","content":prompt}
             ],
             temperature=0.9,
@@ -535,25 +567,14 @@ def _oa_image_b64(prompt: str, size: str = "1024x1024") -> bytes | None:
         return None
 
 async def generate_image_to_github(prompt: str) -> str:
-    raw = _oa_image_b64(prompt)
-    if not raw:
-        return random.choice(fallback_images)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    with open(tmp.name, "wb") as f:
-        f.write(raw)
-    filename = f"{uuid.uuid4().hex}.png"
-    url = upload_image_to_github(tmp.name, filename)
-    try:
-        os.remove(tmp.name)
-    except Exception:
-        pass
-    return url or random.choice(fallback_images)
+    # пока используем заглушки
+    return random.choice(fallback_images)
 
 async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
     text_prompt = (
         "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
-        "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon."
-        f" Emphasize: {topic_hint}. No words like 'google' or 'trends'."
+        "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon. "
+        f"Emphasize: {topic_hint}."
     )
     text_en = _oa_chat_text(text_prompt)
 
@@ -564,51 +585,112 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     tags_line = _oa_chat_text(extra_tags_prompt)
     ai_tags = [t for t in tags_line.split() if t.startswith("#") and len(t) > 1][:4]
 
-    image_prompt = (
-        "futuristic cityscape with soft light, shimmering blockchain networks, floating AI coin symbols, clean minimal style, "
-        "light pastel tones, cinematic depth, high-detail, no text, no logos, modern technology aesthetic"
-    )
-    image_url = await generate_image_to_github(image_prompt)
+    image_url = await generate_image_to_github("ai coin futuristic minimal, no text")
     return (text_en, ai_tags, image_url)
 
 # -----------------------------------------------------------------------------
-# ПРЕДПРОСМОТР (две карточки)
+# ДНЕВНОЙ ПЛАН/ОТЧЁТ/ПУБЛИКАЦИЯ
 # -----------------------------------------------------------------------------
-async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=None):
-    twitter_txt = build_twitter_preview(ai_text_en, ai_hashtags)
-    telegram_txt = build_telegram_preview(ai_text_en, ai_hashtags)
+def _today_time(hour: int, minute: int) -> datetime:
+    now = datetime.now(TZ)
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    tw_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
-         InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")]
-    ])
-    try:
-        if image_url:
-            await send_photo_with_download(bot, chat_id, image_url, caption=f"<b>Twitter:</b>\n{twitter_txt}", reply_markup=tw_markup)
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"<b>Twitter:</b>\n{twitter_txt}", parse_mode="HTML",
-                                   reply_markup=tw_markup, disable_web_page_preview=True)
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=f"<b>Twitter:</b>\n{twitter_txt}", parse_mode="HTML",
-                               reply_markup=tw_markup, disable_web_page_preview=True)
+async def ensure_unique_bundle(text_en: str, tags: list[str], img: str | None, max_tries: int = 3, topic_hint: str = "variant") -> tuple[str, list[str], str | None, bool]:
+    """Вернёт (text, tags, img, replaced). replaced=True если пришлось заменить из-за дубля."""
+    tw = build_twitter_post(text_en, tags)
+    tg = build_telegram_post(text_en, tags)
+    if not await is_duplicate_post(tw, img) and not await is_duplicate_post(tg, img):
+        return text_en, tags, img, False
+    for _ in range(max_tries):
+        nt, ntags, nimg = await ai_generate_content_en(topic_hint)
+        tw2 = build_twitter_post(nt, ntags)
+        tg2 = build_telegram_post(nt, ntags)
+        if not await is_duplicate_post(tw2, nimg) and not await is_duplicate_post(tg2, nimg):
+            return nt, ntags, nimg, True
+    return text_en, tags, img, False
 
-    tg_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main"),
-         InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")]
-    ])
-    try:
-        if image_url:
-            await send_photo_with_download(bot, chat_id, image_url, caption=f"<b>Telegram:</b>\n{telegram_txt}", reply_markup=tg_markup)
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"<b>Telegram:</b>\n{telegram_txt}", parse_mode="HTML",
-                                   reply_markup=tg_markup, disable_web_page_preview=True)
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=f"<b>Telegram:</b>\n{telegram_txt}", parse_mode="HTML",
-                               reply_markup=tg_markup, disable_web_page_preview=True)
+async def report_day_plan_status():
+    lines = ["<b>Day plan (Kyiv):</b>"]
+    for slot in day_plan:
+        tstr = slot["time"].strftime("%H:%M")
+        status = slot["status"]
+        emoji = "🟡" if status == "scheduled" else ("✅" if status == "published" else "⏭️")
+        note = f" — {slot['note']}" if slot.get("note") else ""
+        lines.append(f"{tstr} — {emoji} {status.capitalize()}{note}")
+    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+async def publish_slot(slot_idx: int):
+    slot = day_plan[slot_idx]
+    text_en, tags, img = slot["text"], slot["tags"], slot["img"]
+    tw_text = build_twitter_post(text_en, tags)
+    tg_text = build_telegram_post(text_en, tags)
+
+    # финальная анти‑дедупликация: если дубликат — до 3 попыток перегенерации перед публикацией
+    attempts = 0
+    replaced = False
+    while attempts < 3 and (await is_duplicate_post(tw_text, img) or await is_duplicate_post(tg_text, img)):
+        attempts += 1
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏳ Duplicate detected, generating replacement… ({attempts}/3)")
+        nt, ntags, nimg = await ai_generate_content_en("fresh replacement")
+        nt, ntags, nimg, rep2 = await ensure_unique_bundle(nt, ntags, nimg, max_tries=1, topic_hint="freshest")
+        text_en, tags, img = nt, ntags, nimg
+        tw_text = build_twitter_post(text_en, tags)
+        tg_text = build_telegram_post(text_en, tags)
+        replaced = replaced or rep2
+
+    if replaced:
+        slot["note"] = (slot.get("note") or "") + " (replaced before publish)"
+        slot["text"], slot["tags"], slot["img"] = text_en, tags, img
+
+    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ▶️ Publishing…")
+
+    tg_ok = await publish_post_to_telegram(tg_text, img)
+    tw_ok = publish_post_to_twitter(tw_text, img)
+
+    if tg_ok: await save_post_to_history(tg_text, img)
+    if tw_ok: await save_post_to_history(tw_text, img)
+
+    if tg_ok and tw_ok:
+        slot["status"] = "published"
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ✅ Published (TG+TW)")
+    else:
+        slot["status"] = "skipped"
+        slot["note"] = (slot.get("note") or "") + " (publish error)"
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏭️ Skipped due to error")
+
+async def schedule_slot(slot_idx: int):
+    slot = day_plan[slot_idx]
+    when = slot["time"]
+    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"⏰ Scheduled {when.strftime('%H:%M')} (Kyiv)")
+    await asyncio.sleep(max(0, (when - datetime.now(TZ)).total_seconds()))
+    await publish_slot(slot_idx)
+
+async def build_day_plan_for_today():
+    """Генерим контент при старте: 14:00, 15:00, 16:00. Готовим уникальные бандлы заранее."""
+    global day_plan
+    now = datetime.now(TZ)
+    t14 = _today_time(14, 0)
+    t15 = _today_time(15, 0)
+    t16 = _today_time(16, 0)
+    targets = [t if t > now else t + timedelta(days=1) for t in (t14, t15, t16)]
+
+    topics = [
+        "Utility, community growth and joining early.",
+        "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
+        "AI-powered proposals and speed of execution."
+    ]
+
+    bundles = await asyncio.gather(*(ai_generate_content_en(th) for th in topics))
+
+    unique_bundles = []
+    for (text, tags, img), hint in zip(bundles, topics):
+        nt, ntags, nimg, replaced = await ensure_unique_bundle(text, tags, img, max_tries=3, topic_hint=hint+" variant")
+        note = "replacement prepared" if replaced else ""
+        unique_bundles.append((nt, ntags, nimg, note))
+
+    day_plan = []
+    for t, (text, tags, img, note) in zip(targets, unique_bundles):
+        day_plan.append({"time": t, "text": text, "tags": tags, "img": img, "status": "scheduled", "note": note})
 
 # -----------------------------------------------------------------------------
 # ПУБЛИКАЦИЯ В TWITTER
@@ -633,7 +715,6 @@ def publish_post_to_twitter(text, image_url=None):
             media_ids = [media.media_id_string]
             os.remove(file_path)
 
-        # финальная страховка: не дать превысить 260
         final_text = build_twitter_post(text, [])
         twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
@@ -641,7 +722,6 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return True
     except Exception as e:
-        pending_post["active"] = False
         logging.error(f"Ошибка публикации в Twitter: {e}")
         asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
         if github_filename: delete_image_from_github(github_filename)
@@ -652,32 +732,17 @@ def publish_post_to_twitter(text, image_url=None):
 # -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text, image_url=None):
     try:
-        # приклеиваем подпись только здесь
         text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
         if image_url:
-            await send_photo_with_download(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, image_url, caption=text_with_signature)
+            await channel_bot.send_photo(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=image_url, caption=text_with_signature, parse_mode="HTML")
         else:
             await channel_bot.send_message(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, text=text_with_signature,
                                            parse_mode="HTML", disable_web_page_preview=True)
         return True
     except Exception as e:
-        pending_post["active"] = False
         logging.error(f"Ошибка публикации в Telegram: {e}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Telegram: {e}")
         return False
-
-# -----------------------------------------------------------------------------
-# СТАРТОВОЕ МЕНЮ
-# -----------------------------------------------------------------------------
-def get_start_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Пост", callback_data="post_menu")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🆕 Новый пост (ИИ)", callback_data="new_post_ai")],
-        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
-    ])
 
 # -----------------------------------------------------------------------------
 # ЗАГЛУШКА ПРИ СТАРТЕ
@@ -694,12 +759,13 @@ async def send_start_placeholder():
             image_url=img_url,
             reply_markup=get_start_menu()
         )
+        # включаем таймер автопубликации заглушки
         pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT})
     except Exception as e:
         logging.error(f"Ошибка отправки заглушки: {e}")
 
 # -----------------------------------------------------------------------------
-# ТАЙМЕР АВТОПУБЛИКАЦИИ
+# ТАЙМЕР АВТОПУБЛИКАЦИИ ЗАГЛУШКИ
 # -----------------------------------------------------------------------------
 async def check_timer():
     while True:
@@ -717,8 +783,10 @@ async def check_timer():
                     tg_ok = await publish_post_to_telegram(telegram_text, post_data.get("image_url"))
                     tw_ok = publish_post_to_twitter(twitter_text, post_data.get("image_url"))
 
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                        text=f"Статус автопубликации — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}")
+                    await approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text=f"Статус автопубликации — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}"
+                    )
                     shutdown_bot_and_exit()
         except asyncio.CancelledError:
             raise
@@ -748,69 +816,7 @@ async def check_inactivity_shutdown():
             logging.warning(f"check_inactivity_shutdown error: {e}")
 
 # -----------------------------------------------------------------------------
-# ВРЕМЯ/РАСПИСАНИЕ
-# -----------------------------------------------------------------------------
-def _next_dt_at(hour: int, minute: int) -> datetime:
-    now = datetime.now(TZ)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now: target += timedelta(days=1)
-    return target
-
-async def schedule_post_at(when: datetime, text_en: str, ai_hashtags: list[str] | None, image_url: str | None, tag: str):
-    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"⏰ Запланировано: {tag} на {when.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    await asyncio.sleep(max(0, (when - datetime.now(TZ)).total_seconds()))
-    post_data["text_en"] = text_en
-    post_data["ai_hashtags"] = ai_hashtags or []
-    post_data["image_url"] = image_url
-    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"▶️ Автозапуск: {tag}")
-
-    tw = build_twitter_preview(text_en, ai_hashtags)
-    tg = build_telegram_preview(text_en, ai_hashtags)
-
-    tg_ok = False
-    if not await is_duplicate_post(tg, image_url):
-        tg_ok = await publish_post_to_telegram(tg, image_url)
-        if tg_ok: await save_post_to_history(tg, image_url)
-    else:
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Telegram. Публикация пропущена.")
-
-    tw_ok = False
-    if not await is_duplicate_post(tw, image_url):
-        tw_ok = publish_post_to_twitter(tw, image_url)
-        if tw_ok: await save_post_to_history(tw, image_url)
-    else:
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
-
-    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"Готово: {tag} — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}")
-
-async def schedule_day_posts():
-    """
-    3 EN-промо с разными картинками:
-    12:00 — utility & community,
-    13:00 — governance & voting,
-    14:00 — AI-powered proposals & speed.
-    """
-    topics = [
-        "Utility, community growth and joining early to hit 2,000 followers fast.",
-        "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
-        "Direct dialog: Telegram gated by MetaMask balance; you + AI co-create live ideas."
-    ]
-    bundles = []
-    for t in topics:
-        text_en, tags, img = await ai_generate_content_en(t)
-        bundles.append((text_en, tags, img))
-
-    t_12 = _next_dt_at(12, 0)
-    t_13 = _next_dt_at(13, 0)
-    t_14 = _next_dt_at(14, 0)
-
-    asyncio.create_task(schedule_post_at(t_12, bundles[0][0], bundles[0][1], bundles[0][2], "Дневной пост (12:00)"))
-    asyncio.create_task(schedule_post_at(t_13, bundles[1][0], bundles[1][1], bundles[1][2], "Дневной пост (13:00)"))
-    asyncio.create_task(schedule_post_at(t_14, bundles[2][0], bundles[2][1], bundles[2][2], "Дневной пост (14:00)"))
-
-# -----------------------------------------------------------------------------
 # CALLBACK HANDLER
-# (Сбрасываем таймер при ЛЮБОЙ кнопке)
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, prev_data, manual_posts_today, last_action_time
@@ -821,7 +827,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
-    # СБРОС ТАЙМЕРА при любом нажатии
     pending_post["active"] = True
     pending_post["timer"] = now
     pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
@@ -871,7 +876,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
-        await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_en"], post_data.get("ai_hashtags"), image_url=post_data["image_url"])
+        await report_day_plan_status()
         return
 
     if data in ("post_twitter", "post_telegram", "post_both"):
@@ -918,10 +923,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -----------------------------------------------------------------------------
 # РУЧНОЙ ВВОД ПОСЛЕ «Сделай сам»
-# (Сбрасываем таймер при любом сообщении)
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # СБРОС ТАЙМЕРА при входящем сообщении
     pending_post["active"] = True
     pending_post["timer"] = datetime.now(TZ)
     pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
@@ -987,7 +990,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
-            # финально ужмём на всякий случай
             twitter_text = build_twitter_post(base_text_en, ai_tags)
             tw_status = publish_post_to_twitter(twitter_text, img)
             if tw_status: await save_post_to_history(twitter_text, img)
@@ -1006,7 +1008,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at
     last_button_pressed_at = datetime.now(TZ)
 
-    # СБРОС ТАЙМЕРА при любом входящем сообщении
     pending_post["active"] = True
     pending_post["timer"] = last_button_pressed_at
     pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
@@ -1020,19 +1021,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
+
+    # автопост заглушки по таймеру
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Сразу генерим EN-контент и картинку для заглушки
+    # Заглушка (EN) в чат согласования
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
+    await send_start_placeholder()
 
-    await send_start_placeholder()     # стартовое сообщение + таймер
-    await schedule_day_posts()         # автопосты 12:00, 13:00, 14:00 по Киеву
+    # План дня 14:00/15:00/16:00 и короткий отчёт
+    await build_day_plan_for_today()
+    await report_day_plan_status()
 
-    logging.info("Бот запущен. Заглушка отправлена. Дневные посты запланированы (12/13/14).")
+    # Планируем публикации
+    for idx in range(len(day_plan)):
+        asyncio.create_task(schedule_slot(idx))
+
+    logging.info("Бот запущен. Заглушка отправлена, автопост включен. План дня (14/15/16 Kyiv) запущен.")
 
 # -----------------------------------------------------------------------------
 # Выключение
