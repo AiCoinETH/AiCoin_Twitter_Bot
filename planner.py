@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, CallbackQuery
@@ -35,21 +35,24 @@ def main_planner_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧭 План ИИ (темы→время)", callback_data="OPEN_PLAN_MODE")],
         [InlineKeyboardButton("✨ Генерация (контент→время)", callback_data="OPEN_GEN_MODE")],
         [InlineKeyboardButton("📋 Список на сегодня", callback_data="PLAN_LIST_TODAY")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="STEP_BACK")]
+        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]  # новая кнопка
     ])
 
 def step_buttons_done_add_cancel(prefix: str) -> InlineKeyboardMarkup:
-    # prefix: PLAN_ | GEN_
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}DONE"),
             InlineKeyboardButton("➕ Добавить", callback_data=f"{prefix}ADD_MORE"),
         ],
+        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],  # тоже добавляем сюда
         [InlineKeyboardButton("↩️ Отмена (шаг назад)", callback_data="STEP_BACK")]
     ])
 
 def cancel_only() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отмена", callback_data="STEP_BACK")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],
+        [InlineKeyboardButton("↩️ Отмена", callback_data="STEP_BACK")]
+    ])
 
 # -------------------------
 # ХЕЛПЕРЫ СОСТОЯНИЯ
@@ -71,7 +74,7 @@ def _push(uid: int, item: PlannedItem):
         "image_url": item.image_url,
         "added_at": datetime.utcnow().isoformat() + "Z"
     })
-    USER_STATE[uid]["current"] = PlannedItem()  # сброс
+    USER_STATE[uid]["current"] = PlannedItem()
 
 def _can_finalize(item: PlannedItem) -> bool:
     if not item.time_str:
@@ -88,11 +91,6 @@ def _can_finalize(item: PlannedItem) -> bool:
 async def _safe_edit_or_send(q: CallbackQuery, text: str,
                              reply_markup: Optional[InlineKeyboardMarkup]=None,
                              parse_mode: Optional[str]="HTML"):
-    """
-    - если исходное сообщение было текстом -> edit_message_text
-    - если это было фото с подписью -> edit_message_caption
-    - иначе шлем новое сообщение
-    """
     m: Message = q.message
     try:
         if m and (m.text is not None):
@@ -100,14 +98,13 @@ async def _safe_edit_or_send(q: CallbackQuery, text: str,
                                              disable_web_page_preview=True)
         if m and (m.caption is not None):
             return await q.edit_message_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
-        # если редактировать нечего/нельзя — отправляем новое
         raise BadRequest("no editable text/caption")
     except BadRequest:
         return await m.chat.send_message(text=text, reply_markup=reply_markup, parse_mode=parse_mode,
                                          disable_web_page_preview=True)
 
 # -------------------------
-# ОТКРЫТИЕ ПЛАНИРОВЩИКА (вызывается из twitter_bot)
+# ОТКРЫТИЕ ПЛАНИРОВЩИКА
 # -------------------------
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -127,24 +124,20 @@ async def _ask_topic(q: CallbackQuery, mode: str):
     st = _ensure(uid)
     st.mode = mode
     st.step = "waiting_topic"
-    text = "Введите тему (или несколько) для поста и отправьте сообщением.\nМожно отменить кнопкой ниже."
-    await _safe_edit_or_send(q, text, reply_markup=cancel_only())
+    await _safe_edit_or_send(q, "Введите тему (или несколько) для поста и отправьте сообщением.", reply_markup=cancel_only())
 
 async def _ask_text(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
     st.mode = "gen"
     st.step = "waiting_text"
-    text = ("Отправьте контент поста (текст). "
-            "Если хотите картинку — приложите её к сообщению (одним сообщением с подписью) или пришлите фото отдельно.")
-    await _safe_edit_or_send(q, text, reply_markup=cancel_only())
+    await _safe_edit_or_send(q, "Отправьте контент поста (текст) и/или фото.", reply_markup=cancel_only())
 
 async def _ask_time(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
     st.step = "waiting_time"
-    text = "Введите время публикации в формате HH:MM по Киеву (например, 14:30)."
-    await _safe_edit_or_send(q, text, reply_markup=cancel_only())
+    await _safe_edit_or_send(q, "Введите время публикации в формате HH:MM по Киеву (например, 14:30).", reply_markup=cancel_only())
 
 async def _show_ready_add_cancel(q: CallbackQuery):
     uid = q.from_user.id
@@ -190,9 +183,13 @@ async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
-    USER_STATE.setdefault(uid, {"items": [], "current": PlannedItem()})
-    USER_STATE[uid]["current"] = PlannedItem()  # полный сброс текущего шага
+    USER_STATE[uid]["current"] = PlannedItem()
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
+
+async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from twitter_bot import get_start_menu
+    q = update.callback_query
+    await _safe_edit_or_send(q, "Главное меню:", reply_markup=get_start_menu())
 
 async def _finalize_current_and_back(q: CallbackQuery):
     uid = q.from_user.id
@@ -213,48 +210,38 @@ async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     st = _ensure(uid)
-    # если текущий заполнен — сохраняем и начинаем новый цикл
     if _can_finalize(st):
         _push(uid, st)
-    # запускаем следующий ввод
     if st.mode == "plan":
         await _ask_topic(q, mode="plan")
     else:
         await _ask_text(q)
 
 # -------------------------
-# INPUT (текст/фото) ПО ШАГАМ
+# INPUT
 # -------------------------
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод только когда пользователь в режиме планировщика."""
     uid = update.effective_user.id
     st = _ensure(uid)
     if st.mode not in ("plan", "gen"):
-        return  # не наш режим — пусть основное приложение обработает
-
+        return
     msg: Message = update.message
     text = (msg.text or msg.caption or "").strip()
-
-    # Сбор темы (PLAN)
     if st.step == "waiting_topic":
         if not text:
-            return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
+            return await msg.reply_text("Нужна тема текстом.", reply_markup=cancel_only())
         st.topic = text
         fake_cb = await update.to_callback_query(context.bot)
         return await _ask_time(fake_cb)
-
-    # Сбор контента (GEN) + картинка опционально
     if st.step == "waiting_text":
         if msg.photo:
-            st.image_url = msg.photo[-1].file_id  # фактический URL загрузит основной бот при публикации
+            st.image_url = msg.photo[-1].file_id
         if text:
             st.text = text
         if not (st.text or st.image_url):
-            return await msg.reply_text("Пришлите текст поста и/или фото.", reply_markup=cancel_only())
+            return await msg.reply_text("Пришлите текст и/или фото.", reply_markup=cancel_only())
         fake_cb = await update.to_callback_query(context.bot)
         return await _ask_time(fake_cb)
-
-    # Время для обоих режимов
     if st.step == "waiting_time":
         ok = False
         if len(text) >= 4 and ":" in text:
@@ -263,28 +250,25 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ok:
             return await msg.reply_text("Неверный формат. Пример: 14:30", reply_markup=cancel_only())
         st.time_str = f"{int(hh):02d}:{int(mm):02d}"
-
         fake_cb = await update.to_callback_query(context.bot)
         return await _show_ready_add_cancel(fake_cb)
 
 # -------------------------
-# РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
+# РЕГИСТРАЦИЯ
 # -------------------------
 def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_open_plan_mode, pattern="^OPEN_PLAN_MODE$"))
     app.add_handler(CallbackQueryHandler(cb_open_gen_mode,  pattern="^OPEN_GEN_MODE$"))
     app.add_handler(CallbackQueryHandler(cb_list_today,     pattern="^PLAN_LIST_TODAY$"))
-
     app.add_handler(CallbackQueryHandler(cb_step_back,      pattern="^STEP_BACK$"))
+    app.add_handler(CallbackQueryHandler(cb_back_main_menu, pattern="^BACK_MAIN_MENU$"))
     app.add_handler(CallbackQueryHandler(cb_plan_done,      pattern="^PLAN_DONE$"))
     app.add_handler(CallbackQueryHandler(cb_gen_done,       pattern="^GEN_DONE$"))
     app.add_handler(CallbackQueryHandler(cb_add_more,       pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"))
-
-    # Ввод пользователем (перехватываем только если он в режиме планировщика)
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, on_user_message))
 
 # -------------------------
-# ХЕЛПЕР: превращаем Update в "псевдо" CallbackQuery
+# FAKE CallbackQuery
 # -------------------------
 async def _build_fake_callback_from_message(message: Message, bot) -> CallbackQuery:
     cq = CallbackQuery(
@@ -301,5 +285,4 @@ async def _update_to_callback_query(update: Update, bot):
         return update.callback_query
     return await _build_fake_callback_from_message(update.message, bot)
 
-# Патчим Update для удобного вызова
 setattr(Update, "to_callback_query", _update_to_callback_query)
