@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import asyncio
+import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, CallbackQuery
@@ -24,7 +24,7 @@ class PlannedItem:
     text: Optional[str] = None
     time_str: Optional[str] = None
     image_url: Optional[str] = None
-    step: str = "idle"   # idle | waiting_topic | waiting_text | waiting_time
+    step: str = "idle"   # idle | waiting_topic | waiting_text | waiting_time | confirm
     mode: str = "none"   # plan | gen
 
 # -------------------------
@@ -33,9 +33,10 @@ class PlannedItem:
 def main_planner_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧭 План ИИ (темы→время)", callback_data="OPEN_PLAN_MODE")],
-        [InlineKeyboardButton("✨ Генерация (контент→время)", callback_data="OPEN_GEN_MODE")],
+        [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
+        [InlineKeyboardButton("🤖 Построить план ИИ сейчас", callback_data="PLAN_AI_BUILD_NOW")],
         [InlineKeyboardButton("📋 Список на сегодня", callback_data="PLAN_LIST_TODAY")],
-        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]  # новая кнопка
+        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
     ])
 
 def step_buttons_done_add_cancel(prefix: str) -> InlineKeyboardMarkup:
@@ -44,8 +45,8 @@ def step_buttons_done_add_cancel(prefix: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}DONE"),
             InlineKeyboardButton("➕ Добавить", callback_data=f"{prefix}ADD_MORE"),
         ],
-        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],  # тоже добавляем сюда
-        [InlineKeyboardButton("↩️ Отмена (шаг назад)", callback_data="STEP_BACK")]
+        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],
+        [InlineKeyboardButton("↩️ Отмена (шаг назад)", callback_data="STEP_BACK")],
     ])
 
 def cancel_only() -> InlineKeyboardMarkup:
@@ -74,7 +75,7 @@ def _push(uid: int, item: PlannedItem):
         "image_url": item.image_url,
         "added_at": datetime.utcnow().isoformat() + "Z"
     })
-    USER_STATE[uid]["current"] = PlannedItem()
+    USER_STATE[uid]["current"] = PlannedItem()  # сброс
 
 def _can_finalize(item: PlannedItem) -> bool:
     if not item.time_str:
@@ -104,7 +105,38 @@ async def _safe_edit_or_send(q: CallbackQuery, text: str,
                                          disable_web_page_preview=True)
 
 # -------------------------
-# ОТКРЫТИЕ ПЛАНИРОВЩИКА
+# OPENAI: ПРОВЕРКА ДОСТУПНОСТИ/КВОТЫ
+# -------------------------
+def _openai_key_present() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+async def _openai_usable() -> bool:
+    """
+    Лёгкая проверка: пробуем мини-вызов /chat/completions.
+    Если 429 insufficient_quota — вернём False.
+    """
+    if not _openai_key_present():
+        return False
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":"ping"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+        return True
+    except Exception as e:
+        # Явное сообщение при исчерпании квоты
+        msg = str(e).lower()
+        if "insufficient_quota" in msg or "too many requests" in msg or "429" in msg:
+            return False
+        # Любая другая ошибка — считаем недоступно
+        return False
+
+# -------------------------
+# ОТКРЫТИЕ ПЛАНИРОВЩИКА (вызывается из twitter_bot)
 # -------------------------
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -124,39 +156,69 @@ async def _ask_topic(q: CallbackQuery, mode: str):
     st = _ensure(uid)
     st.mode = mode
     st.step = "waiting_topic"
-    await _safe_edit_or_send(q, "Введите тему (или несколько) для поста и отправьте сообщением.", reply_markup=cancel_only())
+    await _safe_edit_or_send(
+        q,
+        "Введите тему (или несколько) для поста и отправьте сообщением.\n"
+        "Можно отменить или вернуться в основное меню кнопками ниже.",
+        reply_markup=cancel_only()
+    )
 
 async def _ask_text(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
     st.mode = "gen"
     st.step = "waiting_text"
-    await _safe_edit_or_send(q, "Отправьте контент поста (текст) и/или фото.", reply_markup=cancel_only())
+    await _safe_edit_or_send(
+        q,
+        "Отправьте контент поста (текст) и/или фото (можно одним сообщением — фото с подписью).",
+        reply_markup=cancel_only()
+    )
 
 async def _ask_time(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
     st.step = "waiting_time"
-    await _safe_edit_or_send(q, "Введите время публикации в формате HH:MM по Киеву (например, 14:30).", reply_markup=cancel_only())
+    await _safe_edit_or_send(
+        q, "Введите время публикации в формате <b>HH:MM</b> по Киеву (например, 14:30).",
+        reply_markup=cancel_only()
+    )
 
 async def _show_ready_add_cancel(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
     prefix = "PLAN_" if st.mode == "plan" else "GEN_"
-    summary = []
+    lines: List[str] = []
     if st.mode == "plan":
-        summary.append(f"Тема: {st.topic or '—'}")
+        lines.append(f"Тема: {st.topic or '—'}")
     else:
-        summary.append(f"Текст: {st.text or '—'}")
-        summary.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
-    summary.append(f"Время: {st.time_str or '—'}")
-    await _safe_edit_or_send(q, "Проверьте данные:\n" + "\n".join(summary),
-                             reply_markup=step_buttons_done_add_cancel(prefix))
+        text = (st.text or "—").strip()
+        if len(text) > 400:  # просто не захламлять превью
+            text = text[:397] + "…"
+        lines.append(f"Текст: {text}")
+        lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
+    lines.append(f"Время: {st.time_str or '—'}")
+    await _safe_edit_or_send(
+        q, "Проверьте данные:\n" + "\n".join(lines),
+        reply_markup=step_buttons_done_add_cancel(prefix)
+    )
 
 # -------------------------
 # CALLBACKS
 # -------------------------
 async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверка OpenAI перед стартом режима
+    if not await _openai_usable():
+        q = update.callback_query
+        await _safe_edit_or_send(
+            q,
+            "❗ <b>OpenAI недоступен или квота исчерпана</b>.\n"
+            "Вы можете продолжить вручную (кнопка ниже) — всё сохранится и будет опубликовано по расписанию.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
+                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
+            ])
+        )
+        return
     await _ask_topic(update.callback_query, mode="plan")
 
 async def cb_open_gen_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,13 +245,17 @@ async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
-    USER_STATE[uid]["current"] = PlannedItem()
+    USER_STATE.setdefault(uid, {"items": [], "current": PlannedItem()})
+    USER_STATE[uid]["current"] = PlannedItem()  # полный сброс текущего шага
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
 
 async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from twitter_bot import get_start_menu
+    # избегаем кругового импорта — передадим управление основному боту через его кнопку
     q = update.callback_query
-    await _safe_edit_or_send(q, "Главное меню:", reply_markup=get_start_menu())
+    await _safe_edit_or_send(
+        q, "Открываю основное меню…",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Открыть основное меню", callback_data="cancel_to_main")]])
+    )
 
 async def _finalize_current_and_back(q: CallbackQuery):
     uid = q.from_user.id
@@ -217,31 +283,108 @@ async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await _ask_text(q)
 
+# ---- AI build now (по кнопке) ----
+async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not await _openai_usable():
+        return await _safe_edit_or_send(
+            q,
+            "❗ <b>OpenAI недоступен или квота исчерпана</b> — пополните баланс, чтобы строить ИИ-план автоматически.\n\n"
+            "Пока можно перейти в ручной режим:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
+                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
+            ])
+        )
+
+    # Пытаемся импортировать генератор из основного бота (во время колбэка круговой импорт уже безопасен)
+    try:
+        from twitter_bot import ai_generate_content_en
+    except Exception:
+        return await _safe_edit_or_send(
+            q,
+            "Не получилось вызвать ИИ-генератор из основного бота. Можно продолжить вручную.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
+                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
+            ])
+        )
+
+    # простой сценарий: три быстрых слота без расписания (время спросим позже вручную)
+    topics = [
+        "Utility, community growth and joining early.",
+        "Governance & on-chain voting with AI analysis.",
+        "AI-powered proposals and speed of execution."
+    ]
+    uid = q.from_user.id
+    _ensure(uid)  # инициализировать
+
+    # генерим 3 варианта и кладём как черновики (без time_str)
+    created = 0
+    for th in topics:
+        try:
+            text_en, tags, img = await ai_generate_content_en(th)
+            USER_STATE[uid]["items"].append({
+                "mode": "plan",
+                "topic": th,
+                "text": f"{text_en}\n\n{' '.join(tags)}".strip(),
+                "time": None,
+                "image_url": img,
+                "added_at": datetime.utcnow().isoformat() + "Z"
+            })
+            created += 1
+        except Exception:
+            pass
+
+    if created == 0:
+        return await _safe_edit_or_send(
+            q,
+            "Не удалось сгенерировать план. Попробуйте позже или перейдите в ручной режим.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
+                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
+            ])
+        )
+
+    return await _safe_edit_or_send(
+        q,
+        f"Сгенерировано позиций: <b>{created}</b>.\nТеперь добавьте время для нужных задач (через «Ручной план») или вернитесь в основное меню.",
+        reply_markup=main_planner_menu()
+    )
+
 # -------------------------
-# INPUT
+# INPUT (текст/фото) ПО ШАГАМ
 # -------------------------
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод только когда пользователь в режиме планировщика."""
     uid = update.effective_user.id
     st = _ensure(uid)
     if st.mode not in ("plan", "gen"):
-        return
+        return  # не наш режим — пусть основное приложение обработает
+
     msg: Message = update.message
     text = (msg.text or msg.caption or "").strip()
+
+    # Сбор темы (PLAN)
     if st.step == "waiting_topic":
         if not text:
-            return await msg.reply_text("Нужна тема текстом.", reply_markup=cancel_only())
+            return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
         st.topic = text
         fake_cb = await update.to_callback_query(context.bot)
         return await _ask_time(fake_cb)
+
+    # Сбор контента (GEN) + картинка опционально
     if st.step == "waiting_text":
         if msg.photo:
-            st.image_url = msg.photo[-1].file_id
+            st.image_url = msg.photo[-1].file_id  # фактический URL загрузит основной бот при публикации
         if text:
             st.text = text
         if not (st.text or st.image_url):
-            return await msg.reply_text("Пришлите текст и/или фото.", reply_markup=cancel_only())
+            return await msg.reply_text("Пришлите текст поста и/или фото.", reply_markup=cancel_only())
         fake_cb = await update.to_callback_query(context.bot)
         return await _ask_time(fake_cb)
+
+    # Время для обоих режимов
     if st.step == "waiting_time":
         ok = False
         if len(text) >= 4 and ":" in text:
@@ -254,21 +397,25 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _show_ready_add_cancel(fake_cb)
 
 # -------------------------
-# РЕГИСТРАЦИЯ
+# РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
 # -------------------------
 def register_planner_handlers(app: Application):
-    app.add_handler(CallbackQueryHandler(cb_open_plan_mode, pattern="^OPEN_PLAN_MODE$"))
-    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,  pattern="^OPEN_GEN_MODE$"))
-    app.add_handler(CallbackQueryHandler(cb_list_today,     pattern="^PLAN_LIST_TODAY$"))
-    app.add_handler(CallbackQueryHandler(cb_step_back,      pattern="^STEP_BACK$"))
-    app.add_handler(CallbackQueryHandler(cb_back_main_menu, pattern="^BACK_MAIN_MENU$"))
-    app.add_handler(CallbackQueryHandler(cb_plan_done,      pattern="^PLAN_DONE$"))
-    app.add_handler(CallbackQueryHandler(cb_gen_done,       pattern="^GEN_DONE$"))
-    app.add_handler(CallbackQueryHandler(cb_add_more,       pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"))
+    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"))
+    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"))
+    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"))
+    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"))
+
+    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"))
+    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"))
+    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"))
+    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"))
+    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"))
+
+    # Ввод пользователем (перехватываем только если он в режиме планировщика)
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, on_user_message))
 
 # -------------------------
-# FAKE CallbackQuery
+# FAKE CallbackQuery (для унификации шагов)
 # -------------------------
 async def _build_fake_callback_from_message(message: Message, bot) -> CallbackQuery:
     cq = CallbackQuery(
@@ -285,4 +432,5 @@ async def _update_to_callback_query(update: Update, bot):
         return update.callback_query
     return await _build_fake_callback_from_message(update.message, bot)
 
+# Патч метода Update — удобно дергать одинаково из шагов
 setattr(Update, "to_callback_query", _update_to_callback_query)
