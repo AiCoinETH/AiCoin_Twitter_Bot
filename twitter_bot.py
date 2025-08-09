@@ -323,7 +323,7 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None,
         return tmp_file.name
 
 async def save_image_and_get_github_url(image_path):
-    filename = f"{uuid.uuid4().hex}.jpg}"
+    filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
 
