@@ -8,7 +8,6 @@ import random
 import sys
 import tempfile
 import uuid
-import base64
 from datetime import datetime, timedelta, time as dt_time
 from unicodedata import normalize
 from zoneinfo import ZoneInfo
@@ -21,10 +20,10 @@ import aiosqlite
 from github import Github
 from openai import OpenAI  # openai>=1.35.0
 
-# === ПЛАНИРОВЩИК: ДОБАВЛЕНО ===
+# === ПЛАНИРОВЩИК ===
 from planner import register_planner_handlers, open_planner
 from planner import USER_STATE as PLANNER_STATE
-# ===============================
+# ====================
 
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -72,13 +71,14 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
-client_oa = OpenAI(api_key=OPENAI_API_KEY)
+# Не ретраим 429 бесконечно
+client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 
 # -----------------------------------------------------------------------------
 # ТАЙМЕРЫ
 # -----------------------------------------------------------------------------
-TIMER_PUBLISH_DEFAULT = 180            # ожидание решения на старте (плейсхолдер)
-TIMER_PUBLISH_EXTEND  = 600            # 10 минут после любого взаимодействия
+TIMER_PUBLISH_DEFAULT = 180            # ожидание решения на старте
+TIMER_PUBLISH_EXTEND  = 600            # +10 минут после любого взаимодействия
 AUTO_SHUTDOWN_AFTER_SECONDS = 600      # 10 минут неактивности
 
 DISABLE_WEB_PREVIEW = True
@@ -126,7 +126,7 @@ day_plan = []  # {"time": dt, "text": str, "tags": list[str], "img": str|None, "
 # -----------------------------------------------------------------------------
 def get_start_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Пост", callback_data="approve")],  # вернули как просил
+        [InlineKeyboardButton("✅ Пост", callback_data="approve")],
         [InlineKeyboardButton("📢 Пост", callback_data="post_menu")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🆕 Новый пост (ИИ)", callback_data="new_post_ai")],
@@ -439,7 +439,8 @@ def normalize_text_for_hashing(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    import hashlib as _h
+    return _h.sha256(data).hexdigest()
 
 async def is_duplicate_post(text: str, image_url: str | None) -> bool:
     text_norm = normalize_text_for_hashing(text)
@@ -482,7 +483,6 @@ async def save_post_to_history(text, image_url=None):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        # FIX: новый клиент OpenAI 1.x
         resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -672,7 +672,6 @@ async def publish_post_to_telegram(text, image_url=None):
     try:
         text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
         if image_url:
-            # Используем безопасную подкачку вместо прямого URL
             await send_photo_with_download(
                 channel_bot,
                 TELEGRAM_CHANNEL_USERNAME_ID,
@@ -697,7 +696,7 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# СТАРТ: одно сообщение (ближайший пост + ПОЛНЫЙ набор кнопок). Если молчание — автопост TG+TW и выключение.
+# СТАРТ: одно сообщение (предпросмотр + кнопки). Если молчание — автопост TG+TW и выключение.
 # -----------------------------------------------------------------------------
 async def send_start_placeholder():
     text_en = post_data["text_en"]
@@ -706,7 +705,6 @@ async def send_start_placeholder():
 
     tg_preview = build_telegram_preview(text_en, ai_tags)
 
-    # FIX: безопасная отправка через подкачку файла
     try:
         if img_url:
             await send_photo_with_download(
@@ -734,11 +732,10 @@ async def send_start_placeholder():
             reply_markup=get_start_menu()
         )
 
-    # режим "placeholder": если нет действий — автопост TG+TW и выключение
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
 # -----------------------------------------------------------------------------
-# ТАЙМЕР: молчание на старте => автопост TG+TW и выключение
+# ТАЙМЕР старта и автоотключение
 # -----------------------------------------------------------------------------
 async def check_timer():
     while True:
@@ -768,9 +765,6 @@ async def check_timer():
         except Exception as e:
             logging.warning(f"check_timer error: {e}")
 
-# -----------------------------------------------------------------------------
-# АВТОВЫКЛЮЧЕНИЕ ПО НЕАКТИВНОСТИ (10 минут, любое действие — продлевает)
-# -----------------------------------------------------------------------------
 async def check_inactivity_shutdown():
     global last_button_pressed_at
     while True:
@@ -814,19 +808,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[user_id] = now
 
-    # === ПЛАНИРОВЩИК: отдаём его колбэки ему самому ===
+    # === ПЛАНИРОВЩИК: его колбэки обрабатывают его же хендлеры ===
     planner_callbacks = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
         "STEP_BACK", "PLAN_LIST_TODAY"
     }
     if data in planner_callbacks or data.startswith("PLAN_"):
-        return  # планировщик обработает через свои CallbackQueryHandler'ы
+        return  # планировщик перехватит
 
-    # Кнопка нашего меню -> открыть UI планировщика
+    # Открыть UI планировщика из нашего меню
     if data == "show_day_plan":
         return await open_planner(update, context)
-    # === конец вставки для планировщика ===
 
     if data == "shutdown_bot":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
@@ -868,7 +861,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
-        # Показать раздельный предпросмотр текущего поста
         await preview_split(
             approval_bot,
             TELEGRAM_APPROVAL_CHAT_ID,
@@ -877,11 +869,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_url=post_data.get("image_url"),
             header="Предпросмотр"
         )
-        return
-
-    if data == "show_day_plan":
-        await report_day_plan_status()
-        await preview_day_plan()
         return
 
     if data in ("post_twitter", "post_telegram", "post_both"):
@@ -995,8 +982,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === ПЛАНИРОВЩИК: если пользователь в его режиме — не мешаем ===
     try:
         uid = update.effective_user.id
-        st = PLANNER_STATE.get(uid)
-        if st and st.get("mode") in ("plan", "gen"):
+        st = PLANNER_STATE.get(uid) or {}
+        cur = st.get("current")
+        cur_mode = getattr(cur, "mode", None) if cur else None
+        if (st.get("mode") in ("plan", "gen")) or (cur_mode in ("plan", "gen")):
             return  # planner.py обработает свой ввод
     except Exception:
         pass
@@ -1012,8 +1001,8 @@ async def on_start(app: Application):
     await init_db()
 
     # фоновые задачи
-    asyncio.create_task(check_timer())                 # стартовое молчание => автопост
-    asyncio.create_task(check_inactivity_shutdown())   # общее авто-выключение по неактивности
+    asyncio.create_task(check_timer())
+    asyncio.create_task(check_inactivity_shutdown())
 
     # Старт: одно сообщение (ближайший пост + ПОЛНЫЙ набор кнопок)
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
@@ -1022,7 +1011,7 @@ async def on_start(app: Application):
     post_data["image_url"] = img
     await send_start_placeholder()
 
-    # План дня — строим и планируем ТИХО (покажется только по кнопке «🗓 ИИ план на день»)
+    # План дня — строим и планируем ТИХО
     await build_day_plan_for_today()
     for idx in range(len(day_plan)):
         asyncio.create_task(schedule_slot(idx))
@@ -1046,7 +1035,7 @@ def shutdown_bot_and_exit():
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(on_start).build()
 
-    # === ПЛАНИРОВЩИК: регистрируем его хендлеры ===
+    # === ПЛАНИРОВЩИК: регистрируем его хендлеры ДО нашего общего CallbackQueryHandler ===
     register_planner_handlers(app)
 
     # Наши хендлеры
