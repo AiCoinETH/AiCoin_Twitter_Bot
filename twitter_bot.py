@@ -121,6 +121,7 @@ day_plan = []  # {"time": dt, "text": str, "tags": list[str], "img": str|None, "
 # -----------------------------------------------------------------------------
 def get_start_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Пост", callback_data="approve")],  # вернули как просил
         [InlineKeyboardButton("📢 Пост", callback_data="post_menu")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🆕 Новый пост (ИИ)", callback_data="new_post_ai")],
@@ -404,8 +405,8 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
                 return None, None
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
-        await bot.send_message(chat_id=chat_id, text=caption or " ", parse_mode="HTML",
-                               reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+        await bot.send_message(chat_id=chat_id, text=caption or " ",
+                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
         return None, None
 
 # -----------------------------------------------------------------------------
@@ -476,7 +477,8 @@ async def save_post_to_history(text, image_url=None):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        resp = client_oa.chat_completions.create(
+        # FIX: новый клиент OpenAI 1.x
+        resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
@@ -679,15 +681,33 @@ async def send_start_placeholder():
     img_url = post_data.get("image_url")
 
     tg_preview = build_telegram_preview(text_en, ai_tags)
-    if img_url:
-        await approval_bot.send_photo(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=img_url,
-            caption=tg_preview, parse_mode="HTML", reply_markup=get_start_menu()
-        )
-    else:
+
+    # FIX: безопасная отправка через подкачку файла
+    try:
+        if img_url:
+            await send_photo_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                img_url,
+                caption=tg_preview,
+                reply_markup=get_start_menu()
+            )
+        else:
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=tg_preview,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=get_start_menu()
+            )
+    except Exception as e:
+        logging.warning(f"send_start_placeholder image failed, fallback to text: {e}")
         await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=tg_preview,
-            parse_mode="HTML", disable_web_page_preview=True, reply_markup=get_start_menu()
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=tg_preview,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=get_start_menu()
         )
 
     # режим "placeholder": если нет действий — автопост TG+TW и выключение
