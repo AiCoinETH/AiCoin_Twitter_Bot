@@ -1,0 +1,47 @@
+name: Test Twitter Bot
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [telegram-bot-restart]
+
+jobs:
+  test-bot:
+    runs-on: ubuntu-latest
+
+    env:
+      # Telegram bot settings
+      TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
+      TELEGRAM_APPROVAL_CHAT_ID: ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
+      TELEGRAM_BOT_TOKEN_CHANNEL: ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
+      TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
+
+      # Twitter API keys
+      TWITTER_API_KEY: ${{ secrets.TWITTER_API_KEY }}
+      TWITTER_API_SECRET: ${{ secrets.TWITTER_API_SECRET }}
+      TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+      TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+      TWITTER_BEARER_TOKEN: ${{ secrets.TWITTER_BEARER_TOKEN }}
+
+      # Github Action launch secrets
+      ACTION_PAT_GITHUB: ${{ secrets.ACTION_PAT_GITHUB }}
+      ACTION_REPO_GITHUB: ${{ secrets.ACTION_REPO_GITHUB }}
+      ACTION_EVENT_GITHUB: ${{ secrets.ACTION_EVENT_GITHUB }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run Twitter Bot
+        run: python twitter_bot.py
