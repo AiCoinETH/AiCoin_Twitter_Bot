@@ -323,7 +323,7 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None,
         return tmp_file.name
 
 async def save_image_and_get_github_url(image_path):
-    filename = f"{uuid.uuid4().hex}.jpg"
+    filename = f"{uuid.uuid4().hex}.jpg}"
     url = upload_image_to_github(image_path, filename)
     return url, filename
 
@@ -659,17 +659,36 @@ def publish_post_to_twitter(text, image_url=None):
         return False
 
 async def publish_post_to_telegram(text, image_url=None):
+    """
+    Надёжная публикация в TELEGRAM КАНАЛ:
+    - всегда подкачиваем картинку локально (исключает 400 Wrong type of the web page content)
+    - добавляем HTML-подпись
+    """
     try:
         text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
         if image_url:
-            await channel_bot.send_photo(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=image_url, caption=text_with_signature, parse_mode="HTML")
+            # Используем безопасную подкачку вместо прямого URL
+            await send_photo_with_download(
+                channel_bot,
+                TELEGRAM_CHANNEL_USERNAME_ID,
+                image_url,
+                caption=text_with_signature,
+                reply_markup=None
+            )
         else:
-            await channel_bot.send_message(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, text=text_with_signature,
-                                           parse_mode="HTML", disable_web_page_preview=True)
+            await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=text_with_signature,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
         return True
     except Exception as e:
         logging.error(f"Ошибка публикации в Telegram: {e}")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Telegram: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Telegram: {e}"
+        )
         return False
 
 # -----------------------------------------------------------------------------
