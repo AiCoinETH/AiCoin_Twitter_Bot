@@ -478,10 +478,6 @@ async def save_post_to_history(text, image_url=None):
 # ИИ: генерация текста и картинки (OpenAI 1.35+)
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
-    """
-    Генерим короткий EN промо-текст 1–3 предложения, без слов 'google/trends',
-    максимум ~500 символов (дальше режем до 666 на уровне билдеров).
-    """
     try:
         resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
@@ -493,7 +489,6 @@ def _oa_chat_text(prompt: str) -> str:
             max_tokens=220,
         )
         txt = (resp.choices[0].message.content or "").strip()
-        # убираем лишние кавычки/код-блоки
         txt = txt.strip('"\n` ')
         return txt
     except Exception as e:
@@ -515,9 +510,6 @@ def _oa_image_b64(prompt: str, size: str = "1024x1024") -> bytes | None:
         return None
 
 async def generate_image_to_github(prompt: str) -> str:
-    """
-    Генерит картинку и заливает в GitHub, возвращает RAW URL.
-    """
     raw = _oa_image_b64(prompt)
     if not raw:
         return random.choice(fallback_images)
@@ -533,9 +525,6 @@ async def generate_image_to_github(prompt: str) -> str:
     return url or random.choice(fallback_images)
 
 async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
-    """
-    Генерация EN-текста (≤666 режем далее), AI/crypto-хештегов и картинки.
-    """
     text_prompt = (
         "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
         "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon."
@@ -543,7 +532,6 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     )
     text_en = _oa_chat_text(text_prompt)
 
-    # 2–4 релевантных хештега поверх наших
     extra_tags_prompt = (
         "Give me 3 short, relevant crypto+AI hashtags for a social post about Ai Coin (no duplicates of #AiCoin, #AI, #crypto, $Ai), "
         "single line, space-separated, each begins with #, only AI/crypto topics."
@@ -766,31 +754,30 @@ async def schedule_post_at(when: datetime, text_en: str, ai_hashtags: list[str] 
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"Готово: {tag} — Telegram: {'✅' if tg_ok else '❌'}, Twitter: {'✅' if tw_ok else '❌'}")
 
-async def schedule_night_posts():
+async def schedule_day_posts():
     """
-    3 разных EN промо + 3 разных картинки:
-    02:00 — utility & community,
-    03:00 — governance & voting,
-    05:00 — AI-powered proposals & speed.
+    3 EN-промо с разными картинками:
+    12:00 — utility & community,
+    13:00 — governance & voting,
+    14:00 — AI-powered proposals & speed.
     """
     topics = [
         "Utility, community growth and joining early to hit 2,000 followers fast.",
         "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
         "Direct dialog: Telegram gated by MetaMask balance; you + AI co-create live ideas."
     ]
-    # генерим контент и картинки заранее
     bundles = []
     for t in topics:
         text_en, tags, img = await ai_generate_content_en(t)
         bundles.append((text_en, tags, img))
 
-    t_02 = _next_dt_at(2, 0)
-    t_03 = _next_dt_at(3, 0)
-    t_05 = _next_dt_at(5, 0)
+    t_12 = _next_dt_at(12, 0)
+    t_13 = _next_dt_at(13, 0)
+    t_14 = _next_dt_at(14, 0)
 
-    asyncio.create_task(schedule_post_at(t_02, bundles[0][0], bundles[0][1], bundles[0][2], "Ночной пост (02:00)"))
-    asyncio.create_task(schedule_post_at(t_03, bundles[1][0], bundles[1][1], bundles[1][2], "Ночной пост (03:00)"))
-    asyncio.create_task(schedule_post_at(t_05, bundles[2][0], bundles[2][1], bundles[2][2], "Ночной пост (05:00)"))
+    asyncio.create_task(schedule_post_at(t_12, bundles[0][0], bundles[0][1], bundles[0][2], "Дневной пост (12:00)"))
+    asyncio.create_task(schedule_post_at(t_13, bundles[1][0], bundles[1][1], bundles[1][2], "Дневной пост (13:00)"))
+    asyncio.create_task(schedule_post_at(t_14, bundles[2][0], bundles[2][1], bundles[2][2], "Дневной пост (14:00)"))
 
 # -----------------------------------------------------------------------------
 # CALLBACK HANDLER
@@ -844,7 +831,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "new_post_ai":
-        # сгенерировать новый EN пост прямо сейчас
         text_en, ai_tags, img = await ai_generate_content_en("General awareness and community invite.")
         post_data["text_en"] = text_en
         post_data["ai_hashtags"] = ai_tags
@@ -917,7 +903,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     post_data["text_en"] = text.strip()
-    post_data["ai_hashtags"] = []  # можно парсить из текста, но по умолчанию пусто — добавятся твои базовые
+    post_data["ai_hashtags"] = []
     post_data["image_url"] = image_url if image_url else None
     post_data["post_id"] += 1
     post_data["is_manual"] = True
@@ -1004,9 +990,9 @@ async def on_start(app: Application):
     post_data["image_url"] = img
 
     await send_start_placeholder()     # стартовое сообщение + таймер
-    await schedule_night_posts()       # автопосты 02:00, 03:00, 05:00 по Киеву
+    await schedule_day_posts()         # автопосты 12:00, 13:00, 14:00 по Киеву
 
-    logging.info("Бот запущен. Заглушка отправлена. Ночные посты запланированы.")
+    logging.info("Бот запущен. Заглушка отправлена. Дневные посты запланированы (12/13/14).")
 
 # -----------------------------------------------------------------------------
 # Выключение
