@@ -21,6 +21,11 @@ import aiosqlite
 from github import Github
 from openai import OpenAI  # openai>=1.35.0
 
+# === ПЛАНИРОВЩИК: ДОБАВЛЕНО ===
+from planner import register_planner_handlers, open_planner
+from planner import USER_STATE as PLANNER_STATE
+# ===============================
+
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
@@ -84,7 +89,7 @@ DISABLE_WEB_PREVIEW = True
 TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twitter X</a>'
 
 # -----------------------------------------------------------------------------
-# ФОЛБЭК‑КАРТИНКИ
+# ФОЛБЭК-КАРТИНКИ
 # -----------------------------------------------------------------------------
 fallback_images = [
     "https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png",
@@ -797,7 +802,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
-    # Любая кнопка — продлевает жизнь и выводит из placeholder‑режима
+    # Любая кнопка — продлевает жизнь и выводит из placeholder-режима
     pending_post["active"] = True
     pending_post["timer"] = now
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -808,6 +813,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 1:
         return
     last_action_time[user_id] = now
+
+    # === ПЛАНИРОВЩИК: отдаём его колбэки ему самому ===
+    planner_callbacks = {
+        "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
+        "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
+        "STEP_BACK", "PLAN_LIST_TODAY"
+    }
+    if data in planner_callbacks or data.startswith("PLAN_"):
+        return  # планировщик обработает через свои CallbackQueryHandler'ы
+
+    # Кнопка нашего меню -> открыть UI планировщика
+    if data == "show_day_plan":
+        return await open_planner(update, context)
+    # === конец вставки для планировщика ===
 
     if data == "shutdown_bot":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
@@ -973,6 +992,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
+    # === ПЛАНИРОВЩИК: если пользователь в его режиме — не мешаем ===
+    try:
+        uid = update.effective_user.id
+        st = PLANNER_STATE.get(uid)
+        if st and st.get("mode") in ("plan", "gen"):
+            return  # planner.py обработает свой ввод
+    except Exception:
+        pass
+    # === конец вставки ===
+
     # Любой текст/фото трактуем как ручной ввод
     return await handle_manual_input(update, context)
 
@@ -984,7 +1013,7 @@ async def on_start(app: Application):
 
     # фоновые задачи
     asyncio.create_task(check_timer())                 # стартовое молчание => автопост
-    asyncio.create_task(check_inactivity_shutdown())   # общее авто‑выключение по неактивности
+    asyncio.create_task(check_inactivity_shutdown())   # общее авто-выключение по неактивности
 
     # Старт: одно сообщение (ближайший пост + ПОЛНЫЙ набор кнопок)
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
@@ -1016,8 +1045,14 @@ def shutdown_bot_and_exit():
 # -----------------------------------------------------------------------------
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(on_start).build()
+
+    # === ПЛАНИРОВЩИК: регистрируем его хендлеры ===
+    register_planner_handlers(app)
+
+    # Наши хендлеры
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_handler))
+
     app.run_polling(poll_interval=0.12, timeout=1)
 
 # -----------------------------------------------------------------------------
