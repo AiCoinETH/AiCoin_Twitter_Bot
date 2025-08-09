@@ -71,9 +71,11 @@ TZ = ZoneInfo("Europe/Kyiv")
 
 client_oa = OpenAI(api_key=OPENAI_API_KEY)
 
-# расписание/таймеры
+# -----------------------------------------------------------------------------
+# ТАЙМЕРЫ
+# -----------------------------------------------------------------------------
 TIMER_PUBLISH_DEFAULT = 180            # ожидание решения на старте (заглушка)
-TIMER_PUBLISH_EXTEND  = 180
+TIMER_PUBLISH_EXTEND  = 600            # ← 10 минут после любого взаимодействия
 AUTO_SHUTDOWN_AFTER_SECONDS = 600      # 10 минут после последнего взаимодействия
 
 DISABLE_WEB_PREVIEW = True
@@ -118,14 +120,14 @@ last_button_pressed_at = None
 day_plan = []  # {"time": dt, "text": str, "tags": list[str], "img": str|None, "status": "scheduled|published|skipped", "note": str}
 
 # -----------------------------------------------------------------------------
-# СТАРТОВОЕ МЕНЮ (из первого файла + «🗓 ИИ план на день»)
+# СТАРТОВОЕ МЕНЮ (как в первом файле) + одна кнопка плана
 # -----------------------------------------------------------------------------
 def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Пост", callback_data="post_menu")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🆕 Новый пост (ИИ)", callback_data="new_post_ai")],
-        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],  # единственная новая кнопка
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
@@ -663,7 +665,7 @@ async def publish_slot(slot_idx: int):
         slot["note"] = (slot.get("note") or "") + " (publish error)"
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏭️ Skipped due to error")
 
-    # после автопоста или ошибки — выключаемся (по требованиям)
+    # После автопоста или ошибки — выключаем сразу (требование)
     shutdown_bot_and_exit()
 
 async def schedule_slot(slot_idx: int):
@@ -753,18 +755,16 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# СТАРТОВЫЙ ПЛЕЙСХОЛДЕР (предпросмотр + меню; при молчании — выключение без поста)
+# СТАРТ: split‑предпросмотр + меню, при молчании — выключение без поста
 # -----------------------------------------------------------------------------
 async def send_start_placeholder():
     text_en = post_data["text_en"]
     ai_tags = post_data.get("ai_hashtags") or []
     img_url = post_data.get("image_url")
     try:
-        # Разделённый предпросмотр первого поста
         await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, text_en, ai_tags, image_url=img_url, header="Стартовое сообщение")
-        # Показать стартовое меню
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
-        # Включаем режим "placeholder": если нет действий — отключаемся БЕЗ публикации
+        # режим "placeholder": если нет действий — отключаемся БЕЗ публикации
         pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
     except Exception as e:
         logging.error(f"Ошибка отправки заглушки: {e}")
@@ -786,7 +786,6 @@ async def check_timer():
                             pass
                         shutdown_bot_and_exit()
                     else:
-                        # На всякий случай: в обычном режиме ничего не делаем авто‑постом.
                         pending_post["active"] = False
         except asyncio.CancelledError:
             raise
@@ -819,7 +818,7 @@ async def check_inactivity_shutdown():
 # CALLBACK HANDLER
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_button_pressed_at, prev_data, last_action_time
+    global last_button_pressed_at, last_action_time
     query = update.callback_query
     data = query.data
     await query.answer()
@@ -827,7 +826,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
-    # Любая кнопка — продлеваем жизнь и выходим из placeholder‑режима
+    # Любая кнопка — продлевает жизнь и выводит из placeholder‑режима
     pending_post["active"] = True
     pending_post["timer"] = now
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -879,9 +878,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
-        # Показать план + предпросмотры всех слотов (как просил)
-        await report_day_plan_status()
-        await preview_day_plan()
+        # Показать split‑предпросмотр текущего поста (как в первом файле)
+        await preview_split(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            post_data.get("text_en") or "",
+            post_data.get("ai_hashtags") or [],
+            image_url=post_data.get("image_url"),
+            header="Предпросмотр"
+        )
         return
 
     if data == "show_day_plan":
@@ -977,7 +982,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
 
 # -----------------------------------------------------------------------------
-# ПУБЛИКАЦИЯ: общая логика/дедупликация/БД (по кнопкам, не авто)
+# ПУБЛИКАЦИЯ: общая логика/дедупликация/БД (по кнопкам)
 # -----------------------------------------------------------------------------
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
@@ -1042,19 +1047,17 @@ async def on_start(app: Application):
     asyncio.create_task(check_timer())                 # только для стартовой заглушки
     asyncio.create_task(check_inactivity_shutdown())   # общее авто‑выключение по неактивности
 
-    # Заглушка (EN) в чат согласования — ПРЕДПРОСМОТР + МЕНЮ
+    # Старт: split‑предпросмотр + меню, без автопубликации если молчим
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
     await send_start_placeholder()
 
-    # План дня 14:00/15:00/16:00 и отчёт + предпросмотры
+    # План дня 14:00/15:00/16:00: отчёт + предпросмотры + расписание
     await build_day_plan_for_today()
     await report_day_plan_status()
     await preview_day_plan()
-
-    # Планируем публикации
     for idx in range(len(day_plan)):
         asyncio.create_task(schedule_slot(idx))
 
