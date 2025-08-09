@@ -6,7 +6,8 @@ on:
     types: [telegram-bot-restart]
   schedule:
     # GitHub Actions работает в UTC. Киев сейчас UTC+3.
-    - cron: "0 9-11 * * *"   # 12:00, 13:00, 14:00 Kyiv
+    # Для 14:00, 15:00, 16:00 Kyiv нужно UTC 11:00, 12:00, 13:00
+    - cron: "0 11-13 * * *"   # 14:00, 15:00, 16:00 Kyiv
 
 jobs:
   test-bot:
