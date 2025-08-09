@@ -81,6 +81,11 @@ AUTO_SHUTDOWN_AFTER_SECONDS = 600
 DISABLE_WEB_PREVIEW = True
 
 # -----------------------------------------------------------------------------
+# ПОДПИСЬ ДЛЯ TELEGRAM-ПУБЛИКАЦИЙ
+# -----------------------------------------------------------------------------
+TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twitter X</a>'
+
+# -----------------------------------------------------------------------------
 # КАРТИНКИ-ФОЛБЭКИ (на случай, если генерация ляжет)
 # -----------------------------------------------------------------------------
 fallback_images = [
@@ -186,17 +191,22 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# ПОСТОСТРОИТЕЛИ: EN-контент, TG=полный, TW<=279, тело<=666
+# ПОСТОСТРОИТЕЛИ: EN-контент, TG=полный, TW<=260, тело<=666
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
+
+# Подпись/хвосты для Twitter (Telegram получает свою подпись отдельно при отправке)
 LINKS_SIGNATURE = "Learn more: https://getaicoin.com/ | telegram: https://t.me/AiCoin_ETH"
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 279  # общий лимит для X
+
+# Жёсткий лимит твита
+TW_MAX = 260  # <= 260 символов с учётом t.co
 
 def twitter_len(s: str) -> int:
     if not s: return 0
     s = normalize("NFC", s)
+    # учитываем, что все URL считаются длиной _TCO_LEN
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_plain_to(s: str, max_len: int) -> str:
@@ -239,7 +249,16 @@ def _dedup_hashtags(*tags_groups):
     for g in tags_groups: feed(g)
     return " ".join(out)
 
-def compose_full_text(ai_text_en: str, ai_hashtags=None) -> str:
+def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
+    """Тело + хештеги, БЕЗ ссылочного хвоста (для Telegram; подпись добавится при отправке)."""
+    body = trim_plain_to((ai_text_en or "").strip(), 666)
+    tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
+    if body and tags:
+        return f"{body} {tags}"
+    return body or tags
+
+def compose_full_text_with_links(ai_text_en: str, ai_hashtags=None) -> str:
+    """Тело + хвост со ссылками + хештеги (для Twitter)."""
     body = trim_plain_to((ai_text_en or "").strip(), 666)
     tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
     suffix_parts = [LINKS_SIGNATURE]
@@ -249,26 +268,32 @@ def compose_full_text(ai_text_en: str, ai_hashtags=None) -> str:
     return body or suffix
 
 def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
+    """Строго вписываемся в TW_MAX=260 с учётом t.co."""
+    suffix_text = compose_full_text_with_links("", ai_hashtags)  # получим хвост (links + hashtags)
     body = trim_plain_to((ai_text_en or "").strip(), 666)
-    tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
-    suffix_parts = [LINKS_SIGNATURE]
-    if tags: suffix_parts.append(tags)
-    suffix = " ".join(suffix_parts).strip()
-    sep = " " if body and suffix else ""
-    allowed_for_body = TW_MAX - (1 if sep else 0) - twitter_len(suffix)
+
+    # Посчитаем допустимую длину для body
+    sep = " " if body and suffix_text else ""
+    allowed_for_body = TW_MAX - (1 if sep else 0) - twitter_len(suffix_text)
     if allowed_for_body < 0:
-        return trim_to_twitter_len(suffix, TW_MAX)
+        # если хвост сам по себе длиннее лимита — ужмём весь текст до лимита
+        return trim_to_twitter_len(suffix_text, TW_MAX)
+
     body_trimmed = trim_to_twitter_len(body, allowed_for_body)
-    composed = (f"{body_trimmed}{sep}{suffix}").strip()
+    composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
+
+    # Безопасно ещё раз прогарантируем лимит
     while twitter_len(composed) > TW_MAX and body_trimmed:
         body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
-        composed = (f"{body_trimmed}{sep}{suffix}").strip()
-    if not body_trimmed and twitter_len(suffix) > TW_MAX:
-        composed = trim_to_twitter_len(suffix, TW_MAX)
+        composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
+
+    if not body_trimmed and twitter_len(suffix_text) > TW_MAX:
+        composed = trim_to_twitter_len(suffix_text, TW_MAX)
     return composed
 
 def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
-    return compose_full_text(ai_text_en, ai_hashtags)
+    """Тело + хештеги (БЕЗ ссылок). Подпись добавим при фактической отправке."""
+    return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_twitter_post(ai_text_en, ai_hashtags)
@@ -608,7 +633,9 @@ def publish_post_to_twitter(text, image_url=None):
             media_ids = [media.media_id_string]
             os.remove(file_path)
 
-        twitter_client_v2.create_tweet(text=text, media_ids=media_ids)
+        # финальная страховка: не дать превысить 260
+        final_text = build_twitter_post(text, [])
+        twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
@@ -625,10 +652,12 @@ def publish_post_to_twitter(text, image_url=None):
 # -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text, image_url=None):
     try:
+        # приклеиваем подпись только здесь
+        text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
         if image_url:
-            await send_photo_with_download(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, image_url, caption=text)
+            await send_photo_with_download(channel_bot, TELEGRAM_CHANNEL_USERNAME_ID, image_url, caption=text_with_signature)
         else:
-            await channel_bot.send_message(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, text=text,
+            await channel_bot.send_message(chat_id=TELEGRAM_CHANNEL_USERNAME_ID, text=text_with_signature,
                                            parse_mode="HTML", disable_web_page_preview=True)
         return True
     except Exception as e:
@@ -781,6 +810,7 @@ async def schedule_day_posts():
 
 # -----------------------------------------------------------------------------
 # CALLBACK HANDLER
+# (Сбрасываем таймер при ЛЮБОЙ кнопке)
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, prev_data, manual_posts_today, last_action_time
@@ -788,13 +818,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
-    last_button_pressed_at = datetime.now(TZ)
-    if pending_post["active"]:
-        pending_post["active"] = False
+    now = datetime.now(TZ)
+    last_button_pressed_at = now
+
+    # СБРОС ТАЙМЕРА при любом нажатии
+    pending_post["active"] = True
+    pending_post["timer"] = now
+    pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
 
     user_id = update.effective_user.id
-    now = datetime.now(TZ)
-    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 2:
+    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 1:
         return
     last_action_time[user_id] = now
 
@@ -821,8 +854,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
-        pending_post["active"] = True
-        pending_post["timer"] = datetime.now(TZ)
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото одним сообщением:",
@@ -846,7 +877,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("post_twitter", "post_telegram", "post_both"):
         publish_tg = data in ("post_telegram", "post_both")
         publish_tw = data in ("post_twitter", "post_both")
-        pending_post["active"] = False
         await publish_flow(publish_tg=publish_tg, publish_tw=publish_tw)
         return
 
@@ -866,7 +896,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "end_day":
-        pending_post["active"] = False
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -883,14 +912,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "think" or data == "chat":
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="🧐 Думаем дальше…" if data == "think" else ("💬 Начинаем чат:\n" + post_data["text_en"]),
+            text="🧐 Думаем дальше…" if data == "think" else ("💬 Начинаем чат:\n" + (post_data.get("text_en") or "")),
             reply_markup=main_keyboard() if data == "think" else post_end_keyboard())
         return
 
 # -----------------------------------------------------------------------------
 # РУЧНОЙ ВВОД ПОСЛЕ «Сделай сам»
+# (Сбрасываем таймер при любом сообщении)
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # СБРОС ТАЙМЕРА при входящем сообщении
+    pending_post["active"] = True
+    pending_post["timer"] = datetime.now(TZ)
+    pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
+
     text = update.message.text or update.message.caption or ""
     image_url = None
 
@@ -952,6 +987,8 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
+            # финально ужмём на всякий случай
+            twitter_text = build_twitter_post(base_text_en, ai_tags)
             tw_status = publish_post_to_twitter(twitter_text, img)
             if tw_status: await save_post_to_history(twitter_text, img)
 
@@ -962,15 +999,18 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Выберите действие:", reply_markup=get_start_menu())
 
-    if not post_data.get("is_manual"):
-        shutdown_bot_and_exit()
-
 # -----------------------------------------------------------------------------
-# MESSAGE HANDLER
+# MESSAGE HANDLER (сбрасываем таймер)
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at
     last_button_pressed_at = datetime.now(TZ)
+
+    # СБРОС ТАЙМЕРА при любом входящем сообщении
+    pending_post["active"] = True
+    pending_post["timer"] = last_button_pressed_at
+    pending_post["timeout"] = TIMER_PUBLISH_DEFAULT
+
     if pending_post.get("active"):
         return await handle_manual_input(update, context)
     await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Открой меню и выбери действие:", reply_markup=get_start_menu())
