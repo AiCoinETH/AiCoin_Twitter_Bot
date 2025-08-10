@@ -25,7 +25,7 @@ class PlannedItem:
     time_str: Optional[str] = None
     image_url: Optional[str] = None
     step: str = "idle"   # idle | waiting_topic | waiting_text | waiting_time | confirm | editing_*
-    mode: str = "none"   # plan | gen
+    mode: str = "none"   # plan | gen | edit
 
 # -------------------------
 # РЕГИСТРАТОР ИИ-ГЕНЕРАТОРА (ЧТОБЫ НЕ ИМПОРТИРОВАТЬ twitter_bot)
@@ -34,10 +34,10 @@ _AI_GEN_FN: Optional[
     Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
 ] = None
 
-def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]):
+def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str], List[str], Optional[str]]]):
     """Регистрируется из основного бота: set_ai_generator(ai_generate_content_en)"""
     global _AI_GEN_FN
-    _AI_GEN_FN = fn
+    _AI_GEN_FN = fn  # type: ignore
 
 # -------------------------
 # КНОПКИ
@@ -68,7 +68,6 @@ def cancel_only() -> InlineKeyboardMarkup:
     ])
 
 def _item_actions_kb(pid: int, mode: str) -> InlineKeyboardMarkup:
-    # Редактирование, изменение времени, удаление, и «ИИ заполнит текст, сохранив тему/время» (только для PLAN)
     rows = [
         [
             InlineKeyboardButton("✏️ Править", callback_data=f"EDIT_ITEM:{pid}"),
@@ -80,6 +79,10 @@ def _item_actions_kb(pid: int, mode: str) -> InlineKeyboardMarkup:
     ]
     if mode == "plan":
         rows.insert(1, [InlineKeyboardButton("🤖 ИИ: дополнить текст (сохр. тему/время)", callback_data=f"AI_FILL_TEXT:{pid}")])
+        rows.insert(2, [InlineKeyboardButton("🤖 ИИ: новый пост (сохр. тему/время)", callback_data=f"AI_NEW_FROM:{pid}")])
+        rows.insert(3, [InlineKeyboardButton("➕ Клон (сохр. тему/время)", callback_data=f"CLONE_ITEM:{pid}")])
+    else:
+        rows.insert(1, [InlineKeyboardButton("➕ Клон (сохр. тему/время)", callback_data=f"CLONE_ITEM:{pid}")])
     return InlineKeyboardMarkup(rows)
 
 def _edit_fields_kb(pid: int, mode: str) -> InlineKeyboardMarkup:
@@ -281,7 +284,6 @@ def _format_item_row(i: int, it: Dict[str, Any]) -> str:
     return f"{i}) [GEN] {time_s} — {txt} {img}"
 
 def _list_kb(uid: int) -> InlineKeyboardMarkup:
-    # Кнопки «управления» по каждому элементу
     items = USER_STATE.get(uid, {}).get("items", [])
     rows: List[List[InlineKeyboardButton]] = []
     for it in items:
@@ -306,7 +308,7 @@ async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_edit_or_send(q, "Список на сегодня:\n" + "\n".join(lines), reply_markup=_list_kb(uid))
 
 # -------------------------
-# ITEM MENU / EDIT / DELETE / TIME / AI_FILL
+# ITEM MENU / EDIT / DELETE / TIME / AI_FILL / CLONE / AI_NEW_FROM
 # -------------------------
 async def cb_item_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -319,7 +321,6 @@ async def cb_item_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not it:
         return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
 
-    # Показываем краткую сводку и действия
     lines = [
         f"ID: {pid}",
         f"Режим: {it['mode']}",
@@ -350,7 +351,6 @@ async def cb_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, f"Удалено #{pid}.", reply_markup=main_planner_menu())
 
 async def cb_edit_time_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Быстрая смена времени из меню элемента
     q = update.callback_query
     uid = q.from_user.id
     try:
@@ -395,25 +395,25 @@ async def cb_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_STATE[uid]["edit_target"] = pid
 
     if field == "topic":
-        st.step = "editing_topic"
+        st.step = "editing_topic"; st.mode = "edit"
         return await _safe_edit_or_send(q, "Введите новую тему:", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
         ]))
     if field == "text":
-        st.step = "editing_text"
+        st.step = "editing_text"; st.mode = "edit"
         return await _safe_edit_or_send(q, "Пришлите новый текст поста:", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
         ]))
     if field == "image":
-        st.step = "editing_image"
+        st.step = "editing_image"; st.mode = "edit"
         return await _safe_edit_or_send(q, "Пришлите новую картинку <i>(как фото или документ)</i> или отправьте «удалить», чтобы убрать картинку.", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
         ]))
     if field == "time":
-        st.step = "editing_time"
+        st.step = "editing_time"; st.mode = "edit"
         return await _safe_edit_or_send(q, "Введите новое время в формате <b>HH:MM</b> (Киев).", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
@@ -439,13 +439,69 @@ async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = it.get("topic") or ""
     try:
         text_en, tags, img = await _AI_GEN_FN(topic)
-        # Сохраняем текст (+хэштеги в самом тексте — как в кнопке AI build now), картинку — тоже
         it["text"] = f"{text_en}\n\n{' '.join(tags)}".strip()
         if img:
             it["image_url"] = img
         return await _safe_edit_or_send(q, "Текст дополнён ИИ (тема/время сохранены).", reply_markup=_item_actions_kb(pid, it["mode"]))
     except Exception:
         return await _safe_edit_or_send(q, "Не удалось сгенерировать текст ИИ.", reply_markup=_item_actions_kb(pid, it["mode"]))
+
+async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Создать новый элемент, сохранив тему и время, пустые текст/картинка
+    q = update.callback_query
+    uid = q.from_user.id
+    try:
+        pid = int(q.data.split(":", 1)[1])
+    except Exception:
+        return await _safe_edit_or_send(q, "Ошибка ID для клонирования.", reply_markup=main_planner_menu())
+    it = _find_item(uid, pid)
+    if not it:
+        return await _safe_edit_or_send(q, "Элемент не найден для клона.", reply_markup=main_planner_menu())
+
+    nid = _new_pid(uid)
+    USER_STATE[uid]["items"].append({
+        "id": nid,
+        "mode": it["mode"],               # сохраняем тип
+        "topic": it.get("topic"),         # сохраняем тему
+        "text": None,                     # очищаем текст
+        "time": it.get("time"),           # сохраняем время
+        "image_url": None,                # очищаем картинку
+        "added_at": datetime.utcnow().isoformat() + "Z"
+    })
+    return await _safe_edit_or_send(q, f"Создан клон #{nid} (сохр. тему/время).", reply_markup=_item_actions_kb(nid, it["mode"]))
+
+async def cb_ai_new_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Новый элемент на той же теме/времени, но с новым AI-текстом
+    q = update.callback_query
+    uid = q.from_user.id
+    try:
+        pid = int(q.data.split(":", 1)[1])
+    except Exception:
+        return await _safe_edit_or_send(q, "Ошибка ID.", reply_markup=main_planner_menu())
+    it = _find_item(uid, pid)
+    if not it:
+        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
+    if it["mode"] != "plan":
+        return await _safe_edit_or_send(q, "Доступно только для PLAN.", reply_markup=main_planner_menu())
+    if _AI_GEN_FN is None:
+        return await _safe_edit_or_send(q, "Генератор ИИ не подключён.", reply_markup=main_planner_menu())
+
+    topic = it.get("topic") or ""
+    try:
+        text_en, tags, img = await _AI_GEN_FN(topic)
+        nid = _new_pid(uid)
+        USER_STATE[uid]["items"].append({
+            "id": nid,
+            "mode": "plan",
+            "topic": topic,
+            "text": f"{text_en}\n\n{' '.join(tags)}".strip(),
+            "time": it.get("time"),   # сохраняем время
+            "image_url": img,
+            "added_at": datetime.utcnow().isoformat() + "Z"
+        })
+        return await _safe_edit_or_send(q, f"Создан новый пост #{nid} (ИИ-текст, тема/время сохранены).", reply_markup=_item_actions_kb(nid, "plan"))
+    except Exception:
+        return await _safe_edit_or_send(q, "Не удалось сгенерировать новый ИИ-текст.", reply_markup=_item_actions_kb(pid, "plan"))
 
 # -------------------------
 # CALLBACKS (шаги завершения)
@@ -454,7 +510,7 @@ async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     USER_STATE.setdefault(uid, {"items": [], "current": PlannedItem(), "seq": 0})
-    USER_STATE[uid]["current"] = PlannedItem()  # полный сброс текущего шага
+    USER_STATE[uid]["current"] = PlannedItem()
     USER_STATE[uid].pop("edit_target", None)
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
 
@@ -563,7 +619,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает ввод только когда пользователь в режиме планировщика/редактирования."""
     uid = update.effective_user.id
     st = _ensure(uid)
-    # Режимы, в которых мы «перехватываем» сообщение
     active_steps = {
         "waiting_topic", "waiting_text", "waiting_time",
         "editing_time", "editing_text", "editing_topic", "editing_image"
@@ -574,12 +629,12 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg: Message = update.message
     text = (msg.text or msg.caption or "").strip()
 
-    # --- Блок редактирования существующих элементов ---
+    # --- Редактирование существующих элементов ---
     if st.step == "editing_topic":
         pid = USER_STATE[uid].get("edit_target")
         it = _find_item(uid, pid) if pid else None
         if not it:
-            st.step = "idle"
+            st.step = "idle"; st.mode = "none"
             return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
         if not text:
             return await msg.reply_text("Нужна новая тема текстом.")
@@ -592,7 +647,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = USER_STATE[uid].get("edit_target")
         it = _find_item(uid, pid) if pid else None
         if not it:
-            st.step = "idle"
+            st.step = "idle"; st.mode = "none"
             return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
         if not text:
             return await msg.reply_text("Нужен новый текст.")
@@ -605,20 +660,17 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = USER_STATE[uid].get("edit_target")
         it = _find_item(uid, pid) if pid else None
         if not it:
-            st.step = "idle"
+            st.step = "idle"; st.mode = "none"
             return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
 
-        # удалить картинку ключевым словом
         if text.lower() in {"удалить", "delete", "none", "remove"}:
             it["image_url"] = None
             st.step = "idle"; st.mode = "none"
             USER_STATE[uid].pop("edit_target", None)
             return await msg.reply_text(f"Картинка удалена для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
 
-        # фото как фото
         if msg.photo:
             it["image_url"] = msg.photo[-1].file_id
-        # фото как документ
         if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
             if msg.document.mime_type.startswith("image/"):
                 it["image_url"] = msg.document.file_id
@@ -633,7 +685,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = USER_STATE[uid].get("edit_target")
         it = _find_item(uid, pid) if pid else None
         if not it:
-            st.step = "idle"
+            st.step = "idle"; st.mode = "none"
             return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
         ok = False
         if len(text) >= 4 and ":" in text:
@@ -646,7 +698,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid].pop("edit_target", None)
         return await msg.reply_text(f"Время обновлено для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
 
-    # --- Обычные шаги создания ---
+    # --- Создание новых позиций ---
     if st.step == "waiting_topic":
         if not text:
             return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
@@ -738,6 +790,8 @@ def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_edit_item,         pattern="^EDIT_ITEM:\\d+$"),      group=0)
     app.add_handler(CallbackQueryHandler(cb_edit_field,        pattern="^EDIT_FIELD:(topic|text|image|time):\\d+$"), group=0)
     app.add_handler(CallbackQueryHandler(cb_ai_fill_text,      pattern="^AI_FILL_TEXT:\\d+$"),   group=0)
+    app.add_handler(CallbackQueryHandler(cb_clone_item,        pattern="^CLONE_ITEM:\\d+$"),     group=0)
+    app.add_handler(CallbackQueryHandler(cb_ai_new_from,       pattern="^AI_NEW_FROM:\\d+$"),    group=0)
 
     # Ввод пользователем — перехватываем, когда мы реально в шагах/редактировании
     app.add_handler(
