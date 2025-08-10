@@ -34,10 +34,10 @@ _AI_GEN_FN: Optional[
     Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
 ] = None
 
-def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str], List[str], Optional[str]]]):
+def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]):
     """Регистрируется из основного бота: set_ai_generator(ai_generate_content_en)"""
     global _AI_GEN_FN
-    _AI_GEN_FN = fn  # type: ignore
+    _AI_GEN_FN = fn
 
 # -------------------------
 # КНОПКИ
@@ -461,11 +461,11 @@ async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nid = _new_pid(uid)
     USER_STATE[uid]["items"].append({
         "id": nid,
-        "mode": it["mode"],               # сохраняем тип
-        "topic": it.get("topic"),         # сохраняем тему
-        "text": None,                     # очищаем текст
-        "time": it.get("time"),           # сохраняем время
-        "image_url": None,                # очищаем картинку
+        "mode": it["mode"],
+        "topic": it.get("topic"),
+        "text": None,
+        "time": it.get("time"),
+        "image_url": None,
         "added_at": datetime.utcnow().isoformat() + "Z"
     })
     return await _safe_edit_or_send(q, f"Создан клон #{nid} (сохр. тему/время).", reply_markup=_item_actions_kb(nid, it["mode"]))
@@ -495,7 +495,7 @@ async def cb_ai_new_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "mode": "plan",
             "topic": topic,
             "text": f"{text_en}\n\n{' '.join(tags)}".strip(),
-            "time": it.get("time"),   # сохраняем время
+            "time": it.get("time"),
             "image_url": img,
             "added_at": datetime.utcnow().isoformat() + "Z"
         })
