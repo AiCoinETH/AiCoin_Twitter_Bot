@@ -74,8 +74,7 @@ AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
 DISABLE_WEB_PREVIEW = True
 
-# По просьбе — без ссылок/подписей в постах
-DISABLE_SIGNATURE_LINKS = True
+# Без ссылок/подписей в постах
 TELEGRAM_SIGNATURE_HTML = ""  # пусто, чтобы не добавлять ссылки
 
 fallback_images = [
@@ -167,7 +166,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 200  # оставим как было, но реально 280 — мы поджимаем ещё хэштеги
+TW_MAX = 200  # сознательно короче 280, чтобы влезали хэштеги
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -221,7 +220,6 @@ def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
         return f"{body} {tags}"
     return body or tags
 
-# для Twitter теперь ТОЛЬКО текст+теги, без ссылок
 def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
     suffix_text = compose_full_text_without_links("", ai_hashtags)
     body = trim_plain_to((ai_text_en or "").strip(), 666)
@@ -239,7 +237,6 @@ def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
     return composed
 
 def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
-    # тоже без ссылок
     return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
@@ -449,7 +446,6 @@ def _oa_chat_text(prompt: str) -> str:
         return txt.strip('"\n` ')
     except Exception as e:
         logging.warning(f"_oa_chat_text error: {e}")
-        # Единоразовое предупреждение о квоте
         try:
             global OPENAI_QUOTA_WARNED
             if (("429" in str(e)) or ("insufficient_quota" in str(e))) and not OPENAI_QUOTA_WARNED:
@@ -484,10 +480,6 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
 
 # ===== Публикация в Twitter/X с компрессией =====
 def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_side: int = 2048) -> bool:
-    """
-    Пытаемся сжать/уменьшить изображение (JPEG) до лимита Twitter.
-    Возвращает True, если файл уменьшен и <= target_bytes.
-    """
     try:
         from PIL import Image
         import os
@@ -497,14 +489,12 @@ def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_si
 
         img = Image.open(path)
         img = img.convert("RGB")
-        # масштабируем, если очень большое
         w, h = img.size
         scale = min(1.0, float(max_side) / float(max(w, h)))
         if scale < 1.0:
             new_size = (int(w * scale), int(h * scale))
             img = img.resize(new_size, Image.LANCZOS)
 
-        # ступенчато уменьшаем качество
         for q in (85, 80, 75, 70, 65, 60, 55, 50, 45, 40):
             tmp = path + ".tmp.jpg"
             img.save(tmp, format="JPEG", quality=q, optimize=True)
@@ -512,7 +502,6 @@ def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_si
             if sz <= target_bytes:
                 os.replace(tmp, path)
                 return True
-        # если не достигли — сохраняем лучшее (последний)
         os.replace(tmp, path)
         return os.path.getsize(path) <= target_bytes
     except Exception as e:
@@ -534,15 +523,11 @@ def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
         media_ids = None
-
-        # формируем финальный текст
         final_text = build_twitter_post(text, [])
 
-        # если есть картинка — аккуратно поджать/перезалить
         if image_url and str(image_url).startswith("http"):
             file_path = _download_to_temp_file(image_url)
             if file_path:
-                # пробуем сжать до лимита
                 ok = _try_compress_image_inplace(file_path)
                 if not ok:
                     logging.warning("Картинку не удалось сжать до лимита — публикуем твит без изображений.")
@@ -554,7 +539,6 @@ def publish_post_to_twitter(text, image_url=None):
                     media = twitter_api_v1.media_upload(filename=file_path)
                     media_ids = [media.media_id_string]
                 except Exception as e:
-                    # если из-за размера — предпримем ещё одну попытку ужать и повторить
                     if "413" in str(e) or "Payload Too Large" in str(e):
                         logging.warning("413 при загрузке в Twitter, пробую сильнее сжать и повторить…")
                         if _try_compress_image_inplace(file_path, target_bytes=3_800_000, max_side=1600):
@@ -571,10 +555,8 @@ def publish_post_to_twitter(text, image_url=None):
                     except Exception:
                         pass
 
-        # Публикация
         twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
 
-        # почистим GitHub-изображение, если это наш файл
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
@@ -590,7 +572,7 @@ def publish_post_to_twitter(text, image_url=None):
 # ===== Telegram =====
 async def publish_post_to_telegram(text, image_url=None):
     try:
-        text_with_signature = (text or "")  # без ссылок
+        text_with_signature = (text or "")
         if image_url:
             await send_photo_with_download(
                 channel_bot,
@@ -652,7 +634,7 @@ async def send_start_placeholder():
 
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
-# ===== Таймеры (только авто-пост стартового плейсхолдера и авто-выключение) =====
+# ===== Таймеры (только авто-пост плейсхолдера и авто-выключение) =====
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -779,7 +761,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото одним сообщением:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")]])
         )
-        # открываем окно ожидания ручного сообщения на 5 минут
         manual_expected_until = now + timedelta(minutes=5)
         return
 
@@ -835,7 +816,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text or update.message.caption or ""
     image_url = None
 
-    # фото как фото
     if update.message.photo:
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
@@ -844,7 +824,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Пришлите ещё раз или только текст.")
             manual_expected_until = None
             return
-    # фото как документ (скрепка)
     elif getattr(update.message, "document", None) and getattr(update.message.document, "mime_type", ""):
         if update.message.document.mime_type.startswith("image/"):
             try:
@@ -927,11 +906,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # 1) если недавно нажали «Сделай сам» — принудительно в ручной режим
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    # 2) иначе отдаём планировщику ТОЛЬКО когда он реально ждёт ввод
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
@@ -942,7 +919,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # 3) дефолт — ручной ввод
     return await handle_manual_input(update, context)
 
 # ===== STARTUP =====
@@ -958,7 +934,6 @@ async def on_start(app: Application):
     await send_start_placeholder()
 
     # ВАЖНО: никаких автопланов/расписаний тут больше нет — всё делает planner.py
-
     logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. Планирование — только в planner.py.")
 
 # ===== Выключение =====
@@ -982,12 +957,12 @@ def main():
     )
 
     # Планировщик регистрируем первым (высший приоритет)
-    register_planner_handlers(app)  # внутри planner.py хендлеры создаются с block=True
+    register_planner_handlers(app)  # внутри planner.py НЕ использовать block=True (его нет в PTB v20)
 
     # Наши хендлеры — позже
-    app.add_handler(CallbackQueryHandler(callback_handler, block=True), group=5)
+    app.add_handler(CallbackQueryHandler(callback_handler), group=5)
     app.add_handler(
-        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler, block=True),
+        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
         group=10
     )
 
