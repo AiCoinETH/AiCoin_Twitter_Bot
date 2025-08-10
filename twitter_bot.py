@@ -97,6 +97,9 @@ do_not_disturb = {"active": False}
 last_action_time = {}
 last_button_pressed_at = None
 
+# ждём следующее сообщение после «Сделай сам»
+manual_expected_until = None  # datetime | None
+
 day_plan = []
 
 # Меню
@@ -355,7 +358,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         else:
             if not is_valid_image_url(url_or_file_id):
                 await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
-                                       reply_markup=reply_markup, disable_web_page_preview=True)
+                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
                 return None, None
             try:
                 response = requests.get(url_or_file_id, timeout=10)
@@ -368,12 +371,12 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
                 return msg, None
             except Exception:
                 await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
-                                       reply_markup=reply_markup, disable_web_page_preview=True)
+                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
                 return None, None
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         await bot.send_message(chat_id=chat_id, text=caption or " ",
-                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
+                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
         return None, None
 
 # БД
@@ -553,11 +556,11 @@ async def publish_slot(slot_idx: int):
 
     if tg_ok and tw_ok:
         slot["status"] = "published"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%М')} — ✅ Published (TG+TW)")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ✅ Published (TG+TW)")
     else:
         slot["status"] = "skipped"
         slot["note"] = (slot.get("note") or "") + " (publish error)"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%М')} — ⏭️ Skipped due to error")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏭️ Skipped due to error")
 
     shutdown_bot_and_exit()
 
@@ -739,7 +742,7 @@ async def check_inactivity_shutdown():
 
 # CALLBACK HANDLER
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_button_pressed_at, last_action_time
+    global last_button_pressed_at, last_action_time, manual_expected_until
     query = update.callback_query
     data = query.data
     await query.answer()
@@ -816,6 +819,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото одним сообщением:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")]])
         )
+        # открываем окно ожидания ручного сообщения на 5 минут
+        manual_expected_until = now + timedelta(minutes=5)
         return
 
     if data == "new_post_ai":
@@ -860,6 +865,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Ручной ввод
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global manual_expected_until
     pending_post["active"] = True
     pending_post["timer"] = datetime.now(TZ)
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -869,13 +875,25 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text or update.message.caption or ""
     image_url = None
 
+    # фото как фото
     if update.message.photo:
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
         except Exception as e:
             logging.warning(f"handle_manual_input: cannot process photo: {e}")
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Пришлите ещё раз или только текст.")
+            manual_expected_until = None
             return
+    # фото как документ (скрепка)
+    elif getattr(update.message, "document", None) and getattr(update.message.document, "mime_type", ""):
+        if update.message.document.mime_type.startswith("image/"):
+            try:
+                image_url = await process_telegram_photo(update.message.document.file_id, approval_bot)
+            except Exception as e:
+                logging.warning(f"handle_manual_input: cannot process image document: {e}")
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать изображение-документ. Пришлите ещё раз или только текст.")
+                manual_expected_until = None
+                return
 
     post_data["text_en"] = text.strip() or post_data.get("text_en") or ""
     post_data["image_url"] = image_url if image_url else post_data.get("image_url")
@@ -883,7 +901,14 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_data["is_manual"] = True
 
     try:
-        await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, post_data["text_en"], post_data.get("ai_hashtags") or [], image_url=post_data["image_url"], header="Предпросмотр")
+        await preview_split(
+            approval_bot,
+            TELEGRAM_APPROVAL_CHAT_ID,
+            post_data["text_en"],
+            post_data.get("ai_hashtags") or [],
+            image_url=post_data["image_url"],
+            header="Предпросмотр"
+        )
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="Выберите действие:",
@@ -892,6 +917,8 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logging.error(f"handle_manual_input preview failed: {e}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
+    finally:
+        manual_expected_until = None
 
 # Публикация
 async def publish_flow(publish_tg: bool, publish_tw: bool):
@@ -930,16 +957,21 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
 # MESSAGE HANDLER
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_button_pressed_at
-    last_button_pressed_at = datetime.now(TZ)
+    global last_button_pressed_at, manual_expected_until
+    now = datetime.now(TZ)
+    last_button_pressed_at = now
 
     pending_post["active"] = True
-    pending_post["timer"] = last_button_pressed_at
+    pending_post["timer"] = now
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # ВАЖНО: отдаём сообщения планировщику ТОЛЬКО если он реально ждёт ввод
+    # 1) если недавно нажали «Сделай сам» — принудительно в ручной режим
+    if manual_expected_until and now <= manual_expected_until:
+        return await handle_manual_input(update, context)
+
+    # 2) иначе отдаём планировщику ТОЛЬКО когда он реально ждёт ввод
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
@@ -950,6 +982,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # 3) дефолт — ручной ввод
     return await handle_manual_input(update, context)
 
 # STARTUP
@@ -986,9 +1019,9 @@ def main():
     # Регистрируем планировщик ДО общего CallbackQueryHandler
     register_planner_handlers(app)
 
-    # Наши хендлеры
+    # Наши хендлеры: текст, фото и изображения-документы
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_handler))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler))
 
     app.run_polling(poll_interval=0.12, timeout=1)
 
