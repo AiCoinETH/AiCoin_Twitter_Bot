@@ -20,10 +20,9 @@ from github import Github
 from openai import OpenAI  # openai>=1.35.0
 
 # === ПЛАНИРОВЩИК ===
-# set_ai_generator импортируем ОПЦИОНАЛЬНО, чтобы сейчас не падало, пока мы его не добавили в planner.py
 from planner import register_planner_handlers, open_planner
 try:
-    from planner import set_ai_generator  # появится позже — ок
+    from planner import set_ai_generator  # может отсутствовать — ок
 except ImportError:
     set_ai_generator = None
 from planner import USER_STATE as PLANNER_STATE
@@ -78,8 +77,6 @@ TIMER_PUBLISH_EXTEND  = 600       # при активности таймер п�
 AUTO_SHUTDOWN_AFTER_SECONDS = 600 # автовыключение при бездействии 10 минут
 
 DISABLE_WEB_PREVIEW = True
-
-# Без ссылок/подписей в постах
 TELEGRAM_SIGNATURE_HTML = ""  # пусто, чтобы не добавлять ссылки
 
 fallback_images = [
@@ -102,11 +99,9 @@ pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT
 do_not_disturb = {"active": False}
 last_action_time = {}
 last_button_pressed_at = None
-
-# ждём следующее сообщение после «Сделай сам»
 manual_expected_until = None  # datetime | None
 
-# ===== Меню (обновлено: оставлены только нужные кнопки) =====
+# ===== Меню =====
 def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -169,7 +164,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 200  # короче 280, чтобы влезали хэштеги
+TW_MAX = 200
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -250,7 +245,7 @@ def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
 
 # ===== GitHub helpers =====
 def upload_image_to_github(image_path, filename):
-    with open(image_path, "rb") as img_file:
+    with open(image_path, "rb") as img_file):
         content = img_file.read()
     try:
         github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
@@ -481,7 +476,7 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# Связываем генератор с планировщиком (без циклических импортов). Безопасно, если в planner пока нет set_ai_generator.
+# Связь с планировщиком
 try:
     if set_ai_generator:
         set_ai_generator(ai_generate_content_en)
@@ -647,7 +642,7 @@ async def send_start_placeholder():
 
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
-# ===== Таймеры (только авто-пост плейсхолдера и авто-выключение) =====
+# ===== Таймеры =====
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -668,7 +663,6 @@ async def check_timer():
                             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                             text=f"Автопост: Telegram — {'✅' if tg_ok else '❌'}, Twitter — {'✅' if tw_ok else '❌'}. Выключаюсь."
                         )
-                        # Автовыключение ТОЛЬКО в авто-режиме
                         shutdown_bot_and_exit()
                     else:
                         pending_post["active"] = False
@@ -717,7 +711,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[user_id] = now
 
-    # Планировщик сам обрабатывает свои колбэки — не мешаем
     planner_callbacks = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
@@ -726,8 +719,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in planner_callbacks or data.startswith("PLAN_"):
         return
 
-    # Вызов UI планировщика
     if data == "show_day_plan":
+        # если открыли планировщик — выключаем ручной «ожидаю следующее сообщение»
+        manual_expected_until = None
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
@@ -809,7 +803,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text or update.message.caption or ""
     image_url = None
 
-    # фото как фото
     if update.message.photo:
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
@@ -818,7 +811,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Пришлите ещё раз или только текст.")
             manual_expected_until = None
             return
-    # фото как документ (скрепка)
     elif getattr(update.message, "document", None) and getattr(update.message.document, "mime_type", ""):
         if update.message.document.mime_type.startswith("image/"):
             try:
@@ -891,7 +883,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
-    # После ручной публикации — НЕ выключаемся
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
 # ===== MESSAGE HANDLER =====
@@ -910,14 +901,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    # 2) иначе отдаём планировщику ТОЛЬКО когда он реально ждёт ввод
+    # 2) иначе — отдать планировщику, если он АКТИВЕН или ждёт ввод
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
+        cur_mode = getattr(cur, "mode", "none") if cur else "none"
         cur_step = getattr(cur, "step", "idle") if cur else "idle"
-        if cur_step in ("waiting_topic", "waiting_text", "waiting_time"):
-            return  # planner.py обработает свой шаг
+        if (cur_mode in ("plan", "gen", "edit")) or (cur_step in (
+            "waiting_topic", "waiting_text", "waiting_time",
+            "editing_time", "editing_text", "editing_topic", "editing_image"
+        )):
+            # FIX: если пользователь в планировщике — ничего не делаем, planner.py перехватит (group=0)
+            return
     except Exception:
         pass
 
@@ -930,7 +926,6 @@ async def on_start(app: Application):
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Готовим стартовый проект поста (текст/картинка) и сразу показываем меню
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
@@ -959,10 +954,8 @@ def main():
         .build()
     )
 
-    # Планировщик регистрируем первым (высший приоритет)
     register_planner_handlers(app)
 
-    # Наши хендлеры — позже
     app.add_handler(CallbackQueryHandler(callback_handler), group=5)
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
