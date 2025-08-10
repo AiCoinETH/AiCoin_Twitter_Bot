@@ -399,21 +399,22 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
 # -------------------------
 def register_planner_handlers(app: Application):
-    # Планировщик — максимальный приоритет и блокировка дальнейших хендлеров
-    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"),    group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"),     group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"),   group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"), group=0, block=True)
+    # Планировщик — высокий приоритет (group=0). В PTB v20 параметра `block` нет.
+    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"),    group=0)
+    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"),     group=0)
+    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"),   group=0)
+    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"), group=0)
 
-    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"),         group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"),    group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"),         group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"),          group=0, block=True)
-    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"), group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"),         group=0)
+    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"),    group=0)
+    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"),         group=0)
+    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"),          group=0)
+    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"), group=0)
 
-    # Ввод пользователем (перехватываем только если он в режиме планировщика)
+    # Ввод пользователем — тоже в нулевой группе, но on_user_message сам “отпускает” события,
+    # если режим планировщика не активен (см. ранний return в начале функции).
     app.add_handler(
-        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message, block=True),
+        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message),
         group=0
     )
 
