@@ -20,7 +20,7 @@ from github import Github
 from openai import OpenAI  # openai>=1.35.0
 
 # === ПЛАНИРОВЩИК ===
-from planner import register_planner_handlers, open_planner
+from planner import register_planner_handlers, open_planner, set_ai_generator
 from planner import USER_STATE as PLANNER_STATE
 # ====================
 
@@ -476,6 +476,13 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
 
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
+
+# Связываем генератор с планировщиком (без циклических импортов)
+try:
+    set_ai_generator(ai_generate_content_en)
+    logging.info("Planner AI generator registered.")
+except Exception as e:
+    logging.warning(f"Cannot register planner AI generator: {e}")
 
 # ===== Публикация в Twitter/X с компрессией =====
 def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_side: int = 2048) -> bool:
