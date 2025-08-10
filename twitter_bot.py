@@ -770,8 +770,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in planner_callbacks or data.startswith("PLAN_"):
         return
 
-    # Вызов UI планировщика
+    # Вызов UI планировщика (КЛЮЧЕВАЯ ПРАВКА: гасим окно ручного ввода)
     if data == "show_day_plan":
+        manual_expected_until = None  # <<< чтобы «Сделай сам» не перехватывал ввод
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
@@ -955,7 +956,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
-# MESSAGE HANDLER
+# MESSAGE HANDLER (КЛЮЧЕВАЯ ПРАВКА: приоритет за планировщиком)
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, manual_expected_until
     now = datetime.now(TZ)
@@ -967,22 +968,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # 1) если недавно нажали «Сделай сам» — принудительно в ручной режим
-    if manual_expected_until and now <= manual_expected_until:
-        return await handle_manual_input(update, context)
-
-    # 2) иначе отдаём планировщику ТОЛЬКО когда он реально ждёт ввод
+    # 0) Если планировщик ЖДЁТ ввод — отдаём сообщение ему и выходим
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
         cur_step = getattr(cur, "step", "idle") if cur else "idle"
         if cur_step in ("waiting_topic", "waiting_text", "waiting_time"):
-            return  # planner.py обработает свой шаг
+            return  # planner.py сам обработает этот апдейт
     except Exception:
         pass
 
-    # 3) дефолт — ручной ввод
+    # 1) Если активно окно «Сделай сам» — обрабатываем вручную
+    if manual_expected_until and now <= manual_expected_until:
+        return await handle_manual_input(update, context)
+
+    # 2) Дефолт — ручной ввод (на случай произвольного сообщения)
     return await handle_manual_input(update, context)
 
 # STARTUP
@@ -1038,4 +1039,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
