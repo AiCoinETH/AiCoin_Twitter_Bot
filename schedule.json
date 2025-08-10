@@ -1,8 +1,18 @@
 {
-  "times": ["08:00","08:20","08:40","09:00"],
-  "topics": [
-    "Utility, community growth and joining early.",
-    "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
-    "AI-powered proposals and speed of execution."
+  "timezone": "Europe/Kyiv",
+  "slots": [
+    {
+      "time": "08:00",
+      "mode": "ai",
+      "topic": "Utility, community growth and joining early.",
+      "channels": ["tg","tw"]
+    },
+    {
+      "time": "08:20",
+      "mode": "manual",
+      "text": "Ai Coin brings AI to on-chain decisions. Join us!",
+      "image_url": "https://…/image.jpg",
+      "channels": ["tg"]
+    }
   ]
 }
