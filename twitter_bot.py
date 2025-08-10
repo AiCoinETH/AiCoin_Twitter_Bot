@@ -258,7 +258,7 @@ def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
 
 # GitHub helpers
 def upload_image_to_github(image_path, filename):
-    with open(image_path, "rb") as img_file):
+    with open(image_path, "rb") as img_file:
         content = img_file.read()
     try:
         github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
