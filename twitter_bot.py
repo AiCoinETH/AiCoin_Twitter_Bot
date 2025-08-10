@@ -2,7 +2,6 @@
 import os
 import re
 import asyncio
-import hashlib
 import logging
 import random
 import sys
@@ -25,14 +24,9 @@ from planner import register_planner_handlers, open_planner
 from planner import USER_STATE as PLANNER_STATE
 # ====================
 
-# -----------------------------------------------------------------------------
-# ЛОГИРОВАНИЕ
-# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(funcName)s %(message)s')
 
-# -----------------------------------------------------------------------------
 # ENV
-# -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -63,43 +57,31 @@ if not OPENAI_API_KEY:
     logging.error("Не задан OPENAI_API_KEY!")
     sys.exit(1)
 
-# -----------------------------------------------------------------------------
-# ГЛОБАЛЫЕ ОБЪЕКТЫ
-# -----------------------------------------------------------------------------
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
-# Не ретраим 429 бесконечно
-client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 
-# -----------------------------------------------------------------------------
-# ТАЙМЕРЫ
-# -----------------------------------------------------------------------------
-TIMER_PUBLISH_DEFAULT = 180            # ожидание решения на старте
-TIMER_PUBLISH_EXTEND  = 600            # +10 минут после любого взаимодействия
-AUTO_SHUTDOWN_AFTER_SECONDS = 600      # 10 минут неактивности
+# OpenAI: без бесконечных ретраев, и флаг-уведомление по квоте
+client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
+OPENAI_QUOTA_WARNED = False
+
+# Таймеры
+TIMER_PUBLISH_DEFAULT = 180
+TIMER_PUBLISH_EXTEND  = 600
+AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
 DISABLE_WEB_PREVIEW = True
 
-# -----------------------------------------------------------------------------
-# ПОДПИСИ
-# -----------------------------------------------------------------------------
 TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twitter X</a>'
 
-# -----------------------------------------------------------------------------
-# ФОЛБЭК-КАРТИНКИ
-# -----------------------------------------------------------------------------
 fallback_images = [
     "https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png",
     "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
-# -----------------------------------------------------------------------------
-# СОСТОЯНИЕ
-# -----------------------------------------------------------------------------
 post_data = {
     "text_en": "AI Coin blends blockchain with AI for smarter, faster, community-driven decisions.",
     "ai_hashtags": ["#AiCoin", "#AI", "$Ai", "#crypto"],
@@ -110,20 +92,14 @@ post_data = {
 }
 prev_data = post_data.copy()
 
-# режимы: "placeholder" — стартовый пост; "normal" — обычный
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
 last_action_time = {}
 last_button_pressed_at = None
 
-# -----------------------------------------------------------------------------
-# ДНЕВНОЙ ПЛАН (14:00, 15:00, 16:00 — Киев)
-# -----------------------------------------------------------------------------
-day_plan = []  # {"time": dt, "text": str, "tags": list[str], "img": str|None, "status": "scheduled|published|skipped", "note": str}
+day_plan = []
 
-# -----------------------------------------------------------------------------
-# СТАРТОВОЕ МЕНЮ (полный набор) + кнопка плана
-# -----------------------------------------------------------------------------
+# Меню
 def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -162,9 +138,7 @@ def telegram_preview_keyboard():
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
-# -----------------------------------------------------------------------------
-# TWITTER / GITHUB
-# -----------------------------------------------------------------------------
+# Twitter / GitHub
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -186,9 +160,7 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
-# -----------------------------------------------------------------------------
-# ПОСТОСТРОИТЕЛИ (EN, TG=полный, TW<=200)
-# -----------------------------------------------------------------------------
+# Постостроители
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 LINKS_SIGNATURE = "Learn more | telegram: https://t.me/AiCoin_ETH | website: https://getaicoin.com/"
@@ -281,9 +253,7 @@ def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
 def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_telegram_post(ai_text_en, ai_hashtags)
 
-# -----------------------------------------------------------------------------
-# GITHUB HELPERS
-# -----------------------------------------------------------------------------
+# GitHub helpers
 def upload_image_to_github(image_path, filename):
     with open(image_path, "rb") as img_file:
         content = img_file.read()
@@ -303,9 +273,7 @@ def delete_image_from_github(filename):
     except Exception as e:
         logging.error(f"Ошибка удаления файла на GitHub: {e}")
 
-# -----------------------------------------------------------------------------
-# СКАЧИВАНИЕ И ОБРАБОТКА ИЗОБРАЖЕНИЙ
-# -----------------------------------------------------------------------------
+# Изображения
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
         for _ in range(retries):
@@ -343,15 +311,12 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
         raise Exception("Не удалось загрузить фото на GitHub")
     return url
 
-# -----------------------------------------------------------------------------
-# ПРЕДПРОСМОТР (две карточки — по требованию)
-# -----------------------------------------------------------------------------
+# Предпросмотр
 async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=None, header: str | None = None):
     twitter_txt = build_twitter_preview(ai_text_en, ai_hashtags)
     telegram_txt = build_telegram_preview(ai_text_en, ai_hashtags)
     hdr = f"<b>{header}</b>\n" if header else ""
 
-    # Twitter
     tw_markup = twitter_preview_keyboard()
     try:
         if image_url:
@@ -363,7 +328,6 @@ async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=No
         await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Twitter:</b>\n{twitter_txt}",
                                parse_mode="HTML", reply_markup=tw_markup, disable_web_page_preview=True)
 
-    # Telegram
     tg_markup = telegram_preview_keyboard()
     try:
         if image_url:
@@ -375,9 +339,7 @@ async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=No
         await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Telegram:</b>\n{telegram_txt}",
                                parse_mode="HTML", reply_markup=tg_markup, disable_web_page_preview=True)
 
-# -----------------------------------------------------------------------------
-# ОТПРАВКА ФОТО
-# -----------------------------------------------------------------------------
+# Отправка фото
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     def is_valid_image_url(url):
         try:
@@ -393,7 +355,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         else:
             if not is_valid_image_url(url_or_file_id):
                 await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
-                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                                       reply_markup=reply_markup, disable_web_page_preview=True)
                 return None, None
             try:
                 response = requests.get(url_or_file_id, timeout=10)
@@ -406,17 +368,15 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
                 return msg, None
             except Exception:
                 await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
-                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                                       reply_markup=reply_markup, disable_web_page_preview=True)
                 return None, None
     except Exception as e:
         logging.error(f"Ошибка в send_photo_with_download: {e}")
         await bot.send_message(chat_id=chat_id, text=caption or " ",
-                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
         return None, None
 
-# -----------------------------------------------------------------------------
-# БАЗА ДАННЫХ
-# -----------------------------------------------------------------------------
+# БД
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -478,9 +438,7 @@ async def save_post_to_history(text, image_url=None):
         except Exception as e:
             logging.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
-# -----------------------------------------------------------------------------
-# ИИ (текст/хэштеги; картинка — фолбэк)
-# -----------------------------------------------------------------------------
+# ИИ
 def _oa_chat_text(prompt: str) -> str:
     try:
         resp = client_oa.chat.completions.create(
@@ -496,6 +454,19 @@ def _oa_chat_text(prompt: str) -> str:
         return txt.strip('"\n` ')
     except Exception as e:
         logging.warning(f"_oa_chat_text error: {e}")
+        # Единоразовое предупреждение о квоте
+        try:
+            global OPENAI_QUOTA_WARNED
+            if (("429" in str(e)) or ("insufficient_quota" in str(e))) and not OPENAI_QUOTA_WARNED:
+                OPENAI_QUOTA_WARNED = True
+                asyncio.create_task(
+                    approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="⚠️ OpenAI: insufficient quota (429). Пополните баланс OpenAI, иначе генерация не работает."
+                    )
+                )
+        except Exception:
+            pass
         return "Ai Coin fuses AI with blockchain to turn community ideas into real actions. Join builders shaping the next wave of crypto utility."
 
 async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
@@ -516,9 +487,7 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# -----------------------------------------------------------------------------
-# ДНЕВНОЙ ПЛАН / ПУБЛИКАЦИЯ
-# -----------------------------------------------------------------------------
+# Дневной план
 def _today_time(hour: int, minute: int) -> datetime:
     now = datetime.now(TZ)
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -561,7 +530,6 @@ async def publish_slot(slot_idx: int):
     tw_text = build_twitter_post(text_en, tags)
     tg_text = build_telegram_post(text_en, tags)
 
-    # защита от дублей
     attempts = 0
     replaced = False
     while attempts < 3 and (await is_duplicate_post(tw_text, img) or await is_duplicate_post(tg_text, img)):
@@ -577,7 +545,6 @@ async def publish_slot(slot_idx: int):
         slot["note"] = (slot.get("note") or "") + " (replaced before publish)"
         slot["text"], slot["tags"], slot["img"] = text_en, tags, img
 
-    # публикуем
     tg_ok = await publish_post_to_telegram(tg_text, img)
     tw_ok = publish_post_to_twitter(tw_text, img)
 
@@ -586,24 +553,21 @@ async def publish_slot(slot_idx: int):
 
     if tg_ok and tw_ok:
         slot["status"] = "published"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ✅ Published (TG+TW)")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%М')} — ✅ Published (TG+TW)")
     else:
         slot["status"] = "skipped"
         slot["note"] = (slot.get("note") or "") + " (publish error)"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏭️ Skipped due to error")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%М')} — ⏭️ Skipped due to error")
 
-    # после автопоста или ошибки — выключаемся сразу
     shutdown_bot_and_exit()
 
 async def schedule_slot(slot_idx: int):
     slot = day_plan[slot_idx]
     when = slot["time"]
-    # ждём тихо до времени слота
     await asyncio.sleep(max(0, (when - datetime.now(TZ)).total_seconds()))
     await publish_slot(slot_idx)
 
 async def build_day_plan_for_today():
-    """Три слота: 14:00, 15:00, 16:00 (Kyiv). Строим тихо, без сообщений."""
     global day_plan
     now = datetime.now(TZ)
     t14 = _today_time(14, 0)
@@ -629,9 +593,7 @@ async def build_day_plan_for_today():
     for t, (text, tags, img, note) in zip(targets, unique_bundles):
         day_plan.append({"time": t, "text": text, "tags": tags, "img": img, "status": "scheduled", "note": note})
 
-# -----------------------------------------------------------------------------
-# ПУБЛИКАЦИЯ В TWITTER/TELEGRAM
-# -----------------------------------------------------------------------------
+# Публикация
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
@@ -664,11 +626,6 @@ def publish_post_to_twitter(text, image_url=None):
         return False
 
 async def publish_post_to_telegram(text, image_url=None):
-    """
-    Надёжная публикация в TELEGRAM КАНАЛ:
-    - всегда подкачиваем картинку локально (исключает 400 Wrong type of the web page content)
-    - добавляем HTML-подпись
-    """
     try:
         text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
         if image_url:
@@ -695,9 +652,7 @@ async def publish_post_to_telegram(text, image_url=None):
         )
         return False
 
-# -----------------------------------------------------------------------------
-# СТАРТ: одно сообщение (предпросмотр + кнопки). Если молчание — автопост TG+TW и выключение.
-# -----------------------------------------------------------------------------
+# Стартовое сообщение
 async def send_start_placeholder():
     text_en = post_data["text_en"]
     ai_tags = post_data.get("ai_hashtags") or []
@@ -734,9 +689,7 @@ async def send_start_placeholder():
 
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
-# -----------------------------------------------------------------------------
-# ТАЙМЕР старта и автоотключение
-# -----------------------------------------------------------------------------
+# Таймеры
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -784,9 +737,7 @@ async def check_inactivity_shutdown():
         except Exception as e:
             logging.warning(f"check_inactivity_shutdown error: {e}")
 
-# -----------------------------------------------------------------------------
 # CALLBACK HANDLER
-# -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time
     query = update.callback_query
@@ -796,7 +747,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
-    # Любая кнопка — продлевает жизнь и выводит из placeholder-режима
     pending_post["active"] = True
     pending_post["timer"] = now
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -808,16 +758,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[user_id] = now
 
-    # === ПЛАНИРОВЩИК: его колбэки обрабатывают его же хендлеры ===
+    # Планировщик сам обрабатывает свои колбэки — не мешаем
     planner_callbacks = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
         "STEP_BACK", "PLAN_LIST_TODAY"
     }
     if data in planner_callbacks or data.startswith("PLAN_"):
-        return  # планировщик перехватит
+        return
 
-    # Открыть UI планировщика из нашего меню
+    # Вызов UI планировщика
     if data == "show_day_plan":
         return await open_planner(update, context)
 
@@ -827,7 +777,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutdown_bot_and_exit()
         return
 
-    if data == "cancel_to_main":
+    if data in ("cancel_to_main", "BACK_MAIN_MENU"):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
@@ -844,6 +794,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
+        # Жёсткий сброс состояния планировщика, чтобы не перехватывал ручной ввод
+        try:
+            uid = update.effective_user.id
+            st = PLANNER_STATE.get(uid)
+            if st:
+                cur = st.get("current")
+                if cur:
+                    cur.mode = "none"
+                    cur.step = "idle"
+                    cur.text = None
+                    cur.topic = None
+                    cur.time_str = None
+                    cur.image_url = None
+                st["mode"] = "none"
+        except Exception:
+            pass
+
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото одним сообщением:",
@@ -891,11 +858,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-# -----------------------------------------------------------------------------
-# РУЧНОЙ ВВОД «Сделай сам»
-# -----------------------------------------------------------------------------
+# Ручной ввод
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Любое сообщение продлевает жизнь на 10 минут
     pending_post["active"] = True
     pending_post["timer"] = datetime.now(TZ)
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -929,9 +893,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         logging.error(f"handle_manual_input preview failed: {e}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
 
-# -----------------------------------------------------------------------------
-# ПУБЛИКАЦИЯ (по кнопкам)
-# -----------------------------------------------------------------------------
+# Публикация
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     ai_tags = post_data.get("ai_hashtags") or []
@@ -966,9 +928,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
-# -----------------------------------------------------------------------------
-# MESSAGE HANDLER (любое сообщение продлевает 10 минут)
-# -----------------------------------------------------------------------------
+# MESSAGE HANDLER
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at
     last_button_pressed_at = datetime.now(TZ)
@@ -979,48 +939,38 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # === ПЛАНИРОВЩИК: если пользователь в его режиме — не мешаем ===
+    # ВАЖНО: отдаём сообщения планировщику ТОЛЬКО если он реально ждёт ввод
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
-        cur_mode = getattr(cur, "mode", None) if cur else None
-        if (st.get("mode") in ("plan", "gen")) or (cur_mode in ("plan", "gen")):
-            return  # planner.py обработает свой ввод
+        cur_step = getattr(cur, "step", "idle") if cur else "idle"
+        if cur_step in ("waiting_topic", "waiting_text", "waiting_time"):
+            return  # planner.py обработает свой шаг
     except Exception:
         pass
-    # === конец вставки ===
 
-    # Любой текст/фото трактуем как ручной ввод
     return await handle_manual_input(update, context)
 
-# -----------------------------------------------------------------------------
 # STARTUP
-# -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-
-    # фоновые задачи
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Старт: одно сообщение (ближайший пост + ПОЛНЫЙ набор кнопок)
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
     await send_start_placeholder()
 
-    # План дня — строим и планируем ТИХО
     await build_day_plan_for_today()
     for idx in range(len(day_plan)):
         asyncio.create_task(schedule_slot(idx))
 
     logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. План дня активирован тихо.")
 
-# -----------------------------------------------------------------------------
 # Выключение
-# -----------------------------------------------------------------------------
 def shutdown_bot_and_exit():
     try:
         asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"))
@@ -1029,13 +979,11 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
-# -----------------------------------------------------------------------------
 # MAIN
-# -----------------------------------------------------------------------------
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(on_start).build()
 
-    # === ПЛАНИРОВЩИК: регистрируем его хендлеры ДО нашего общего CallbackQueryHandler ===
+    # Регистрируем планировщик ДО общего CallbackQueryHandler
     register_planner_handlers(app)
 
     # Наши хендлеры
@@ -1044,8 +992,5 @@ def main():
 
     app.run_polling(poll_interval=0.12, timeout=1)
 
-# -----------------------------------------------------------------------------
-# ENTRYPOINT
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
