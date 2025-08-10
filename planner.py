@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, Awaitable, Tuple
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, CallbackQuery
@@ -26,6 +26,18 @@ class PlannedItem:
     image_url: Optional[str] = None
     step: str = "idle"   # idle | waiting_topic | waiting_text | waiting_time | confirm
     mode: str = "none"   # plan | gen
+
+# -------------------------
+# РЕГИСТРАТОР ИИ-ГЕНЕРАТОРА (ЧТОБЫ НЕ ИМПОРТИРОВАТЬ twitter_bot)
+# -------------------------
+_AI_GEN_FN: Optional[
+    Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
+] = None
+
+def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]):
+    """Регистрируется из основного бота: set_ai_generator(ai_generate_content_en)"""
+    global _AI_GEN_FN
+    _AI_GEN_FN = fn
 
 # -------------------------
 # КНОПКИ
@@ -111,10 +123,6 @@ def _openai_key_present() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
 
 async def _openai_usable() -> bool:
-    """
-    Лёгкая проверка: пробуем мини-вызов /chat/completions.
-    Если 429 insufficient_quota — вернём False.
-    """
     if not _openai_key_present():
         return False
     try:
@@ -128,14 +136,13 @@ async def _openai_usable() -> bool:
         )
         return True
     except Exception as e:
-        # Можно включить отладочное логирование при желании
         msg = str(e).lower()
         if "insufficient_quota" in msg or "too many requests" in msg or "429" in msg:
             return False
         return False
 
 # -------------------------
-# ОТКРЫТИЕ ПЛАНИРОВЩИКА (вызывается из twitter_bot)
+# ОТКРЫТИЕ ПЛАНИРОВЩИКА
 # -------------------------
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -294,13 +301,11 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
             ])
         )
 
-    # Пытаемся импортировать генератор из основного бота
-    try:
-        from twitter_bot import ai_generate_content_en
-    except Exception:
+    # Никаких импортов из twitter_bot: используем зарегистрированную функцию
+    if _AI_GEN_FN is None:
         return await _safe_edit_or_send(
             q,
-            "Не получилось вызвать ИИ-генератор из основного бота. Можно продолжить вручную.",
+            "Не подключён ИИ-генератор из основного бота. Можно продолжить вручную.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✨ Ручной план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
                 [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
@@ -318,7 +323,7 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
     created = 0
     for th in topics:
         try:
-            text_en, tags, img = await ai_generate_content_en(th)
+            text_en, tags, img = await _AI_GEN_FN(th)
             USER_STATE[uid]["items"].append({
                 "mode": "plan",
                 "topic": th,
@@ -351,16 +356,14 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
 # INPUT (текст/фото) ПО ШАГАМ
 # -------------------------
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод только когда пользователь в режиме планировщика."""
     uid = update.effective_user.id
     st = _ensure(uid)
     if st.mode not in ("plan", "gen"):
-        return  # не наш режим — пусть основное приложение обработает
+        return
 
     msg: Message = update.message
     text = (msg.text or msg.caption or "").strip()
 
-    # Сбор темы (PLAN)
     if st.step == "waiting_topic":
         if not text:
             return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
@@ -368,7 +371,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fake_cb = await update.to_callback_query(context.bot)
         if fake_cb:
             return await _ask_time(fake_cb)
-        # Фолбэк: напрямую спрашиваем время
         st.step = "waiting_time"
         return await msg.reply_text(
             "Введите время публикации в формате <b>HH:MM</b> по Киеву (например, 14:30).",
@@ -376,12 +378,9 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-    # Сбор контента (GEN) + картинка опционально
     if st.step == "waiting_text":
-        # фото как фото
         if msg.photo:
             st.image_url = msg.photo[-1].file_id
-        # фото как документ (скрепка)
         if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
             if msg.document.mime_type.startswith("image/"):
                 st.image_url = msg.document.file_id
@@ -392,7 +391,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fake_cb = await update.to_callback_query(context.bot)
         if fake_cb:
             return await _ask_time(fake_cb)
-        # Фолбэк: напрямую спрашиваем время
         st.step = "waiting_time"
         return await msg.reply_text(
             "Введите время публикации в формате <b>HH:MM</b> по Киеву (например, 14:30).",
@@ -400,7 +398,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-    # Время для обоих режимов
     if st.step == "waiting_time":
         ok = False
         if len(text) >= 4 and ":" in text:
@@ -414,7 +411,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if fake_cb:
             return await _show_ready_add_cancel(fake_cb)
 
-        # Фолбэк: показываем сводку обычным сообщением
         prefix = "PLAN_" if st.mode == "plan" else "GEN_"
         lines: List[str] = []
         if st.mode == "plan":
@@ -437,7 +433,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
 # -------------------------
 def register_planner_handlers(app: Application):
-    # Планировщик — высокий приоритет (group=0). В PTB v20 параметра `block` нет.
     app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"),    group=0)
     app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"),     group=0)
     app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"),   group=0)
@@ -449,8 +444,6 @@ def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"),          group=0)
     app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"), group=0)
 
-    # Ввод пользователем — тоже в нулевой группе, но on_user_message сам “отпускает” события,
-    # если режим планировщика не активен (см. ранний return в начале функции).
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message),
         group=0
@@ -478,5 +471,4 @@ async def _update_to_callback_query(update: Update, bot) -> _Optional[CallbackQu
         return await _build_fake_callback_from_message(update.message, bot)
     return None
 
-# Патч метода Update — удобно дергать одинаково из шагов
 setattr(Update, "to_callback_query", _update_to_callback_query)
