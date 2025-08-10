@@ -1,1 +1,22 @@
-
+{
+  "posts": [
+    {
+      "time": "09:00",
+      "topic": "AI in cryptocurrency",
+      "text": "Sample text for post",
+      "image_url": null
+    },
+    {
+      "time": "14:00",
+      "topic": "Community growth and token utility",
+      "text": "Another post example",
+      "image_url": null
+    },
+    {
+      "time": "22:00",
+      "topic": "Promo post about Ai Coin",
+      "text": "Promo content here",
+      "image_url": null
+    }
+  ]
+}
