@@ -20,7 +20,12 @@ from github import Github
 from openai import OpenAI  # openai>=1.35.0
 
 # === ПЛАНИРОВЩИК ===
-from planner import register_planner_handlers, open_planner, set_ai_generator
+# set_ai_generator импортируем ОПЦИОНАЛЬНО, чтобы сейчас не падало, пока мы его не добавили в planner.py
+from planner import register_planner_handlers, open_planner
+try:
+    from planner import set_ai_generator  # появится позже — ок
+except ImportError:
+    set_ai_generator = None
 from planner import USER_STATE as PLANNER_STATE
 # ====================
 
@@ -68,9 +73,9 @@ client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
 # Таймеры
-TIMER_PUBLISH_DEFAULT = 180
-TIMER_PUBLISH_EXTEND  = 600
-AUTO_SHUTDOWN_AFTER_SECONDS = 600
+TIMER_PUBLISH_DEFAULT = 180       # авто-пост плейсхолдера через 3 минуты
+TIMER_PUBLISH_EXTEND  = 600       # при активности таймер продлеваем
+AUTO_SHUTDOWN_AFTER_SECONDS = 600 # автовыключение при бездействии 10 минут
 
 DISABLE_WEB_PREVIEW = True
 
@@ -113,7 +118,6 @@ def get_start_menu():
     ])
 
 def post_choice_keyboard():
-    # Клавиатура выбора способа публикации после ручного ввода
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
@@ -165,7 +169,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 200  # сознательно короче 280, чтобы влезали хэштеги
+TW_MAX = 200  # короче 280, чтобы влезали хэштеги
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -477,10 +481,13 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# Связываем генератор с планировщиком (без циклических импортов)
+# Связываем генератор с планировщиком (без циклических импортов). Безопасно, если в planner пока нет set_ai_generator.
 try:
-    set_ai_generator(ai_generate_content_en)
-    logging.info("Planner AI generator registered.")
+    if set_ai_generator:
+        set_ai_generator(ai_generate_content_en)
+        logging.info("Planner AI generator registered.")
+    else:
+        logging.info("Planner AI generator not registered (set_ai_generator not found).")
 except Exception as e:
     logging.warning(f"Cannot register planner AI generator: {e}")
 
@@ -661,6 +668,7 @@ async def check_timer():
                             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                             text=f"Автопост: Telegram — {'✅' if tg_ok else '❌'}, Twitter — {'✅' if tw_ok else '❌'}. Выключаюсь."
                         )
+                        # Автовыключение ТОЛЬКО в авто-режиме
                         shutdown_bot_and_exit()
                     else:
                         pending_post["active"] = False
@@ -883,6 +891,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
+    # После ручной публикации — НЕ выключаемся
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
 # ===== MESSAGE HANDLER =====
@@ -928,8 +937,7 @@ async def on_start(app: Application):
     post_data["image_url"] = img
     await send_start_placeholder()
 
-    # ВАЖНО: никаких автопланов/расписаний тут больше нет — всё делает planner.py
-    logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. Планирование — только в planner.py.")
+    logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. Планирование — в planner.py.")
 
 # ===== Выключение =====
 def shutdown_bot_and_exit():
@@ -951,7 +959,7 @@ def main():
         .build()
     )
 
-    # Планировщик регистрируем первым (высший приоритет, без block для PTB v20)
+    # Планировщик регистрируем первым (высший приоритет)
     register_planner_handlers(app)
 
     # Наши хендлеры — позже
