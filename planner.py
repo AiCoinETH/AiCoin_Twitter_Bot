@@ -128,11 +128,9 @@ async def _openai_usable() -> bool:
         )
         return True
     except Exception as e:
-        # Явное сообщение при исчерпании квоты
         msg = str(e).lower()
         if "insufficient_quota" in msg or "too many requests" in msg or "429" in msg:
             return False
-        # Любая другая ошибка — считаем недоступно
         return False
 
 # -------------------------
@@ -192,7 +190,7 @@ async def _show_ready_add_cancel(q: CallbackQuery):
         lines.append(f"Тема: {st.topic or '—'}")
     else:
         text = (st.text or "—").strip()
-        if len(text) > 400:  # просто не захламлять превью
+        if len(text) > 400:
             text = text[:397] + "…"
         lines.append(f"Текст: {text}")
         lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
@@ -206,7 +204,6 @@ async def _show_ready_add_cancel(q: CallbackQuery):
 # CALLBACKS
 # -------------------------
 async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверка OpenAI перед стартом режима
     if not await _openai_usable():
         q = update.callback_query
         await _safe_edit_or_send(
@@ -250,7 +247,6 @@ async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
 
 async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # избегаем кругового импорта — передадим управление основному боту через его кнопку
     q = update.callback_query
     await _safe_edit_or_send(
         q, "Открываю основное меню…",
@@ -297,7 +293,7 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
             ])
         )
 
-    # Пытаемся импортировать генератор из основного бота (во время колбэка круговой импорт уже безопасен)
+    # Пытаемся импортировать генератор из основного бота
     try:
         from twitter_bot import ai_generate_content_en
     except Exception:
@@ -310,16 +306,14 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
             ])
         )
 
-    # простой сценарий: три быстрых слота без расписания (время спросим позже вручную)
     topics = [
         "Utility, community growth and joining early.",
         "Governance & on-chain voting with AI analysis.",
         "AI-powered proposals and speed of execution."
     ]
     uid = q.from_user.id
-    _ensure(uid)  # инициализировать
+    _ensure(uid)
 
-    # генерим 3 варианта и кладём как черновики (без time_str)
     created = 0
     for th in topics:
         try:
@@ -375,8 +369,13 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Сбор контента (GEN) + картинка опционально
     if st.step == "waiting_text":
+        # фото как фото
         if msg.photo:
-            st.image_url = msg.photo[-1].file_id  # фактический URL загрузит основной бот при публикации
+            st.image_url = msg.photo[-1].file_id
+        # фото как документ (скрепка)
+        if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
+            if msg.document.mime_type.startswith("image/"):
+                st.image_url = msg.document.file_id
         if text:
             st.text = text
         if not (st.text or st.image_url):
@@ -400,19 +399,23 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
 # -------------------------
 def register_planner_handlers(app: Application):
-    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"))
-    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"))
-    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"))
-    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"))
+    # Планировщик — максимальный приоритет и блокировка дальнейших хендлеров
+    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"),    group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"),     group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"),   group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"), group=0, block=True)
 
-    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"))
-    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"))
-    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"))
-    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"))
-    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"))
+    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"),         group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"),    group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"),         group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"),          group=0, block=True)
+    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"), group=0, block=True)
 
     # Ввод пользователем (перехватываем только если он в режиме планировщика)
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, on_user_message))
+    app.add_handler(
+        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message, block=True),
+        group=0
+    )
 
 # -------------------------
 # FAKE CallbackQuery (для унификации шагов)
