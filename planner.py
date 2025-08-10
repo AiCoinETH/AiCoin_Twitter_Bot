@@ -128,6 +128,7 @@ async def _openai_usable() -> bool:
         )
         return True
     except Exception as e:
+        # Можно включить отладочное логирование при желании
         msg = str(e).lower()
         if "insufficient_quota" in msg or "too many requests" in msg or "429" in msg:
             return False
@@ -365,7 +366,15 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
         st.topic = text
         fake_cb = await update.to_callback_query(context.bot)
-        return await _ask_time(fake_cb)
+        if fake_cb:
+            return await _ask_time(fake_cb)
+        # Фолбэк: напрямую спрашиваем время
+        st.step = "waiting_time"
+        return await msg.reply_text(
+            "Введите время публикации в формате <b>HH:MM</b> по Киеву (например, 14:30).",
+            reply_markup=cancel_only(),
+            parse_mode="HTML"
+        )
 
     # Сбор контента (GEN) + картинка опционально
     if st.step == "waiting_text":
@@ -381,7 +390,15 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (st.text or st.image_url):
             return await msg.reply_text("Пришлите текст поста и/или фото.", reply_markup=cancel_only())
         fake_cb = await update.to_callback_query(context.bot)
-        return await _ask_time(fake_cb)
+        if fake_cb:
+            return await _ask_time(fake_cb)
+        # Фолбэк: напрямую спрашиваем время
+        st.step = "waiting_time"
+        return await msg.reply_text(
+            "Введите время публикации в формате <b>HH:MM</b> по Киеву (например, 14:30).",
+            reply_markup=cancel_only(),
+            parse_mode="HTML"
+        )
 
     # Время для обоих режимов
     if st.step == "waiting_time":
@@ -392,8 +409,29 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ok:
             return await msg.reply_text("Неверный формат. Пример: 14:30", reply_markup=cancel_only())
         st.time_str = f"{int(hh):02d}:{int(mm):02d}"
+
         fake_cb = await update.to_callback_query(context.bot)
-        return await _show_ready_add_cancel(fake_cb)
+        if fake_cb:
+            return await _show_ready_add_cancel(fake_cb)
+
+        # Фолбэк: показываем сводку обычным сообщением
+        prefix = "PLAN_" if st.mode == "plan" else "GEN_"
+        lines: List[str] = []
+        if st.mode == "plan":
+            lines.append(f"Тема: {st.topic or '—'}")
+        else:
+            t = (st.text or "—").strip()
+            if len(t) > 400: t = t[:397] + "…"
+            lines.append(f"Текст: {t}")
+            lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
+        lines.append(f"Время: {st.time_str or '—'}")
+
+        return await msg.reply_text(
+            "Проверьте данные:\n" + "\n".join(lines),
+            reply_markup=step_buttons_done_add_cancel(prefix),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
 
 # -------------------------
 # РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
@@ -421,6 +459,8 @@ def register_planner_handlers(app: Application):
 # -------------------------
 # FAKE CallbackQuery (для унификации шагов)
 # -------------------------
+from typing import Optional as _Optional
+
 async def _build_fake_callback_from_message(message: Message, bot) -> CallbackQuery:
     cq = CallbackQuery(
         id="fake",
@@ -431,10 +471,12 @@ async def _build_fake_callback_from_message(message: Message, bot) -> CallbackQu
     )
     return cq
 
-async def _update_to_callback_query(update: Update, bot):
+async def _update_to_callback_query(update: Update, bot) -> _Optional[CallbackQuery]:
     if update.callback_query:
         return update.callback_query
-    return await _build_fake_callback_from_message(update.message, bot)
+    if update.message:
+        return await _build_fake_callback_from_message(update.message, bot)
+    return None
 
 # Патч метода Update — удобно дергать одинаково из шагов
 setattr(Update, "to_callback_query", _update_to_callback_query)
