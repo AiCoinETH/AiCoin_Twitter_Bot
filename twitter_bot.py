@@ -1014,14 +1014,25 @@ def shutdown_bot_and_exit():
 
 # MAIN
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN_APPROVAL).post_init(on_start).build()
+    app = (
+        Application
+        .builder()
+        .token(TELEGRAM_BOT_TOKEN_APPROVAL)
+        .post_init(on_start)
+        # Важно: последовательная обработка, чтобы исключить гонки между планировщиком и ручным режимом
+        .concurrent_updates(False)
+        .build()
+    )
 
-    # Регистрируем планировщик ДО общего CallbackQueryHandler
-    register_planner_handlers(app)
+    # Планировщик регистрируем первым (приоритетная группа)
+    register_planner_handlers(app)  # Внутри planner.py по возможности добавляй handlers с block=True
 
-    # Наши хендлеры: текст, фото и изображения-документы
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler))
+    # Наши хендлеры ставим в более поздние группы и помечаем block=True
+    app.add_handler(CallbackQueryHandler(callback_handler, block=True), group=5)
+    app.add_handler(
+        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler, block=True),
+        group=10
+    )
 
     app.run_polling(poll_interval=0.12, timeout=1)
 
