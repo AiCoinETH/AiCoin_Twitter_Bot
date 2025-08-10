@@ -26,7 +26,7 @@ from planner import USER_STATE as PLANNER_STATE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(funcName)s %(message)s')
 
-# ENV
+# ===== ENV =====
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
@@ -63,7 +63,7 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
 
-# OpenAI: без бесконечных ретраев, и флаг-уведомление по квоте
+# OpenAI
 client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
@@ -74,7 +74,9 @@ AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
 DISABLE_WEB_PREVIEW = True
 
-TELEGRAM_SIGNATURE_HTML = '\n\n<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twitter X</a>'
+# По просьбе — без ссылок/подписей в постах
+DISABLE_SIGNATURE_LINKS = True
+TELEGRAM_SIGNATURE_HTML = ""  # пусто, чтобы не добавлять ссылки
 
 fallback_images = [
     "https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png",
@@ -100,9 +102,7 @@ last_button_pressed_at = None
 # ждём следующее сообщение после «Сделай сам»
 manual_expected_until = None  # datetime | None
 
-day_plan = []
-
-# Меню
+# ===== Меню =====
 def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пост", callback_data="approve")],
@@ -141,7 +141,7 @@ def telegram_preview_keyboard():
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
-# Twitter / GitHub
+# ===== Twitter / GitHub =====
 def get_twitter_clients():
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
@@ -163,12 +163,11 @@ twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
-# Постостроители
+# ===== Постостроители =====
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
-LINKS_SIGNATURE = "Learn more | telegram: https://t.me/AiCoin_ETH | website: https://getaicoin.com/"
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 200
+TW_MAX = 200  # оставим как было, но реально 280 — мы поджимаем ещё хэштеги
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -222,17 +221,9 @@ def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
         return f"{body} {tags}"
     return body or tags
 
-def compose_full_text_with_links(ai_text_en: str, ai_hashtags=None) -> str:
-    body = trim_plain_to((ai_text_en or "").strip(), 666)
-    tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
-    suffix_parts = [LINKS_SIGNATURE]
-    if tags: suffix_parts.append(tags)
-    suffix = " ".join(suffix_parts).strip()
-    if body and suffix: return f"{body} {suffix}"
-    return body or suffix
-
+# для Twitter теперь ТОЛЬКО текст+теги, без ссылок
 def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
-    suffix_text = compose_full_text_with_links("", ai_hashtags)
+    suffix_text = compose_full_text_without_links("", ai_hashtags)
     body = trim_plain_to((ai_text_en or "").strip(), 666)
     sep = " " if body and suffix_text else ""
     allowed_for_body = TW_MAX - (1 if sep else 0) - twitter_len(suffix_text)
@@ -248,6 +239,7 @@ def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
     return composed
 
 def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
+    # тоже без ссылок
     return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
@@ -256,7 +248,7 @@ def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
 def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_telegram_post(ai_text_en, ai_hashtags)
 
-# GitHub helpers
+# ===== GitHub helpers =====
 def upload_image_to_github(image_path, filename):
     with open(image_path, "rb") as img_file:
         content = img_file.read()
@@ -276,7 +268,7 @@ def delete_image_from_github(filename):
     except Exception as e:
         logging.error(f"Ошибка удаления файла на GitHub: {e}")
 
-# Изображения
+# ===== Изображения =====
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
         for _ in range(retries):
@@ -314,7 +306,7 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
         raise Exception("Не удалось загрузить фото на GitHub")
     return url
 
-# Предпросмотр
+# ===== Предпросмотр =====
 async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=None, header: str | None = None):
     twitter_txt = build_twitter_preview(ai_text_en, ai_hashtags)
     telegram_txt = build_telegram_preview(ai_text_en, ai_hashtags)
@@ -342,7 +334,7 @@ async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=No
         await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Telegram:</b>\n{telegram_txt}",
                                parse_mode="HTML", reply_markup=tg_markup, disable_web_page_preview=True)
 
-# Отправка фото
+# ===== Отправка фото =====
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     def is_valid_image_url(url):
         try:
@@ -379,7 +371,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
                                parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
         return None, None
 
-# БД
+# ===== БД =====
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -441,7 +433,7 @@ async def save_post_to_history(text, image_url=None):
         except Exception as e:
             logging.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
-# ИИ
+# ===== ИИ =====
 def _oa_chat_text(prompt: str) -> str:
     try:
         resp = client_oa.chat.completions.create(
@@ -490,147 +482,115 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# Дневной план
-def _today_time(hour: int, minute: int) -> datetime:
-    now = datetime.now(TZ)
-    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+# ===== Публикация в Twitter/X с компрессией =====
+def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_side: int = 2048) -> bool:
+    """
+    Пытаемся сжать/уменьшить изображение (JPEG) до лимита Twitter.
+    Возвращает True, если файл уменьшен и <= target_bytes.
+    """
+    try:
+        from PIL import Image
+        import os
+        initial_size = os.path.getsize(path)
+        if initial_size <= target_bytes:
+            return True
 
-async def ensure_unique_bundle(text_en: str, tags: list[str], img: str | None, max_tries: int = 3, topic_hint: str = "variant") -> tuple[str, list[str], str | None, bool]:
-    tw = build_twitter_post(text_en, tags)
-    tg = build_telegram_post(text_en, tags)
-    if not await is_duplicate_post(tw, img) and not await is_duplicate_post(tg, img):
-        return text_en, tags, img, False
-    for _ in range(max_tries):
-        nt, ntags, nimg = await ai_generate_content_en(topic_hint)
-        tw2 = build_twitter_post(nt, ntags)
-        tg2 = build_telegram_post(nt, ntags)
-        if not await is_duplicate_post(tw2, nimg) and not await is_duplicate_post(tg2, nimg):
-            return nt, ntags, nimg, True
-    return text_en, tags, img, False
+        img = Image.open(path)
+        img = img.convert("RGB")
+        # масштабируем, если очень большое
+        w, h = img.size
+        scale = min(1.0, float(max_side) / float(max(w, h)))
+        if scale < 1.0:
+            new_size = (int(w * scale), int(h * scale))
+            img = img.resize(new_size, Image.LANCZOS)
 
-async def report_day_plan_status():
-    if not day_plan:
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="План на день пуст.", disable_web_page_preview=True)
-        return
-    lines = ["<b>Day plan (Kyiv):</b>"]
-    for slot in day_plan:
-        tstr = slot["time"].strftime("%H:%M")
-        status = slot["status"]
-        emoji = "🟡" if status == "scheduled" else ("✅" if status == "published" else "⏭️")
-        note = f" — {slot['note']}" if slot.get("note") else ""
-        lines.append(f"{tstr} — {emoji} {status.capitalize()}{note}")
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        # ступенчато уменьшаем качество
+        for q in (85, 80, 75, 70, 65, 60, 55, 50, 45, 40):
+            tmp = path + ".tmp.jpg"
+            img.save(tmp, format="JPEG", quality=q, optimize=True)
+            sz = os.path.getsize(tmp)
+            if sz <= target_bytes:
+                os.replace(tmp, path)
+                return True
+        # если не достигли — сохраняем лучшее (последний)
+        os.replace(tmp, path)
+        return os.path.getsize(path) <= target_bytes
+    except Exception as e:
+        logging.warning(f"Pillow недоступен или ошибка сжатия: {e}")
+        return False
 
-async def preview_day_plan():
-    for slot in day_plan:
-        tstr = slot["time"].strftime("%H:%M")
-        header = f"{tstr} • Scheduled preview"
-        await preview_split(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, slot["text"], slot["tags"], slot["img"], header=header)
+def _download_to_temp_file(image_url: str) -> str | None:
+    try:
+        r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        r.raise_for_status()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp.write(r.content); tmp.close()
+        return tmp.name
+    except Exception as e:
+        logging.warning(f"Не удалось скачать картинку для Twitter: {e}")
+        return None
 
-async def publish_slot(slot_idx: int):
-    slot = day_plan[slot_idx]
-    text_en, tags, img = slot["text"], slot["tags"], slot["img"]
-    tw_text = build_twitter_post(text_en, tags)
-    tg_text = build_telegram_post(text_en, tags)
-
-    attempts = 0
-    replaced = False
-    while attempts < 3 and (await is_duplicate_post(tw_text, img) or await is_duplicate_post(tg_text, img)):
-        attempts += 1
-        nt, ntags, nimg = await ai_generate_content_en("fresh replacement")
-        nt, ntags, nimg, rep2 = await ensure_unique_bundle(nt, ntags, nimg, max_tries=1, topic_hint="freshest")
-        text_en, tags, img = nt, ntags, nimg
-        tw_text = build_twitter_post(text_en, tags)
-        tg_text = build_telegram_post(text_en, tags)
-        replaced = replaced or rep2
-
-    if replaced:
-        slot["note"] = (slot.get("note") or "") + " (replaced before publish)"
-        slot["text"], slot["tags"], slot["img"] = text_en, tags, img
-
-    tg_ok = await publish_post_to_telegram(tg_text, img)
-    tw_ok = publish_post_to_twitter(tw_text, img)
-
-    if tg_ok: await save_post_to_history(tg_text, img)
-    if tw_ok: await save_post_to_history(tw_text, img)
-
-    if tg_ok and tw_ok:
-        slot["status"] = "published"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ✅ Published (TG+TW)")
-    else:
-        slot["status"] = "skipped"
-        slot["note"] = (slot.get("note") or "") + " (publish error)"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"{slot['time'].strftime('%H:%M')} — ⏭️ Skipped due to error")
-
-    shutdown_bot_and_exit()
-
-async def schedule_slot(slot_idx: int):
-    slot = day_plan[slot_idx]
-    when = slot["time"]
-    await asyncio.sleep(max(0, (when - datetime.now(TZ)).total_seconds()))
-    await publish_slot(slot_idx)
-
-async def build_day_plan_for_today():
-    global day_plan
-    now = datetime.now(TZ)
-    t14 = _today_time(14, 0)
-    t15 = _today_time(15, 0)
-    t16 = _today_time(16, 0)
-    targets = [t if t > now else t + timedelta(days=1) for t in (t14, t15, t16)]
-
-    topics = [
-        "Utility, community growth and joining early.",
-        "Governance: holders propose, AI analyzes, tokenholders vote on-chain (>51% wins).",
-        "AI-powered proposals and speed of execution."
-    ]
-
-    bundles = await asyncio.gather(*(ai_generate_content_en(th) for th in topics))
-
-    unique_bundles = []
-    for (text, tags, img), hint in zip(bundles, topics):
-        nt, ntags, nimg, replaced = await ensure_unique_bundle(text, tags, img, max_tries=3, topic_hint=hint+" variant")
-        note = "replacement prepared" if replaced else ""
-        unique_bundles.append((nt, ntags, nimg, note))
-
-    day_plan = []
-    for t, (text, tags, img, note) in zip(targets, unique_bundles):
-        day_plan.append({"time": t, "text": text, "tags": tags, "img": img, "status": "scheduled", "note": note})
-
-# Публикация
 def publish_post_to_twitter(text, image_url=None):
     github_filename = None
     try:
         media_ids = None
-        file_path = None
-        if image_url:
-            if not str(image_url).startswith("http"):
-                return False
-            r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'})
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp.write(r.content); tmp.close()
-            file_path = tmp.name
 
-        if file_path:
-            media = twitter_api_v1.media_upload(file_path)
-            media_ids = [media.media_id_string]
-            os.remove(file_path)
-
+        # формируем финальный текст
         final_text = build_twitter_post(text, [])
+
+        # если есть картинка — аккуратно поджать/перезалить
+        if image_url and str(image_url).startswith("http"):
+            file_path = _download_to_temp_file(image_url)
+            if file_path:
+                # пробуем сжать до лимита
+                ok = _try_compress_image_inplace(file_path)
+                if not ok:
+                    logging.warning("Картинку не удалось сжать до лимита — публикуем твит без изображений.")
+                    os.remove(file_path)
+                    file_path = None
+
+            if file_path:
+                try:
+                    media = twitter_api_v1.media_upload(filename=file_path)
+                    media_ids = [media.media_id_string]
+                except Exception as e:
+                    # если из-за размера — предпримем ещё одну попытку ужать и повторить
+                    if "413" in str(e) or "Payload Too Large" in str(e):
+                        logging.warning("413 при загрузке в Twitter, пробую сильнее сжать и повторить…")
+                        if _try_compress_image_inplace(file_path, target_bytes=3_800_000, max_side=1600):
+                            media = twitter_api_v1.media_upload(filename=file_path)
+                            media_ids = [media.media_id_string]
+                        else:
+                            logging.warning("Не удалось сжать до безопасного размера — отправляю без изображения.")
+                            media_ids = None
+                    else:
+                        raise
+                finally:
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+
+        # Публикация
         twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
+
+        # почистим GitHub-изображение, если это наш файл
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
         return True
+
     except Exception as e:
         logging.error(f"Ошибка публикации в Twitter: {e}")
         asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
-        if github_filename: delete_image_from_github(github_filename)
+        if github_filename:
+            delete_image_from_github(github_filename)
         return False
 
+# ===== Telegram =====
 async def publish_post_to_telegram(text, image_url=None):
     try:
-        text_with_signature = (text or "") + TELEGRAM_SIGNATURE_HTML
+        text_with_signature = (text or "")  # без ссылок
         if image_url:
             await send_photo_with_download(
                 channel_bot,
@@ -655,7 +615,7 @@ async def publish_post_to_telegram(text, image_url=None):
         )
         return False
 
-# Стартовое сообщение
+# ===== Стартовое сообщение =====
 async def send_start_placeholder():
     text_en = post_data["text_en"]
     ai_tags = post_data.get("ai_hashtags") or []
@@ -692,7 +652,7 @@ async def send_start_placeholder():
 
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
-# Таймеры
+# ===== Таймеры (только авто-пост стартового плейсхолдера и авто-выключение) =====
 async def check_timer():
     while True:
         await asyncio.sleep(0.5)
@@ -740,7 +700,7 @@ async def check_inactivity_shutdown():
         except Exception as e:
             logging.warning(f"check_inactivity_shutdown error: {e}")
 
-# CALLBACK HANDLER
+# ===== CALLBACK HANDLER =====
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until
     query = update.callback_query
@@ -765,14 +725,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     planner_callbacks = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
-        "STEP_BACK", "PLAN_LIST_TODAY"
+        "STEP_BACK", "PLAN_LIST_TODAY", "PLAN_AI_BUILD_NOW"
     }
     if data in planner_callbacks or data.startswith("PLAN_"):
         return
 
-    # Вызов UI планировщика (КЛЮЧЕВАЯ ПРАВКА: гасим окно ручного ввода)
+    # Вызов UI планировщика
     if data == "show_day_plan":
-        manual_expected_until = None  # <<< чтобы «Сделай сам» не перехватывал ввод
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
@@ -798,7 +757,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
-        # Жёсткий сброс состояния планировщика, чтобы не перехватывал ручной ввод
+        # Сброс состояния планировщика, чтобы не перехватывал ручной ввод
         try:
             uid = update.effective_user.id
             st = PLANNER_STATE.get(uid)
@@ -864,7 +823,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-# Ручной ввод
+# ===== Ручной ввод =====
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     pending_post["active"] = True
@@ -921,7 +880,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     finally:
         manual_expected_until = None
 
-# Публикация
+# ===== Публикация =====
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     ai_tags = post_data.get("ai_hashtags") or []
@@ -956,7 +915,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
-# MESSAGE HANDLER (КЛЮЧЕВАЯ ПРАВКА: приоритет за планировщиком)
+# ===== MESSAGE HANDLER =====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, manual_expected_until
     now = datetime.now(TZ)
@@ -968,25 +927,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # 0) Если планировщик ЖДЁТ ввод — отдаём сообщение ему и выходим
+    # 1) если недавно нажали «Сделай сам» — принудительно в ручной режим
+    if manual_expected_until and now <= manual_expected_until:
+        return await handle_manual_input(update, context)
+
+    # 2) иначе отдаём планировщику ТОЛЬКО когда он реально ждёт ввод
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
         cur_step = getattr(cur, "step", "idle") if cur else "idle"
         if cur_step in ("waiting_topic", "waiting_text", "waiting_time"):
-            return  # planner.py сам обработает этот апдейт
+            return  # planner.py обработает свой шаг
     except Exception:
         pass
 
-    # 1) Если активно окно «Сделай сам» — обрабатываем вручную
-    if manual_expected_until and now <= manual_expected_until:
-        return await handle_manual_input(update, context)
-
-    # 2) Дефолт — ручной ввод (на случай произвольного сообщения)
+    # 3) дефолт — ручной ввод
     return await handle_manual_input(update, context)
 
-# STARTUP
+# ===== STARTUP =====
 async def on_start(app: Application):
     await init_db()
     asyncio.create_task(check_timer())
@@ -998,13 +957,11 @@ async def on_start(app: Application):
     post_data["image_url"] = img
     await send_start_placeholder()
 
-    await build_day_plan_for_today()
-    for idx in range(len(day_plan)):
-        asyncio.create_task(schedule_slot(idx))
+    # ВАЖНО: никаких автопланов/расписаний тут больше нет — всё делает planner.py
 
-    logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. План дня активирован тихо.")
+    logging.info("Бот запущен. Отправлено ОДНО стартовое сообщение с ПОЛНЫМ набором кнопок. Планирование — только в planner.py.")
 
-# Выключение
+# ===== Выключение =====
 def shutdown_bot_and_exit():
     try:
         asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!"))
@@ -1013,22 +970,21 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
-# MAIN
+# ===== MAIN =====
 def main():
     app = (
         Application
         .builder()
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)
         .post_init(on_start)
-        # Важно: последовательная обработка, чтобы исключить гонки между планировщиком и ручным режимом
         .concurrent_updates(False)
         .build()
     )
 
-    # Планировщик регистрируем первым (приоритетная группа)
-    register_planner_handlers(app)  # Внутри planner.py по возможности добавляй handlers с block=True
+    # Планировщик регистрируем первым (высший приоритет)
+    register_planner_handlers(app)  # внутри planner.py хендлеры создаются с block=True
 
-    # Наши хендлеры ставим в более поздние группы и помечаем block=True
+    # Наши хендлеры — позже
     app.add_handler(CallbackQueryHandler(callback_handler, block=True), group=5)
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler, block=True),
