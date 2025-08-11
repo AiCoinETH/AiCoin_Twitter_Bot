@@ -41,8 +41,8 @@ def _db_init():
             user_id INTEGER NOT NULL,
             mode TEXT NOT NULL,         -- 'plan' | 'gen'
             topic TEXT,                 -- для plan
-            text  TEXT,                 -- итоговый текст (для plan после ИИ)
-            time_str TEXT NOT NULL,     -- HH:MM (Киев)
+            text  TEXT,                 -- итоговый текст
+            time_str TEXT,              -- HH:MM (Киев)
             image_url TEXT,             -- file_id или URL
             status TEXT NOT NULL DEFAULT 'planned', -- planned | posted | canceled
             created_at TEXT NOT NULL
@@ -652,6 +652,7 @@ async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = _ensure(uid)
     if _can_finalize(st):
         _push(uid, st)
+    # Важно: начинаем НОВЫЙ такой же сценарий той же ветки
     if st.mode == "plan":
         await _ask_topic(q, mode="plan")
     else:
@@ -830,7 +831,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- СОЗДАНИЕ ---
     if st.step == "waiting_topic":
-        # Зафиксируем ветку PLAN (на случай рассинхронизации)
+        # Зафиксируем ветку PLAN
         st.mode = "plan"
         if not text:
             return await msg.reply_text("[PLAN] Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
@@ -929,7 +930,7 @@ def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_clone_item,        pattern="^CLONE_ITEM:\\d+$"),     group=0)
     app.add_handler(CallbackQueryHandler(cb_ai_new_from,       pattern="^AI_NEW_FROM:\\d+$"),    group=0)
 
-    # Ввод пользователем — только когда мы реально в шагах/редактировании
+    # Пользовательский ввод на шагах/редактировании
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message),
         group=0
