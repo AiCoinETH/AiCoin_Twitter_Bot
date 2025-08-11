@@ -329,7 +329,7 @@ async def _show_ready_add_cancel(q: CallbackQuery):
         text = (st.text or "—").strip()
         if len(text) > 400: text = text[:397] + "…"
         lines.append(f"Текст: {text}")
-        lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
+        lines.append(f"Картинка: {'есть' если st.image_url else 'нет'}")
     lines.append(f"Время: {st.time_str or '—'}")
     await _safe_edit_or_send(
         q, "Проверь данные:\n" + "\n".join(lines),
@@ -841,7 +841,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if img: st.image_url = img
             except Exception:
                 st.text = st.text or ""  # если ИИ не сработал — без текста
-        # PATCH 2: спрашиваем время сообщением (не через fake callback)
+        # спрашиваем время сообщением (не через fake callback)
         await _ask_time_via_msg(msg)
         return
 
@@ -856,7 +856,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st.text = text
         if not (st.text or st.image_url):
             return await msg.reply_text("Пришли текст поста и/или фото.", reply_markup=cancel_only())
-        # PATCH 3: спрашиваем время сообщением (не через fake callback)
+        # спрашиваем время сообщением (не через fake callback)
         await _ask_time_via_msg(msg)
         return
 
