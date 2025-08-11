@@ -88,7 +88,7 @@ def db_delete_item(pid: int) -> None:
     conn.close()
 
 # =========================
-# РЕГИСТРАТОР ИИ-ГЕНЕРОТОРА
+# РЕГИСТРАТОР ИИ-ГЕНЕРАТОРА
 # =========================
 _AI_GEN_FN: Optional[
     Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
@@ -208,7 +208,7 @@ def _can_finalize(item: PlannedItem) -> bool:
     if not item.time_str:
         return False
     if item.mode == "plan":
-        return bool(item.topic and (item.text or True))  # текст появится от ИИ
+        return bool(item.topic and (item.text or True))  # текст появится от ИИ (если доступен)
     if item.mode == "gen":
         return bool(item.text or item.image_url)
     return False
@@ -280,7 +280,9 @@ async def _ask_topic(q: CallbackQuery, mode: str):
     st.step = "waiting_topic"
     await _safe_edit_or_send(
         q,
-        "Введи <b>тему</b> для поста. После этого я сам сгенерирую текст и сразу попрошу время публикации.",
+        "Введи <b>тему</b> для поста.\n"
+        "Если ИИ доступен — я сгенерирую текст автоматически и сразу попрошу время публикации.\n"
+        "Если ИИ недоступен — просто сразу перейдём к выбору времени.",
         reply_markup=cancel_only()
     )
 
@@ -304,7 +306,7 @@ async def _ask_time(q: CallbackQuery):
         reply_markup=cancel_only()
     )
 
-# PATCH 1: Новый хелпер — спрашиваем время обычным сообщением, без fake CallbackQuery
+# Запрос времени через обычное сообщение (без fake-callback)
 async def _ask_time_via_msg(msg: Message):
     uid = msg.from_user.id
     st = _ensure(uid)
@@ -340,18 +342,19 @@ async def _show_ready_add_cancel(q: CallbackQuery):
 # CALLBACKS (режимы и список)
 # =========================
 async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _openai_usable():
-        q = update.callback_query
-        await _safe_edit_or_send(
-            q,
-            "❗ <b>OpenAI недоступен или квота исчерпана</b>.\nМожно продолжить вручную:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
-                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
-            ])
-        )
-        return
-    await _ask_topic(update.callback_query, mode="plan")
+    q = update.callback_query
+    # Всегда заходим в PLAN; при недоступности OpenAI — только предупреждение
+    usable = await _openai_usable()
+    if not usable:
+        try:
+            await q.message.chat.send_message(
+                "⚠️ OpenAI сейчас недоступен — продолжим PLAN без автогенерации текста.\n"
+                "Сначала введи тему, затем укажем время.",
+                reply_markup=cancel_only(), parse_mode="HTML", disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+    await _ask_topic(q, mode="plan")
 
 async def cb_open_gen_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _ask_text(update.callback_query)
@@ -664,10 +667,14 @@ async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not await _openai_usable():
+    usable = await _openai_usable()
+
+    if not usable:
+        # Не редиректим в GEN — просто предложим ручной режим как опцию
         return await _safe_edit_or_send(
             q,
-            "❗ <b>OpenAI недоступен или квота исчерпана</b>.\nПока можно перейти в ручной режим:",
+            "❗ <b>OpenAI недоступен или квота исчерпана</b>.\n"
+            "Можно продолжить вручную или вернуться позже:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
                 [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
@@ -829,18 +836,26 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- СОЗДАНИЕ ---
     if st.step == "waiting_topic":
-        # ИИ-режим: тема -> генерим текст -> сразу просим время
+        # ИИ-режим: тема -> (опционально генерим текст) -> сразу просим время
         if not text:
             return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
         st.topic = text
-        # генерим текст
-        if _AI_GEN_FN is not None:
+
+        # генерим текст (только если есть генератор и OpenAI доступен)
+        try:
+            usable = await _openai_usable()
+        except Exception:
+            usable = False
+
+        if (_AI_GEN_FN is not None) and usable:
             try:
                 text_en, tags, img = await _AI_GEN_FN(st.topic)
                 st.text = f"{text_en}\n\n{' '.join(tags)}".strip()
-                if img: st.image_url = img
+                if img:
+                    st.image_url = img
             except Exception:
-                st.text = st.text or ""  # если ИИ не сработал — без текста
+                st.text = st.text or ""  # если ИИ не сработал — продолжим без текста
+
         # спрашиваем время сообщением (не через fake callback)
         await _ask_time_via_msg(msg)
         return
@@ -856,6 +871,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st.text = text
         if not (st.text or st.image_url):
             return await msg.reply_text("Пришли текст поста и/или фото.", reply_markup=cancel_only())
+
         # спрашиваем время сообщением (не через fake callback)
         await _ask_time_via_msg(msg)
         return
@@ -928,7 +944,7 @@ def register_planner_handlers(app: Application):
     )
 
 # =========================
-# FAKE CallbackQuery (для унификации шагов)
+# (Необязательная) унификация: FAKE CallbackQuery
 # =========================
 from typing import Optional as _Optional
 
