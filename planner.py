@@ -191,7 +191,6 @@ def _push(uid: int, item: PlannedItem):
         "added_at": datetime.utcnow().isoformat() + "Z"
     }
     USER_STATE[uid]["items"].append(row)
-    # в БД
     try:
         db_insert_item(uid, {
             "mode": row["mode"],
@@ -202,13 +201,13 @@ def _push(uid: int, item: PlannedItem):
         })
     except Exception:
         pass
-    USER_STATE[uid]["current"] = PlannedItem()  # сброс
+    USER_STATE[uid]["current"] = PlannedItem()
 
 def _can_finalize(item: PlannedItem) -> bool:
     if not item.time_str:
         return False
     if item.mode == "plan":
-        return bool(item.topic and (item.text or True))  # текст появится от ИИ (если доступен)
+        return bool(item.topic and (item.text or True))
     if item.mode == "gen":
         return bool(item.text or item.image_url)
     return False
@@ -265,9 +264,9 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     USER_STATE.setdefault(uid, {"mode": "none", "items": [], "current": PlannedItem(), "seq": 0})
     if q:
-        await _safe_edit_or_send(q, "Планировщик: выбери режим.", reply_markup=main_planner_menu())
+        await _safe_edit_or_send(q, "[ПЛАНИРОВЩИК] Выбери режим.", reply_markup=main_planner_menu())
     else:
-        await context.bot.send_message(update.effective_chat.id, "Планировщик: выбери режим.",
+        await context.bot.send_message(update.effective_chat.id, "[ПЛАНИРОВЩИК] Выбери режим.",
                                        reply_markup=main_planner_menu())
 
 # =========================
@@ -280,9 +279,9 @@ async def _ask_topic(q: CallbackQuery, mode: str):
     st.step = "waiting_topic"
     await _safe_edit_or_send(
         q,
-        "Введи <b>тему</b> для поста.\n"
-        "Если ИИ доступен — я сгенерирую текст автоматически и сразу попрошу время публикации.\n"
-        "Если ИИ недоступен — просто сразу перейдём к выбору времени.",
+        "[PLAN] Введи <b>тему</b> для поста.\n"
+        "Если ИИ доступен — я сгенерирую текст и сразу попрошу время публикации.\n"
+        "Если ИИ недоступен — сразу перейдём к выбору времени.",
         reply_markup=cancel_only()
     )
 
@@ -293,7 +292,7 @@ async def _ask_text(q: CallbackQuery):
     st.step = "waiting_text"
     await _safe_edit_or_send(
         q,
-        "Пришли текст поста и/или фото (можно одним сообщением — фото с подписью). Затем попрошу время публикации.",
+        "[GEN] Пришли текст поста и/или фото (можно одним сообщением — фото с подписью). Затем попрошу время публикации.",
         reply_markup=cancel_only()
     )
 
@@ -302,17 +301,16 @@ async def _ask_time(q: CallbackQuery):
     st = _ensure(uid)
     st.step = "waiting_time"
     await _safe_edit_or_send(
-        q, "Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
+        q, "[*] Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
         reply_markup=cancel_only()
     )
 
-# Запрос времени через обычное сообщение (без fake-callback)
 async def _ask_time_via_msg(msg: Message):
     uid = msg.from_user.id
     st = _ensure(uid)
     st.step = "waiting_time"
     await msg.reply_text(
-        "Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
+        "[*] Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
         reply_markup=cancel_only(),
         parse_mode="HTML"
     )
@@ -343,13 +341,11 @@ async def _show_ready_add_cancel(q: CallbackQuery):
 # =========================
 async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    # Всегда заходим в PLAN; при недоступности OpenAI — только предупреждение
     usable = await _openai_usable()
     if not usable:
         try:
             await q.message.chat.send_message(
-                "⚠️ OpenAI сейчас недоступен — продолжим PLAN без автогенерации текста.\n"
-                "Сначала введи тему, затем укажем время.",
+                "⚠️ OpenAI сейчас недоступен — продолжим в ветке [PLAN] без автогенерации.",
                 reply_markup=cancel_only(), parse_mode="HTML", disable_web_page_preview=True
             )
         except Exception:
@@ -532,7 +528,6 @@ async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         it["text"] = f"{text_en}\n\n{' '.join(tags)}".strip()
         if img:
             it["image_url"] = img
-        # в БД
         try:
             db_update_item(pid, {"text": it["text"], "image_url": it.get("image_url")})
         except Exception:
@@ -670,11 +665,10 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
     usable = await _openai_usable()
 
     if not usable:
-        # Не редиректим в GEN — просто предложим ручной режим как опцию
         return await _safe_edit_or_send(
             q,
             "❗ <b>OpenAI недоступен или квота исчерпана</b>.\n"
-            "Можно продолжить вручную или вернуться позже:",
+            "Можно продолжить вручную (ветка [GEN]) или вернуться позже.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
                 [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
@@ -755,7 +749,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "editing_time", "editing_text", "editing_topic", "editing_image"
     }
     if (st.mode not in ("plan", "gen", "edit")) and (st.step not in active_steps):
-        return  # не наш режим — пусть основное приложение обработает
+        return
 
     msg: Message = update.message
     text = (msg.text or msg.caption or "").strip()
@@ -836,12 +830,12 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- СОЗДАНИЕ ---
     if st.step == "waiting_topic":
-        # ИИ-режим: тема -> (опционально генерим текст) -> сразу просим время
+        # Зафиксируем ветку PLAN (на случай рассинхронизации)
+        st.mode = "plan"
         if not text:
-            return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
+            return await msg.reply_text("[PLAN] Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
         st.topic = text
 
-        # генерим текст (только если есть генератор и OpenAI доступен)
         try:
             usable = await _openai_usable()
         except Exception:
@@ -854,14 +848,14 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if img:
                     st.image_url = img
             except Exception:
-                st.text = st.text or ""  # если ИИ не сработал — продолжим без текста
-
-        # спрашиваем время сообщением (не через fake callback)
+                st.text = st.text or ""
+        # спрашиваем время сообщением
         await _ask_time_via_msg(msg)
         return
 
     if st.step == "waiting_text":
-        # Мой план: текст/фото -> время
+        # Ветка GEN
+        st.mode = "gen"
         if msg.photo:
             st.image_url = msg.photo[-1].file_id
         if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
@@ -870,9 +864,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text:
             st.text = text
         if not (st.text or st.image_url):
-            return await msg.reply_text("Пришли текст поста и/или фото.", reply_markup=cancel_only())
-
-        # спрашиваем время сообщением (не через fake callback)
+            return await msg.reply_text("[GEN] Пришли текст поста и/или фото.", reply_markup=cancel_only())
         await _ask_time_via_msg(msg)
         return
 
@@ -882,7 +874,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hh, mm = text.split(":", 1)
             ok = hh.isdigit() and mm.isdigit() and 0 <= int(hh) < 24 and 0 <= int(mm) < 60
         if not ok:
-            return await msg.reply_text("Неверный формат. Пример: 14:30", reply_markup=cancel_only())
+            return await msg.reply_text("[*] Неверный формат. Пример: 14:30", reply_markup=cancel_only())
         st.time_str = f"{int(hh):02d}:{int(mm):02d}"
 
         prefix = "PLAN_" if st.mode == "plan" else "GEN_"
@@ -944,7 +936,7 @@ def register_planner_handlers(app: Application):
     )
 
 # =========================
-# (Необязательная) унификация: FAKE CallbackQuery
+# (опц.) унификация CallbackQuery из Message
 # =========================
 from typing import Optional as _Optional
 
