@@ -304,6 +304,17 @@ async def _ask_time(q: CallbackQuery):
         reply_markup=cancel_only()
     )
 
+# PATCH 1: Новый хелпер — спрашиваем время обычным сообщением, без fake CallbackQuery
+async def _ask_time_via_msg(msg: Message):
+    uid = msg.from_user.id
+    st = _ensure(uid)
+    st.step = "waiting_time"
+    await msg.reply_text(
+        "Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
+        reply_markup=cancel_only(),
+        parse_mode="HTML"
+    )
+
 async def _show_ready_add_cancel(q: CallbackQuery):
     uid = q.from_user.id
     st = _ensure(uid)
@@ -818,7 +829,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- СОЗДАНИЕ ---
     if st.step == "waiting_topic":
-        # ИИ-режим: тема -> генерим текст -> сразу спрашиваем время
+        # ИИ-режим: тема -> генерим текст -> сразу просим время
         if not text:
             return await msg.reply_text("Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
         st.topic = text
@@ -830,14 +841,9 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if img: st.image_url = img
             except Exception:
                 st.text = st.text or ""  # если ИИ не сработал — без текста
-        fake_cb = await update.to_callback_query(context.bot)
-        if fake_cb:
-            return await _ask_time(fake_cb)
-        st.step = "waiting_time"
-        return await msg.reply_text(
-            "Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
-            reply_markup=cancel_only(), parse_mode="HTML"
-        )
+        # PATCH 2: спрашиваем время сообщением (не через fake callback)
+        await _ask_time_via_msg(msg)
+        return
 
     if st.step == "waiting_text":
         # Мой план: текст/фото -> время
@@ -850,14 +856,9 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st.text = text
         if not (st.text or st.image_url):
             return await msg.reply_text("Пришли текст поста и/или фото.", reply_markup=cancel_only())
-        fake_cb = await update.to_callback_query(context.bot)
-        if fake_cb:
-            return await _ask_time(fake_cb)
-        st.step = "waiting_time"
-        return await msg.reply_text(
-            "Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
-            reply_markup=cancel_only(), parse_mode="HTML"
-        )
+        # PATCH 3: спрашиваем время сообщением (не через fake callback)
+        await _ask_time_via_msg(msg)
+        return
 
     if st.step == "waiting_time":
         ok = False
@@ -867,10 +868,6 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ok:
             return await msg.reply_text("Неверный формат. Пример: 14:30", reply_markup=cancel_only())
         st.time_str = f"{int(hh):02d}:{int(mm):02d}"
-
-        fake_cb = await update.to_callback_query(context.bot)
-        if fake_cb:
-            return await _show_ready_add_cancel(fake_cb)
 
         prefix = "PLAN_" if st.mode == "plan" else "GEN_"
         lines: List[str] = []
