@@ -697,6 +697,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
+    # ----- ВАЖНО: ВСЁ «планировочное» отдаём planner.py -----
+    planner_exact = {
+        "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
+        "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
+        "STEP_BACK", "PLAN_LIST_TODAY", "PLAN_AI_BUILD_NOW",
+        "BACK_MAIN_MENU"
+    }
+    planner_prefixes = (
+        "PLAN_",        # общие шаги
+        "ITEM_MENU:",   # меню элемента
+        "DEL_ITEM:",    # удаление
+        "EDIT_TIME:",   # шорткат времени
+        "EDIT_ITEM:",   # меню редактирования
+        "EDIT_FIELD:",  # выбор поля
+        "AI_FILL_TEXT:",
+        "CLONE_ITEM:",
+        "AI_NEW_FROM:"
+    )
+    if (data in planner_exact) or any(data.startswith(p) for p in planner_prefixes):
+        # Ничего не делаем тут — перехватят хендлеры planner.py (group=0)
+        return
+
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
@@ -711,16 +733,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[user_id] = now
 
-    planner_callbacks = {
-        "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
-        "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
-        "STEP_BACK", "PLAN_LIST_TODAY", "PLAN_AI_BUILD_NOW"
-    }
-    if data in planner_callbacks or data.startswith("PLAN_"):
-        return
-
     if data == "show_day_plan":
-        # если открыли планировщик — выключаем ручной «ожидаю следующее сообщение»
         manual_expected_until = None
         return await open_planner(update, context)
 
@@ -912,7 +925,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "waiting_topic", "waiting_text", "waiting_time",
             "editing_time", "editing_text", "editing_topic", "editing_image"
         )):
-            # FIX: если пользователь в планировщике — ничего не делаем, planner.py перехватит (group=0)
+            # planner.py перехватит (group=0)
             return
     except Exception:
         pass
