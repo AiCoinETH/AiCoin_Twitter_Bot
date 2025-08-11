@@ -88,7 +88,7 @@ def db_delete_item(pid: int) -> None:
     conn.close()
 
 # =========================
-# РЕГИСТРАТОР ИИ-ГЕНЕРАТОРА
+# РЕГИСТРАТОР ИИ-ГЕНЕРОТОРА
 # =========================
 _AI_GEN_FN: Optional[
     Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
@@ -329,7 +329,7 @@ async def _show_ready_add_cancel(q: CallbackQuery):
         text = (st.text or "—").strip()
         if len(text) > 400: text = text[:397] + "…"
         lines.append(f"Текст: {text}")
-        lines.append(f"Картинка: {'есть' если st.image_url else 'нет'}")
+        lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
     lines.append(f"Время: {st.time_str or '—'}")
     await _safe_edit_or_send(
         q, "Проверь данные:\n" + "\n".join(lines),
