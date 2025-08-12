@@ -1,962 +1,1054 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
+"""
+twitter_bot.py — основной бот согласования/генерации/публикации.
+Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто-превью поста)
+c меню действий, где есть кнопка «🗓 ИИ план на день» (в planner.py).
+"""
+
 import os
-import sqlite3
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Callable, Awaitable, Tuple
+import re
+import asyncio
+import logging
+import random
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timedelta, time as dt_time
+from unicodedata import normalize
+from zoneinfo import ZoneInfo
 
-from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, CallbackQuery
+import tweepy
+import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+import aiosqlite
+from github import Github
+from openai import OpenAI  # openai>=1.35.0
+
+# === ПЛАНИРОВЩИК ===
+from planner import register_planner_handlers, open_planner
+try:
+    from planner import set_ai_generator
+except ImportError:
+    set_ai_generator = None
+from planner import USER_STATE as PLANNER_STATE
+
+# -----------------------------------------------------------------------------
+# ЛОГИРОВАНИЕ
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s",
 )
-    # NOTE: Update is extended at the end of file with .to_callback_query helper
-from telegram.ext import (
-    Application, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-)
-from telegram.error import BadRequest
+log = logging.getLogger("twitter_bot")
 
-# =========================
-# ПАМЯТЬ СЕССИЙ ПЛАНИРОВЩИКА
-# =========================
-USER_STATE: Dict[int, Dict[str, Any]] = {}
+def _lg(prefix: str, msg: str):
+    log.info(f"{prefix} {msg}")
 
-@dataclass
-class PlannedItem:
-    topic: Optional[str] = None
-    text: Optional[str] = None
-    time_str: Optional[str] = None
-    image_url: Optional[str] = None
-    step: str = "idle"   # idle | waiting_topic | waiting_text | waiting_time | editing_*
-    mode: str = "none"   # plan | gen | edit
+# -----------------------------------------------------------------------------
+# ENV
+# -----------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # @username или id
 
-# =========================
-# БАЗА ДАННЫХ (только план)
-# =========================
-DB_FILE = os.getenv("PLANNER_DB_FILE", "planner_posts.db")
+TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
+TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
+TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
 
-def _db_init():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS planned_posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            mode TEXT NOT NULL,         -- 'plan' | 'gen'
-            topic TEXT,                 -- для plan
-            text  TEXT,                 -- итоговый текст
-            time_str TEXT,              -- HH:MM (Киев)
-            image_url TEXT,             -- file_id или URL
-            status TEXT NOT NULL DEFAULT 'planned', -- planned | posted | canceled
-            created_at TEXT NOT NULL
+GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
+GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
+GITHUB_IMAGE_PATH = "images_for_posts"
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Жёсткие проверки окружения
+if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID_STR, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
+    log.error("Не заданы обязательные переменные окружения Telegram!")
+    sys.exit(1)
+TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID_STR)
+if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET]):
+    log.error("Не заданы обязательные переменные окружения для Twitter!")
+    sys.exit(1)
+if not all([GITHUB_TOKEN, GITHUB_REPO]):
+    log.error("Не заданы обязательные переменные окружения GitHub!")
+    sys.exit(1)
+if not OPENAI_API_KEY:
+    log.error("Не задан OPENAI_API_KEY!")
+    sys.exit(1)
+
+# -----------------------------------------------------------------------------
+# ГЛОБАЛЫ
+# -----------------------------------------------------------------------------
+approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
+channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
+
+DB_FILE = "post_history.db"
+TZ = ZoneInfo("Europe/Kyiv")
+
+# OpenAI
+client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
+OPENAI_QUOTA_WARNED = False
+
+# Таймеры
+TIMER_PUBLISH_DEFAULT = 180
+TIMER_PUBLISH_EXTEND  = 600
+AUTO_SHUTDOWN_AFTER_SECONDS = 600
+
+DISABLE_WEB_PREVIEW = True
+TELEGRAM_SIGNATURE_HTML = ""
+
+# -----------------------------------------------------------------------------
+# ДЕФОЛТНЫЕ ДАННЫЕ ПОСТА
+# -----------------------------------------------------------------------------
+fallback_images = [
+    "https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png",
+    "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
+]
+
+post_data = {
+    "text_en": "AI Coin blends blockchain with AI for smarter, faster, community-driven decisions.",
+    "ai_hashtags": ["#AiCoin", "#AI", "$Ai", "#crypto"],
+    "image_url": random.choice(fallback_images),
+    "timestamp": None,
+    "post_id": 0,
+    "is_manual": False
+}
+prev_data = post_data.copy()
+
+pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
+do_not_disturb = {"active": False}
+last_action_time = {}
+last_button_pressed_at = None
+manual_expected_until = None  # datetime | None
+
+# >>> ФЛАГ-РОУТЕР для планировщика (чтобы ввод не улетал в «Сделай сам»)
+ROUTE_TO_PLANNER = set()  # set(user_id)
+
+# -----------------------------------------------------------------------------
+# МЕНЮ/КНОПКИ
+# -----------------------------------------------------------------------------
+def start_preview_keyboard():
+    # Компактное меню под единый предпросмотр
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
+        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
+         InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post"),
+         InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
+         InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+    ])
+
+def get_start_menu():
+    # Запасное «Главное меню» (используется в некоторых ответах)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
+        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+    ])
+
+def post_choice_keyboard():
+    return start_preview_keyboard()
+
+def twitter_preview_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+    ])
+
+def telegram_preview_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
+    ])
+
+# -----------------------------------------------------------------------------
+# TWITTER / GITHUB
+# -----------------------------------------------------------------------------
+def get_twitter_clients():
+    client_v2 = tweepy.Client(
+        consumer_key=TWITTER_API_KEY,
+        consumer_secret=TWITTER_API_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
+    )
+    api_v1 = tweepy.API(
+        tweepy.OAuth1UserHandler(
+            TWITTER_API_KEY,
+            TWITTER_API_SECRET,
+            TWITTER_ACCESS_TOKEN,
+            TWITTER_ACCESS_TOKEN_SECRET
         )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_planned_status ON planned_posts(status)")
-    conn.commit()
-    conn.close()
+    )
+    return client_v2, api_v1
 
-def db_insert_item(user_id: int, it: Dict[str, Any]) -> int:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO planned_posts (user_id, mode, topic, text, time_str, image_url, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)
-    """, (
-        user_id,
-        it.get("mode"),
-        it.get("topic"),
-        it.get("text"),
-        it.get("time"),
-        it.get("image_url"),
-        datetime.utcnow().isoformat() + "Z"
-    ))
-    rowid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return int(rowid)
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+github_client = Github(GITHUB_TOKEN)
+github_repo = github_client.get_repo(GITHUB_REPO)
 
-def db_update_item(pid: int, fields: Dict[str, Any]) -> None:
-    if not fields: return
-    sets = ", ".join(f"{k} = ?" for k in fields.keys())
-    vals = list(fields.values()) + [pid]
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(f"UPDATE planned_posts SET {sets} WHERE id = ?", vals)
-    conn.commit()
-    conn.close()
+# -----------------------------------------------------------------------------
+# ТЕКСТ/ХЭШТЕГИ/ДЛИНЫ
+# -----------------------------------------------------------------------------
+_TCO_LEN = 23
+_URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
+MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
+TW_MAX = 200
 
-def db_delete_item(pid: int) -> None:
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("DELETE FROM planned_posts WHERE id = ?", (pid,))
-    conn.commit()
-    conn.close()
+def twitter_len(s: str) -> int:
+    if not s: return 0
+    s = normalize("NFC", s)
+    return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
-# =========================
-# РЕГИСТРАТОР ИИ-ГЕНЕРАТОРА
-# =========================
-_AI_GEN_FN: Optional[
-    Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]
-] = None
+def trim_plain_to(s: str, max_len: int) -> str:
+    if not s: return s
+    s = normalize("NFC", s).strip()
+    if len(s) <= max_len: return s
+    ell = '…'
+    s = s[: max_len - len(ell)]
+    return (s + ell).rstrip()
 
-def set_ai_generator(fn: Callable[[str], Awaitable[Tuple[str, List[str], Optional[str]]]]):
-    """Регистрируется из основного бота: set_ai_generator(ai_generate_content_en)"""
-    global _AI_GEN_FN
-    _AI_GEN_FN = fn
+def trim_to_twitter_len(s: str, max_len: int) -> str:
+    if not s: return s
+    s = normalize("NFC", s).strip()
+    if twitter_len(s) <= max_len: return s
+    ell = '…'
+    while s and twitter_len(s + ell) > max_len:
+        s = s[:-1]
+    return (s + ell).rstrip()
 
-# =========================
-# КНОПКИ
-# =========================
-def main_planner_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧭 ИИ план (тема → текст → время)", callback_data="OPEN_PLAN_MODE")],
-        [InlineKeyboardButton("✨ Мой план (текст/фото → время)", callback_data="OPEN_GEN_MODE")],
-        [InlineKeyboardButton("🤖 Построить план ИИ сейчас", callback_data="PLAN_AI_BUILD_NOW")],
-        [InlineKeyboardButton("📋 Список на сегодня", callback_data="PLAN_LIST_TODAY")],
-        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
-    ])
+def _dedup_hashtags(*tags_groups):
+    seen, out = set(), []
+    def norm_tag(t: str) -> str:
+        t = t.strip()
+        if not t: return ""
+        if not (t.startswith("#") or t.startswith("$")):
+            t = "#" + t
+        return t
+    def is_topic_ok(t: str) -> bool:
+        tl = t.lower()
+        return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
+    def feed(group):
+        if not group: return
+        items = group.split() if isinstance(group, str) else list(group)
+        for raw in items:
+            tag = norm_tag(raw)
+            if not tag or not is_topic_ok(tag): continue
+            key = tag.lower()
+            if key in seen: continue
+            seen.add(key); out.append(tag)
+    for g in tags_groups: feed(g)
+    return " ".join(out)
 
-def step_buttons_done_add_cancel(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}DONE"),
-            InlineKeyboardButton("➕ Добавить", callback_data=f"{prefix}ADD_MORE"),
-        ],
-        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],
-        [InlineKeyboardButton("↩️ Отмена (шаг назад)", callback_data="STEP_BACK")],
-    ])
+def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
+    body = trim_plain_to((ai_text_en or "").strip(), 666)
+    tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
+    if body and tags:
+        return f"{body} {tags}"
+    return body or tags
 
-def cancel_only() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")],
-        [InlineKeyboardButton("↩️ Отмена", callback_data="STEP_BACK")]
-    ])
+def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
+    suffix_text = compose_full_text_without_links("", ai_hashtags)
+    body = trim_plain_to((ai_text_en or "").strip(), 666)
+    sep = " " if body and suffix_text else ""
+    allowed_for_body = TW_MAX - (1 if sep else 0) - twitter_len(suffix_text)
+    if allowed_for_body < 0:
+        return trim_to_twitter_len(suffix_text, TW_MAX)
+    body_trimmed = trim_to_twitter_len(body, allowed_for_body)
+    composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
+    while twitter_len(composed) > TW_MAX and body_trimmed:
+        body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
+        composed = (f"{body_trimmed}{sep}{suffix_text}").strip()
+    if not body_trimmed and twitter_len(suffix_text) > TW_MAX:
+        composed = trim_to_twitter_len(suffix_text, TW_MAX)
+    return composed
 
-def _item_actions_kb(pid: int, mode: str) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("✏️ Править", callback_data=f"EDIT_ITEM:{pid}"),
-            InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{pid}"),
-        ],
-        [InlineKeyboardButton("🗑 Удалить", callback_data=f"DEL_ITEM:{pid}")],
-        [InlineKeyboardButton("⬅️ Назад к списку", callback_data="PLAN_LIST_TODAY")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")],
-    ]
-    if mode == "plan":
-        rows.insert(1, [InlineKeyboardButton("🤖 ИИ: дополнить текст", callback_data=f"AI_FILL_TEXT:{pid}")])
-        rows.insert(2, [InlineKeyboardButton("🤖 ИИ: новый пост (та же тема/время)", callback_data=f"AI_NEW_FROM:{pid}")])
-        rows.insert(3, [InlineKeyboardButton("➕ Клон (та же тема/время)", callback_data=f"CLONE_ITEM:{pid}")])
-    else:
-        rows.insert(1, [InlineKeyboardButton("➕ Клон (то же время)", callback_data=f"CLONE_ITEM:{pid}")])
-    return InlineKeyboardMarkup(rows)
+def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
+    return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
-def _edit_fields_kb(pid: int, mode: str) -> InlineKeyboardMarkup:
-    rows = []
-    if mode == "plan":
-        rows.append([InlineKeyboardButton("📝 Тема", callback_data=f"EDIT_FIELD:topic:{pid}")])
-        rows.append([InlineKeyboardButton("✍️ Текст (ручн.)", callback_data=f"EDIT_FIELD:text:{pid}")])
-    else:
-        rows.append([InlineKeyboardButton("✍️ Текст", callback_data=f"EDIT_FIELD:text:{pid}")])
-    rows.append([InlineKeyboardButton("🖼 Картинка", callback_data=f"EDIT_FIELD:image:{pid}")])
-    rows.append([InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_FIELD:time:{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ITEM_MENU:{pid}")])
-    return InlineKeyboardMarkup(rows)
+def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
+    return build_twitter_post(ai_text_en, ai_hashtags)
 
-# =========================
-# ХЕЛПЕРЫ СОСТОЯНИЯ
-# =========================
-def _ensure(uid: int) -> PlannedItem:
-    row = USER_STATE.get(uid) or {}
-    if "current" not in row:
-        row["current"] = PlannedItem()
-        row.setdefault("items", [])
-        row.setdefault("seq", 0)
-        USER_STATE[uid] = row
-    return row["current"]
+def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
+    return build_telegram_post(ai_text_en, ai_hashtags)
 
-def _new_pid(uid: int) -> int:
-    USER_STATE[uid]["seq"] = USER_STATE[uid].get("seq", 0) + 1
-    return USER_STATE[uid]["seq"]
-
-def _find_item(uid: int, pid: int) -> Optional[Dict[str, Any]]:
-    for it in USER_STATE.get(uid, {}).get("items", []):
-        if it.get("id") == pid:
-            return it
-    return None
-
-def _push(uid: int, item: PlannedItem):
-    pid = _new_pid(uid)
-    row = {
-        "id": pid,
-        "mode": item.mode,
-        "topic": item.topic,
-        "text": item.text,
-        "time": item.time_str,
-        "image_url": item.image_url,
-        "added_at": datetime.utcnow().isoformat() + "Z"
-    }
-    USER_STATE[uid]["items"].append(row)
+# -----------------------------------------------------------------------------
+# GitHub helpers (хостинг изображений)
+# -----------------------------------------------------------------------------
+def upload_image_to_github(image_path, filename):
+    with open(image_path, "rb") as img_file:
+        content = img_file.read()
     try:
-        db_insert_item(uid, {
-            "mode": row["mode"],
-            "topic": row["topic"],
-            "text": row["text"],
-            "time": row["time"],
-            "image_url": row["image_url"],
-        })
+        github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
+        url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/{filename}"
+        return url
+    except Exception as e:
+        log.error(f"Ошибка загрузки файла на GitHub: {e}")
+        return None
+
+def delete_image_from_github(filename):
+    try:
+        file_path = f"{GITHUB_IMAGE_PATH}/{filename}"
+        contents = github_repo.get_contents(file_path, ref="main")
+        github_repo.delete_file(contents.path, "delete image after posting", contents.sha, branch="main")
+    except Exception as e:
+        log.error(f"Ошибка удаления файла на GitHub: {e}")
+
+# -----------------------------------------------------------------------------
+# Изображения
+# -----------------------------------------------------------------------------
+async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
+    if is_telegram_file:
+        for _ in range(retries):
+            try:
+                file = await bot.get_file(url_or_file_id)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                await file.download_to_drive(tmp_file.name)
+                return tmp_file.name
+            except Exception as e:
+                log.warning(f"download_image_async TG failed: {e}")
+                await asyncio.sleep(1)
+        raise Exception("Не удалось скачать файл из Telegram")
+    else:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url_or_file_id, headers=headers, timeout=15)
+        r.raise_for_status()
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp_file.write(r.content); tmp_file.close()
+        return tmp_file.name
+
+async def save_image_and_get_github_url(image_path):
+    filename = f"{uuid.uuid4().hex}.jpg"
+    url = upload_image_to_github(image_path, filename)
+    return url, filename
+
+async def process_telegram_photo(file_id: str, bot: Bot) -> str:
+    _lg("IMG>", f"process_telegram_photo file_id={file_id}")
+    file_path = await download_image_async(file_id, is_telegram_file=True, bot=bot)
+    url, _ = await save_image_and_get_github_url(file_path)
+    try:
+        os.remove(file_path)
     except Exception:
         pass
-    USER_STATE[uid]["current"] = PlannedItem()
+    if not url:
+        raise Exception("Не удалось загрузить фото на GitHub")
+    _lg("IMG>", f"uploaded_to_github url={url}")
+    return url
 
-def _can_finalize(item: PlannedItem) -> bool:
-    if not item.time_str:
-        return False
-    if item.mode == "plan":
-        return bool(item.topic and (item.text or True))
-    if item.mode == "gen":
-        return bool(item.text or item.image_url)
-    return False
+# -----------------------------------------------------------------------------
+# ЕДИНЫЙ ПРЕДПРОСМОТР (1 сообщение)
+# -----------------------------------------------------------------------------
+async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, header: str | None = "Предпросмотр"):
+    caption = build_telegram_preview(text_en, ai_hashtags or [])
+    hdr = f"<b>{header}</b>\n" if header else ""
+    text = f"{hdr}{caption}".strip()
 
-# =========================
-# БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ
-# =========================
-async def _safe_edit_or_send(q: CallbackQuery, text: str,
-                             reply_markup: Optional[InlineKeyboardMarkup]=None,
-                             parse_mode: Optional[str]="HTML"):
-    m: Message = q.message
     try:
-        if m and (m.text is not None):
-            return await q.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode,
-                                             disable_web_page_preview=True)
-        if m and (m.caption is not None):
-            return await q.edit_message_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
-        raise BadRequest("no editable text/caption")
-    except BadRequest:
-        return await m.chat.send_message(text=text, reply_markup=reply_markup, parse_mode=parse_mode,
-                                         disable_web_page_preview=True)
-
-# =========================
-# OPENAI: ПРОВЕРКА ДОСТУПНОСТИ/КВОТЫ
-# =========================
-def _openai_key_present() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY"))
-
-async def _openai_usable() -> bool:
-    if not _openai_key_present():
-        return False
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":"ping"}],
-            max_tokens=1,
-            temperature=0.0,
+        if image_url:
+            _lg("PREVIEW>", f"send photo preview (has image) len={len(text)}")
+            await send_photo_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                image_url,
+                caption=text,
+                reply_markup=start_preview_keyboard()
+            )
+        else:
+            _lg("PREVIEW>", f"send text preview len={len(text)}")
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=start_preview_keyboard()
+            )
+    except Exception as e:
+        log.warning(f"send_single_preview failed, fallback to text: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=start_preview_keyboard()
         )
+
+# -----------------------------------------------------------------------------
+# Отправка фото c локальным скачиванием
+# -----------------------------------------------------------------------------
+async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+    def is_valid_image_url(url):
+        try:
+            resp = requests.head(url, timeout=5)
+            return resp.headers.get('Content-Type', '').startswith('image/')
+        except Exception:
+            return False
+    try:
+        if not str(url_or_file_id).startswith("http"):
+            _lg("IMG>", "input is telegram file_id -> process+upload")
+            url = await process_telegram_photo(url_or_file_id, bot)
+            msg = await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+            return msg, url.split('/')[-1]
+        else:
+            if not is_valid_image_url(url_or_file_id):
+                _lg("IMG>", "invalid image url -> fallback to text")
+                await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
+                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                return None, None
+            try:
+                response = requests.get(url_or_file_id, timeout=10)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                tmp_file.write(response.content); tmp_file.close()
+                with open(tmp_file.name, "rb") as img:
+                    msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+                os.remove(tmp_file.name)
+                return msg, None
+            except Exception:
+                _lg("IMG>", "download-or-send failed -> fallback to text")
+                await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML",
+                                       reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+                return None, None
+    except Exception as e:
+        log.error(f"Ошибка в send_photo_with_download: {e}")
+        await bot.send_message(chat_id=chat_id, text=caption or " ",
+                               parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=DISABLE_WEB_PREVIEW)
+        return None, None
+
+# -----------------------------------------------------------------------------
+# БД истории (дедупликация)
+# -----------------------------------------------------------------------------
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                text_hash TEXT,
+                timestamp TEXT NOT NULL,
+                image_hash TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_unique
+            ON posts (COALESCE(text_hash, ''), COALESCE(image_hash, ''));
+        """)
+        await db.commit()
+
+def normalize_text_for_hashing(text: str) -> str:
+    if not text: return ""
+    return " ".join(text.strip().lower().split())
+
+def sha256_hex(data: bytes) -> str:
+    import hashlib as _h
+    return _h.sha256(data).hexdigest()
+
+async def is_duplicate_post(text: str, image_url: str | None) -> bool:
+    text_norm = normalize_text_for_hashing(text)
+    text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
+    image_hash = None
+    if image_url:
+        try:
+            r = requests.get(image_url, timeout=10)
+            r.raise_for_status()
+            image_hash = sha256_hex(r.content)
+        except Exception:
+            image_hash = None
+    async with aiosqlite.connect(DB_FILE) as db:
+        q = "SELECT 1 FROM posts WHERE COALESCE(text_hash,'') = COALESCE(?, '') AND COALESCE(image_hash,'') = COALESCE(?, '') LIMIT 1"
+        async with db.execute(q, (text_hash, image_hash)) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+async def save_post_to_history(text, image_url=None):
+    text_norm = normalize_text_for_hashing(text)
+    text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
+    image_hash = None
+    if image_url:
+        try:
+            r = requests.get(image_url, timeout=10)
+            r.raise_for_status()
+            image_hash = sha256_hex(r.content)
+        except Exception:
+            image_hash = None
+    async with aiosqlite.connect(DB_FILE) as db:
+        try:
+            await db.execute("INSERT INTO posts (text, text_hash, timestamp, image_hash) VALUES (?, ?, ?, ?)",
+                             (text, text_hash, datetime.now(TZ).isoformat(), image_hash))
+            await db.commit()
+        except Exception as e:
+            log.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
+
+# -----------------------------------------------------------------------------
+# ИИ-генерация
+# -----------------------------------------------------------------------------
+def _oa_chat_text(prompt: str) -> str:
+    try:
+        resp = client_oa.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.9,
+            max_tokens=220,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        return txt.strip('"\n` ')
+    except Exception as e:
+        log.warning(f"_oa_chat_text error: {e}")
+        try:
+            global OPENAI_QUOTA_WARNED
+            if (("429" in str(e)) or ("insufficient_quota" in str(e))) and not OPENAI_QUOTA_WARNED:
+                OPENAI_QUOTA_WARNED = True
+                asyncio.create_task(
+                    approval_bot.send_message(
+                        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                        text="⚠️ OpenAI: insufficient quota (429). Пополните баланс OpenAI, иначе генерация не работает."
+                    )
+                )
+        except Exception:
+            pass
+        return "Ai Coin fuses AI with blockchain to turn community ideas into real actions. Join builders shaping the next wave of crypto utility."
+
+async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
+    text_prompt = (
+        "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
+        "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon. "
+        f"Emphasize: {topic_hint}."
+    )
+    text_en = _oa_chat_text(text_prompt)
+
+    extra_tags_prompt = (
+        "Give me 3 short, relevant crypto+AI hashtags for a social post about Ai Coin (no duplicates of #AiCoin, #AI, #crypto, $Ai), "
+        "single line, space-separated, each begins with #, only AI/crypto topics."
+    )
+    tags_line = _oa_chat_text(extra_tags_prompt)
+    ai_tags = [t for t in tags_line.split() if t.startswith("#") and len(t) > 1][:4]
+
+    image_url = random.choice(fallback_images)
+    return (text_en, ai_tags, image_url)
+
+# регистрируем генератор для planner.py
+try:
+    if set_ai_generator:
+        set_ai_generator(ai_generate_content_en)
+        log.info("Planner AI generator registered.")
+    else:
+        log.info("Planner AI generator not registered (set_ai_generator not found).")
+except Exception as e:
+    log.warning(f"Cannot register planner AI generator: {e}")
+
+# -----------------------------------------------------------------------------
+# Публикация
+# -----------------------------------------------------------------------------
+def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_side: int = 2048) -> bool:
+    try:
+        from PIL import Image
+        import os
+        initial_size = os.path.getsize(path)
+        if initial_size <= target_bytes:
+            return True
+
+        img = Image.open(path)
+        img = img.convert("RGB")
+        w, h = img.size
+        scale = min(1.0, float(max_side) / float(max(w, h)))
+        if scale < 1.0:
+            new_size = (int(w * scale), int(h * scale))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        for q in (85, 80, 75, 70, 65, 60, 55, 50, 45, 40):
+            tmp = path + ".tmp.jpg"
+            img.save(tmp, format="JPEG", quality=q, optimize=True)
+            sz = os.path.getsize(tmp)
+            if sz <= target_bytes:
+                os.replace(tmp, path)
+                return True
+        os.replace(tmp, path)
+        return os.path.getsize(path) <= target_bytes
+    except Exception as e:
+        log.warning(f"Pillow недоступен или ошибка сжатия: {e}")
+        return False
+
+def _download_to_temp_file(image_url: str) -> str | None:
+    try:
+        r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        r.raise_for_status()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp.write(r.content); tmp.close()
+        return tmp.name
+    except Exception as e:
+        log.warning(f"Не удалось скачать картинку для Twitter: {e}")
+        return None
+
+def publish_post_to_twitter(text, image_url=None):
+    github_filename = None
+    try:
+        media_ids = None
+        final_text = build_twitter_post(text, [])
+
+        if image_url and str(image_url).startswith("http"):
+            file_path = _download_to_temp_file(image_url)
+            if file_path:
+                ok = _try_compress_image_inplace(file_path)
+                if not ok:
+                    log.warning("Картинку не удалось сжать до лимита — публикуем твит без изображений.")
+                    os.remove(file_path)
+                    file_path = None
+
+            if file_path:
+                try:
+                    media = twitter_api_v1.media_upload(filename=file_path)
+                    media_ids = [media.media_id_string]
+                except Exception as e:
+                    if "413" in str(e) or "Payload Too Large" in str(e):
+                        log.warning("413 при загрузке в Twitter, пробую сильнее сжать и повторить…")
+                        if _try_compress_image_inplace(file_path, target_bytes=3_800_000, max_side=1600):
+                            media = twitter_api_v1.media_upload(filename=file_path)
+                            media_ids = [media.media_id_string]
+                        else:
+                            log.warning("Не удалось сжать до безопасного размера — отправляю без изображения.")
+                            media_ids = None
+                    else:
+                        raise
+                finally:
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+
+        _lg("POST/TW>", f"create_tweet len={len(final_text)} media={bool(media_ids)}")
+        twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
+
+        if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
+            github_filename = image_url.split('/')[-1]
+            delete_image_from_github(github_filename)
+        return True
+
+    except Exception as e:
+        log.error(f"Ошибка публикации в Twitter: {e}")
+        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
+        if github_filename:
+            delete_image_from_github(github_filename)
+        return False
+
+async def publish_post_to_telegram(text, image_url=None):
+    try:
+        text_with_signature = (text or "")
+        if image_url:
+            _lg("POST/TG>", f"send_photo len={len(text_with_signature)}")
+            await send_photo_with_download(
+                channel_bot,
+                TELEGRAM_CHANNEL_USERNAME_ID,
+                image_url,
+                caption=text_with_signature,
+                reply_markup=None
+            )
+        else:
+            _lg("POST/TG>", f"send_message len={len(text_with_signature)}")
+            await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=text_with_signature,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
         return True
     except Exception as e:
-        msg = str(e).lower()
-        if "insufficient_quota" in msg or "too many requests" in msg or "429" in msg:
-            return False
+        log.error(f"Ошибка публикации в Telegram: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Telegram: {e}"
+        )
         return False
 
-# =========================
-# ОТКРЫТИЕ ПЛАНИРОВЩИКА
-# =========================
-async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _db_init()
-    q = update.callback_query
+# -----------------------------------------------------------------------------
+# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ (если где-то дергают)
+# -----------------------------------------------------------------------------
+def generate_post(topic_hint: str = "General invite and value."):
+    """
+    Синхронная обёртка: возвращает (text, image_url).
+    На старте не вызываем. Только для внешних вызовов.
+    """
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        text_en = post_data.get("text_en") or ""
+        tags = post_data.get("ai_hashtags") or []
+        img = post_data.get("image_url")
+        return build_telegram_post(text_en, tags), img
+    else:
+        text_en, tags, img = loop.run_until_complete(ai_generate_content_en(topic_hint))
+        return build_telegram_post(text_en, tags), img
+
+# -----------------------------------------------------------------------------
+# CALLBACKS / INPUT / FLOW
+# -----------------------------------------------------------------------------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_button_pressed_at, last_action_time, manual_expected_until
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+
     uid = update.effective_user.id
-    USER_STATE.setdefault(uid, {"mode": "none", "items": [], "current": PlannedItem(), "seq": 0})
-    if q:
-        await _safe_edit_or_send(q, "[ПЛАНИРОВЩИК] Выбери режим.", reply_markup=main_planner_menu())
-    else:
-        await context.bot.send_message(update.effective_chat.id, "[ПЛАНИРОВЩИК] Выбери режим.",
-                                       reply_markup=main_planner_menu())
+    _lg("CB>", f"uid={uid} data={data}")
 
-# =========================
-# ПРОСЬБЫ/ШАГИ
-# =========================
-async def _ask_topic(q: CallbackQuery, mode: str):
-    uid = q.from_user.id
-    st = _ensure(uid)
-    st.mode = mode
-    st.step = "waiting_topic"
-    await _safe_edit_or_send(
-        q,
-        "[PLAN] Введи <b>тему</b> для поста.\n"
-        "Если ИИ доступен — я сгенерирую текст и сразу попрошу время публикации.\n"
-        "Если ИИ недоступен — сразу перейдём к выбору времени.",
-        reply_markup=cancel_only()
-    )
-
-async def _ask_text(q: CallbackQuery):
-    uid = q.from_user.id
-    st = _ensure(uid)
-    st.mode = "gen"
-    st.step = "waiting_text"
-    await _safe_edit_or_send(
-        q,
-        "[GEN] Пришли текст поста и/или фото (можно одним сообщением — фото с подписью). Затем попрошу время публикации.",
-        reply_markup=cancel_only()
-    )
-
-async def _ask_time(q: CallbackQuery):
-    uid = q.from_user.id
-    st = _ensure(uid)
-    st.step = "waiting_time"
-    await _safe_edit_or_send(
-        q, "[*] Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
-        reply_markup=cancel_only()
-    )
-
-async def _ask_time_via_msg(msg: Message):
-    uid = msg.from_user.id
-    st = _ensure(uid)
-    st.step = "waiting_time"
-    await msg.reply_text(
-        "[*] Введи время публикации в формате <b>HH:MM</b> (Киев). Например, 14:30.",
-        reply_markup=cancel_only(),
-        parse_mode="HTML"
-    )
-
-async def _show_ready_add_cancel(q: CallbackQuery):
-    uid = q.from_user.id
-    st = _ensure(uid)
-    prefix = "PLAN_" if st.mode == "plan" else "GEN_"
-    lines: List[str] = []
-    if st.mode == "plan":
-        lines.append(f"Тема: {st.topic or '—'}")
-        txt = (st.text or "—").strip()
-        if len(txt) > 400: txt = txt[:397] + "…"
-        lines.append(f"Текст: {txt}")
-    else:
-        text = (st.text or "—").strip()
-        if len(text) > 400: text = text[:397] + "…"
-        lines.append(f"Текст: {text}")
-        lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
-    lines.append(f"Время: {st.time_str or '—'}")
-    await _safe_edit_or_send(
-        q, "Проверь данные:\n" + "\n".join(lines),
-        reply_markup=step_buttons_done_add_cancel(prefix)
-    )
-
-# =========================
-# CALLBACKS (режимы и список)
-# =========================
-async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    usable = await _openai_usable()
-    if not usable:
-        try:
-            await q.message.chat.send_message(
-                "⚠️ OpenAI сейчас недоступен — продолжим в ветке [PLAN] без автогенерации.",
-                reply_markup=cancel_only(), parse_mode="HTML", disable_web_page_preview=True
-            )
-        except Exception:
-            pass
-    await _ask_topic(q, mode="plan")
-
-async def cb_open_gen_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _ask_text(update.callback_query)
-
-def _format_item_row(i: int, it: Dict[str, Any]) -> str:
-    mode = it.get("mode")
-    time_s = it.get("time") or "—"
-    if mode == "plan":
-        txt = (it.get("topic") or "—")
-        return f"{i}) [PLAN] {time_s} — {txt}"
-    t = (it.get("text") or "").strip()
-    if len(t) > 60: t = t[:57] + "…"
-    img = "🖼" if it.get("image_url") else "—"
-    return f"{i}) [GEN] {time_s} — {t} {img}"
-
-def _list_kb(uid: int) -> InlineKeyboardMarkup:
-    items = USER_STATE.get(uid, {}).get("items", [])
-    rows: List[List[InlineKeyboardButton]] = []
-    for it in items:
-        pid = it["id"]
-        title = f"#{pid}"
-        rows.append([
-            InlineKeyboardButton(f"⚙️ {title}", callback_data=f"ITEM_MENU:{pid}"),
-            InlineKeyboardButton("🗑", callback_data=f"DEL_ITEM:{pid}"),
-        ])
-    rows.append([InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")])
-    return InlineKeyboardMarkup(rows)
-
-async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    items = USER_STATE.get(uid, {}).get("items", [])
-    if not items:
-        return await _safe_edit_or_send(q, "На сегодня пока пусто.", reply_markup=main_planner_menu())
-    lines = []
-    for i, it in enumerate(items, 1):
-        lines.append(_format_item_row(i, it))
-    await _safe_edit_or_send(q, "Список на сегодня:\n" + "\n".join(lines), reply_markup=_list_kb(uid))
-
-# =========================
-# ITEM MENU / EDIT / DELETE / TIME / AI_FILL / CLONE / AI_NEW_FROM
-# =========================
-async def cb_item_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка идентификатора.", reply_markup=main_planner_menu())
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
-
-    lines = [
-        f"ID: {pid}",
-        f"Режим: {it['mode']}",
-        f"Время: {it.get('time') or '—'}",
-    ]
-    if it["mode"] == "plan":
-        lines.append(f"Тема: {it.get('topic') or '—'}")
-        txt = (it.get("text") or "—").strip()
-        if len(txt) > 300: txt = txt[:297] + "…"
-        lines.append(f"Текст: {txt}")
-    else:
-        txt = (it.get("text") or "—").strip()
-        if len(txt) > 300: txt = txt[:297] + "…"
-        lines.append(f"Текст: {txt}")
-        lines.append(f"Картинка: {'есть' if it.get('image_url') else 'нет'}")
-
-    return await _safe_edit_or_send(q, "\n".join(lines), reply_markup=_item_actions_kb(pid, it["mode"]))
-
-async def cb_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID для удаления.", reply_markup=main_planner_menu())
-    items = USER_STATE.get(uid, {}).get("items", [])
-    USER_STATE[uid]["items"] = [x for x in items if x.get("id") != pid]
-    try:
-        db_delete_item(pid)
-    except Exception:
-        pass
-    return await _safe_edit_or_send(q, f"Удалено #{pid}.", reply_markup=main_planner_menu())
-
-async def cb_edit_time_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID.", reply_markup=main_planner_menu())
-    st = _ensure(uid)
-    st.step = "editing_time"
-    st.mode = "edit"
-    USER_STATE[uid]["edit_target"] = pid
-    return await _safe_edit_or_send(q, "Введите новое время в формате <b>HH:MM</b> (Киев).", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад к элементу", callback_data=f"ITEM_MENU:{pid}")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
-    ]))
-
-async def cb_edit_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID для редактирования.", reply_markup=main_planner_menu())
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
-    return await _safe_edit_or_send(q, "Что меняем?", reply_markup=_edit_fields_kb(pid, it["mode"]))
-
-async def cb_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        _, field, pid_s = q.data.split(":", 2)
-        pid = int(pid_s)
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка выбора поля.", reply_markup=main_planner_menu())
-
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
-
-    st = _ensure(uid)
-    USER_STATE[uid]["edit_target"] = pid
-
-    if field == "topic":
-        st.step = "editing_topic"; st.mode = "edit"
-        return await _safe_edit_or_send(q, "Введите новую тему:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
-        ]))
-    if field == "text":
-        st.step = "editing_text"; st.mode = "edit"
-        return await _safe_edit_or_send(q, "Пришлите новый текст поста:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
-        ]))
-    if field == "image":
-        st.step = "editing_image"; st.mode = "edit"
-        return await _safe_edit_or_send(q, "Пришлите новую картинку <i>(как фото или документ)</i> или отправьте «удалить».", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
-        ]))
-    if field == "time":
-        st.step = "editing_time"; st.mode = "edit"
-        return await _safe_edit_or_send(q, "Введите новое время в формате <b>HH:MM</b> (Киев).", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад к редактированию", callback_data=f"EDIT_ITEM:{pid}")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK_MAIN_MENU")]
-        ]))
-    return await _safe_edit_or_send(q, "Неизвестное поле.", reply_markup=main_planner_menu())
-
-async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID.", reply_markup=main_planner_menu())
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
-    if it["mode"] != "plan":
-        return await _safe_edit_or_send(q, "ИИ-дополнение доступно только для PLAN.", reply_markup=main_planner_menu())
-    if _AI_GEN_FN is None:
-        return await _safe_edit_or_send(q, "Генератор ИИ не подключён.", reply_markup=main_planner_menu())
-
-    topic = it.get("topic") or ""
-    try:
-        text_en, tags, img = await _AI_GEN_FN(topic)
-        it["text"] = f"{text_en}\n\n{' '.join(tags)}".strip()
-        if img:
-            it["image_url"] = img
-        try:
-            db_update_item(pid, {"text": it["text"], "image_url": it.get("image_url")})
-        except Exception:
-            pass
-        return await _safe_edit_or_send(q, "Текст дополнён ИИ (тема/время сохранены).", reply_markup=_item_actions_kb(pid, it["mode"]))
-    except Exception:
-        return await _safe_edit_or_send(q, "Не удалось сгенерировать текст ИИ.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID для клонирования.", reply_markup=main_planner_menu())
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден для клона.", reply_markup=main_planner_menu())
-
-    nid = _new_pid(uid)
-    clone = {
-        "id": nid,
-        "mode": it["mode"],
-        "topic": it.get("topic"),
-        "text": None,
-        "time": it.get("time"),
-        "image_url": None,
-        "added_at": datetime.utcnow().isoformat() + "Z"
+    # Всё «планировочное» — отдаём planner.py (group=0)
+    planner_exact = {
+        "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
+        "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
+        "STEP_BACK", "PLAN_LIST_TODAY", "PLAN_AI_BUILD_NOW",
+        "BACK_MAIN_MENU"
     }
-    USER_STATE[uid]["items"].append(clone)
-    try:
-        db_insert_item(uid, {
-            "mode": clone["mode"],
-            "topic": clone["topic"],
-            "text": clone["text"],
-            "time": clone["time"],
-            "image_url": clone["image_url"],
-        })
-    except Exception:
-        pass
-    return await _safe_edit_or_send(q, f"Создан клон #{nid} (сохр. тему/время).", reply_markup=_item_actions_kb(nid, it["mode"]))
-
-async def cb_ai_new_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    try:
-        pid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await _safe_edit_or_send(q, "Ошибка ID.", reply_markup=main_planner_menu())
-    it = _find_item(uid, pid)
-    if not it:
-        return await _safe_edit_or_send(q, "Элемент не найден.", reply_markup=main_planner_menu())
-    if it["mode"] != "plan":
-        return await _safe_edit_or_send(q, "Доступно только для PLAN.", reply_markup=main_planner_menu())
-    if _AI_GEN_FN is None:
-        return await _safe_edit_or_send(q, "Генератор ИИ не подключён.", reply_markup=main_planner_menu())
-
-    topic = it.get("topic") or ""
-    try:
-        text_en, tags, img = await _AI_GEN_FN(topic)
-        nid = _new_pid(uid)
-        newrow = {
-            "id": nid,
-            "mode": "plan",
-            "topic": topic,
-            "text": f"{text_en}\n\n{' '.join(tags)}".strip(),
-            "time": it.get("time"),
-            "image_url": img,
-            "added_at": datetime.utcnow().isoformat() + "Z"
-        }
-        USER_STATE[uid]["items"].append(newrow)
-        try:
-            db_insert_item(uid, {
-                "mode": newrow["mode"],
-                "topic": newrow["topic"],
-                "text": newrow["text"],
-                "time": newrow["time"],
-                "image_url": newrow["image_url"],
-            })
-        except Exception:
-            pass
-        return await _safe_edit_or_send(q, f"Создан новый пост #{nid} (ИИ-текст, тема/время сохранены).", reply_markup=_item_actions_kb(nid, "plan"))
-    except Exception:
-        return await _safe_edit_or_send(q, "Не удалось сгенерировать новый ИИ-текст.", reply_markup=_item_actions_kb(pid, "plan"))
-
-# =========================
-# CALLBACKS (шаги завершения)
-# =========================
-async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    USER_STATE.setdefault(uid, {"items": [], "current": PlannedItem(), "seq": 0})
-    USER_STATE[uid]["current"] = PlannedItem()
-    USER_STATE[uid].pop("edit_target", None)
-    await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
-
-async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await _safe_edit_or_send(
-        q, "Открываю основное меню…",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Открыть основное меню", callback_data="cancel_to_main")]])
+    planner_prefixes = (
+        "PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:",
+        "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"
     )
+    if (data in planner_exact) or any(data.startswith(p) for p in planner_prefixes):
+        _lg("CB>", f"planner-key detected -> let planner handle (group=0).")
+        return
 
-async def _finalize_current_and_back(q: CallbackQuery):
-    uid = q.from_user.id
-    st = _ensure(uid)
-    if _can_finalize(st):
-        _push(uid, st)
-        return await _safe_edit_or_send(q, "Сохранено. Что дальше?", reply_markup=main_planner_menu())
-    else:
-        return await _safe_edit_or_send(q, "Нечего сохранять — заполни данные и время.", reply_markup=main_planner_menu())
+    now = datetime.now(TZ)
+    last_button_pressed_at = now
 
-async def cb_plan_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _finalize_current_and_back(update.callback_query)
+    pending_post["active"] = True
+    pending_post["timer"] = now
+    pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+    if pending_post.get("mode") == "placeholder":
+        pending_post["mode"] = "normal"
 
-async def cb_gen_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _finalize_current_and_back(update.callback_query)
+    if uid in last_action_time and (now - last_action_time[uid]).seconds < 1:
+        _lg("CB>", f"uid={uid} throttled duplicate click")
+        return
+    last_action_time[uid] = now
 
-async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    st = _ensure(uid)
-    if _can_finalize(st):
-        _push(uid, st)
-    # Важно: начинаем НОВЫЙ такой же сценарий той же ветки
-    if st.mode == "plan":
-        await _ask_topic(q, mode="plan")
-    else:
-        await _ask_text(q)
+    if data == "show_day_plan":
+        manual_expected_until = None
+        ROUTE_TO_PLANNER.add(uid)
+        _lg("PLANNER-ROUTE>", f"ON uid={uid}")
+        return await open_planner(update, context)
 
-# =========================
-# AI build now (по кнопке)
-# =========================
-async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    usable = await _openai_usable()
+    if data == "shutdown_bot":
+        ROUTE_TO_PLANNER.discard(uid)
+        _lg("PLANNER-ROUTE>", f"OFF uid={uid} (shutdown)")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
+        await asyncio.sleep(1)
+        shutdown_bot_and_exit()
+        return
 
-    if not usable:
-        return await _safe_edit_or_send(
-            q,
-            "❗ <b>OpenAI недоступен или квота исчерпана</b>.\n"
-            "Можно продолжить вручную (ветка [GEN]) или вернуться позже.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
-                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
-            ])
-        )
+    if data in ("cancel_to_main", "BACK_MAIN_MENU"):
+        ROUTE_TO_PLANNER.discard(uid)
+        _lg("PLANNER-ROUTE>", f"OFF uid={uid} (back to main)")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+        return
 
-    if _AI_GEN_FN is None:
-        return await _safe_edit_or_send(
-            q,
-            "Не подключён ИИ-генератор из основного бота. Можно продолжить вручную.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
-                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
-            ])
-        )
-
-    topics = [
-        "Utility, community growth and joining early.",
-        "Governance & on-chain voting with AI analysis.",
-        "AI-powered proposals and speed of execution."
-    ]
-    uid = q.from_user.id
-    _ensure(uid)
-
-    created = 0
-    for th in topics:
+    if data == "self_post":
+        ROUTE_TO_PLANNER.discard(uid)
+        _lg("PLANNER-ROUTE>", f"OFF uid={uid} (manual mode)")
         try:
-            text_en, tags, img = await _AI_GEN_FN(th)
-            row = {
-                "id": _new_pid(uid),
-                "mode": "plan",
-                "topic": th,
-                "text": f"{text_en}\n\n{' '.join(tags)}".strip(),
-                "time": None,
-                "image_url": img,
-                "added_at": datetime.utcnow().isoformat() + "Z"
-            }
-            USER_STATE[uid]["items"].append(row)
-            try:
-                db_insert_item(uid, {
-                    "mode": "plan",
-                    "topic": th,
-                    "text": row["text"],
-                    "time": row["time"],
-                    "image_url": img,
-                })
-            except Exception:
-                pass
-            created += 1
+            st = PLANNER_STATE.get(uid)
+            if st:
+                cur = st.get("current")
+                if cur:
+                    cur.mode = "none"
+                    cur.step = "idle"
+                    cur.text = None
+                    cur.topic = None
+                    cur.time_str = None
+                    cur.image_url = None
+                st["mode"] = "none"
         except Exception:
             pass
 
-    if created == 0:
-        return await _safe_edit_or_send(
-            q,
-            "Не удалось сгенерировать план. Попробуй позже или перейди в ручной режим.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✨ Мой план (текст/фото→время)", callback_data="OPEN_GEN_MODE")],
-                [InlineKeyboardButton("⬅️ В основное меню", callback_data="BACK_MAIN_MENU")]
-            ])
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="✍️ Введите текст поста (EN) и (опционально) приложите фото одним сообщением:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")]])
         )
+        manual_expected_until = now + timedelta(minutes=5)
+        _lg("MANUAL>", f"uid={uid} waiting for manual text/photo until {manual_expected_until}")
+        return
 
-    return await _safe_edit_or_send(
-        q,
-        f"Сгенерировано позиций: <b>{created}</b>.\nТеперь добавь время для нужных задач или отредактируй через «Список на сегодня».",
-        reply_markup=main_planner_menu()
-    )
+    if data == "approve":
+        _lg("PREVIEW>", "approve -> resend single preview")
+        await send_single_preview(
+            post_data.get("text_en") or "",
+            post_data.get("ai_hashtags") or [],
+            image_url=post_data.get("image_url"),
+            header="Предпросмотр"
+        )
+        return
 
-# =========================
-# INPUT (текст/фото) + РЕДАКТ
-# =========================
-async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перехватываем ввод только когда реально на шаге планировщика."""
+    if data in ("post_twitter", "post_telegram", "post_both"):
+        publish_tg = data in ("post_telegram", "post_both")
+        publish_tw = data in ("post_twitter", "post_both")
+        _lg("POST>", f"flow start tg={publish_tg} tw={publish_tw}")
+        await publish_flow(publish_tg=publish_tg, publish_tw=publish_tw)
+        return
+
+    if data == "do_not_disturb":
+        do_not_disturb["active"] = not do_not_disturb["active"]
+        status = "включён" if do_not_disturb["active"] else "выключен"
+        _lg("DND>", f"set {status}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
+        return
+
+    if data == "end_day":
+        ROUTE_TO_PLANNER.discard(uid)
+        do_not_disturb["active"] = True
+        tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
+        _lg("ENDDAY>", f"uid={uid} end day, next={tomorrow.isoformat()}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
+            parse_mode="HTML", reply_markup=get_start_menu())
+        return
+
+# --- Ручной ввод ---
+async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global manual_expected_until
+    pending_post["active"] = True
+    pending_post["timer"] = datetime.now(TZ)
+    pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+    if pending_post.get("mode") == "placeholder":
+        pending_post["mode"] = "normal"
+
     uid = update.effective_user.id
-    st = _ensure(uid)
-    active_steps = {
-        "waiting_topic", "waiting_text", "waiting_time",
-        "editing_time", "editing_text", "editing_topic", "editing_image"
-    }
-    if (st.mode not in ("plan", "gen", "edit")) and (st.step not in active_steps):
-        return
+    text = update.message.text or update.message.caption or ""
+    _lg("MANUAL>", f"uid={uid} incoming message len={len(text)} photo={bool(update.message.photo)}")
 
-    msg: Message = update.message
-    text = (msg.text or msg.caption or "").strip()
+    image_url = None
 
-    # --- РЕДАКТИРОВАНИЕ ---
-    if st.step == "editing_topic":
-        pid = USER_STATE[uid].get("edit_target")
-        it = _find_item(uid, pid) if pid else None
-        if not it:
-            st.step = "idle"; st.mode = "none"
-            return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
-        if not text:
-            return await msg.reply_text("Нужна новая тема текстом.")
-        it["topic"] = text
-        try: db_update_item(pid, {"topic": text})
-        except Exception: pass
-        st.step = "idle"; st.mode = "none"; USER_STATE[uid].pop("edit_target", None)
-        return await msg.reply_text(f"Тема обновлена для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-    if st.step == "editing_text":
-        pid = USER_STATE[uid].get("edit_target")
-        it = _find_item(uid, pid) if pid else None
-        if not it:
-            st.step = "idle"; st.mode = "none"
-            return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
-        if not text:
-            return await msg.reply_text("Нужен новый текст.")
-        it["text"] = text
-        try: db_update_item(pid, {"text": text})
-        except Exception: pass
-        st.step = "idle"; st.mode = "none"; USER_STATE[uid].pop("edit_target", None)
-        return await msg.reply_text(f"Текст обновлён для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-    if st.step == "editing_image":
-        pid = USER_STATE[uid].get("edit_target")
-        it = _find_item(uid, pid) if pid else None
-        if not it:
-            st.step = "idle"; st.mode = "none"
-            return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
-
-        if text.lower() in {"удалить", "delete", "none", "remove"}:
-            it["image_url"] = None
-            try: db_update_item(pid, {"image_url": None})
-            except Exception: pass
-            st.step = "idle"; st.mode = "none"; USER_STATE[uid].pop("edit_target", None)
-            return await msg.reply_text(f"Картинка удалена для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-        if msg.photo:
-            it["image_url"] = msg.photo[-1].file_id
-        if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
-            if msg.document.mime_type.startswith("image/"):
-                it["image_url"] = msg.document.file_id
-
-        if not it.get("image_url"):
-            return await msg.reply_text("Пришлите фото или отправьте «удалить».")
-        try: db_update_item(pid, {"image_url": it["image_url"]})
-        except Exception: pass
-        st.step = "idle"; st.mode = "none"; USER_STATE[uid].pop("edit_target", None)
-        return await msg.reply_text(f"Картинка обновлена для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-    if st.step == "editing_time":
-        pid = USER_STATE[uid].get("edit_target")
-        it = _find_item(uid, pid) if pid else None
-        if not it:
-            st.step = "idle"; st.mode = "none"
-            return await msg.reply_text("Элемент не найден.", reply_markup=main_planner_menu())
-        ok = False
-        if len(text) >= 4 and ":" in text:
-            hh, mm = text.split(":", 1)
-            ok = hh.isdigit() and mm.isdigit() and 0 <= int(hh) < 24 and 0 <= int(mm) < 60
-        if not ok:
-            return await msg.reply_text("Неверный формат. Пример: 14:30")
-        it["time"] = f"{int(hh):02d}:{int(mm):02d}"
-        try: db_update_item(pid, {"time_str": it["time"]})
-        except Exception: pass
-        st.step = "idle"; st.mode = "none"; USER_STATE[uid].pop("edit_target", None)
-        return await msg.reply_text(f"Время обновлено для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
-
-    # --- СОЗДАНИЕ ---
-    if st.step == "waiting_topic":
-        # Зафиксируем ветку PLAN
-        st.mode = "plan"
-        if not text:
-            return await msg.reply_text("[PLAN] Нужна тема текстом. Попробуй ещё раз.", reply_markup=cancel_only())
-        st.topic = text
-
+    if update.message.photo:
         try:
-            usable = await _openai_usable()
-        except Exception:
-            usable = False
-
-        if (_AI_GEN_FN is not None) and usable:
+            image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
+        except Exception as e:
+            log.warning(f"handle_manual_input: cannot process photo: {e}")
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Пришлите ещё раз или только текст.")
+            manual_expected_until = None
+            return
+    elif getattr(update.message, "document", None) and getattr(update.message.document, "mime_type", ""):
+        if update.message.document.mime_type.startswith("image/"):
             try:
-                text_en, tags, img = await _AI_GEN_FN(st.topic)
-                st.text = f"{text_en}\n\n{' '.join(tags)}".strip()
-                if img:
-                    st.image_url = img
-            except Exception:
-                st.text = st.text or ""
-        # спрашиваем время сообщением
-        await _ask_time_via_msg(msg)
+                image_url = await process_telegram_photo(update.message.document.file_id, approval_bot)
+            except Exception as e:
+                log.warning(f"handle_manual_input: cannot process image document: {e}")
+                await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать изображение-документ. Пришлите ещё раз или только текст.")
+                manual_expected_until = None
+                return
+
+    post_data["text_en"] = text.strip() or post_data.get("text_en") or ""
+    post_data["image_url"] = image_url if image_url else post_data.get("image_url")
+    post_data["post_id"] += 1
+    post_data["is_manual"] = True
+
+    _lg("MANUAL>", f"uid={uid} preview text_len={len(post_data['text_en'])} image={bool(post_data['image_url'])}")
+
+    try:
+        await send_single_preview(
+            post_data["text_en"],
+            post_data.get("ai_hashtags") or [],
+            image_url=post_data["image_url"],
+            header="Предпросмотр"
+        )
+    except Exception as e:
+        log.error(f"handle_manual_input preview failed: {e}")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
+    finally:
+        manual_expected_until = None
+
+# --- Публикация ---
+async def publish_flow(publish_tg: bool, publish_tw: bool):
+    base_text_en = (post_data.get("text_en") or "").strip()
+    ai_tags = post_data.get("ai_hashtags") or []
+    img = post_data.get("image_url") or None
+
+    twitter_text = build_twitter_preview(base_text_en, ai_tags)
+    telegram_text = build_telegram_preview(base_text_en, ai_tags)
+
+    _lg("POST>", f"dedupe check TG text_len={len(telegram_text)} TW text_len={len(twitter_text)} image={bool(img)}")
+
+    tg_status = None
+    tw_status = None
+
+    if do_not_disturb["active"]:
+        _lg("POST>", "DND active -> cancel")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "🌙 Режим «Не беспокоить» активен. Публикация отменена.")
         return
 
-    if st.step == "waiting_text":
-        # Ветка GEN
-        st.mode = "gen"
-        if msg.photo:
-            st.image_url = msg.photo[-1].file_id
-        if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
-            if msg.document.mime_type.startswith("image/"):
-                st.image_url = msg.document.file_id
-        if text:
-            st.text = text
-        if not (st.text or st.image_url):
-            return await msg.reply_text("[GEN] Пришли текст поста и/или фото.", reply_markup=cancel_only())
-        await _ask_time_via_msg(msg)
-        return
-
-    if st.step == "waiting_time":
-        ok = False
-        if len(text) >= 4 and ":" in text:
-            hh, mm = text.split(":", 1)
-            ok = hh.isdigit() and mm.isdigit() and 0 <= int(hh) < 24 and 0 <= int(mm) < 60
-        if not ok:
-            return await msg.reply_text("[*] Неверный формат. Пример: 14:30", reply_markup=cancel_only())
-        st.time_str = f"{int(hh):02d}:{int(mm):02d}"
-
-        prefix = "PLAN_" if st.mode == "plan" else "GEN_"
-        lines: List[str] = []
-        if st.mode == "plan":
-            lines.append(f"Тема: {st.topic or '—'}")
-            t = (st.text or "—").strip()
-            if len(t) > 400: t = t[:397] + "…"
-            lines.append(f"Текст: {t}")
+    if publish_tg:
+        if await is_duplicate_post(telegram_text, img):
+            await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Telegram. Публикация пропущена.")
+            tg_status = False
+            _lg("POST/TG>", "duplicate -> skip")
         else:
-            t = (st.text or "—").strip()
-            if len(t) > 400: t = t[:397] + "…"
-            lines.append(f"Текст: {t}")
-            lines.append(f"Картинка: {'есть' if st.image_url else 'нет'}")
-        lines.append(f"Время: {st.time_str or '—'}")
+            tg_status = await publish_post_to_telegram(text=telegram_text, image_url=img)
+            if tg_status:
+                await save_post_to_history(telegram_text, img)
+                _lg("POST/TG>", "sent and saved")
+            else:
+                _lg("POST/TG>", "failed")
 
-        return await msg.reply_text(
-            "Проверь данные:\n" + "\n".join(lines),
-            reply_markup=step_buttons_done_add_cancel(prefix),
-            parse_mode="HTML",
-            disable_web_page_preview=True
+    if publish_tw:
+        if await is_duplicate_post(twitter_text, img):
+            await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
+            tw_status = False
+            _lg("POST/TW>", "duplicate -> skip")
+        else:
+            tw_status = publish_post_to_twitter(twitter_text, img)
+            if tw_status:
+                await save_post_to_history(twitter_text, img)
+                _lg("POST/TW>", "sent and saved")
+            else:
+                _lg("POST/TW>", "failed")
+
+    if publish_tg:
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram.")
+    if publish_tw:
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
+
+    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
+
+# --- Маршрутизация сообщений ---
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_button_pressed_at, manual_expected_until
+    now = datetime.now(TZ)
+    last_button_pressed_at = now
+
+    pending_post["active"] = True
+    pending_post["timer"] = now
+    pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+    if pending_post.get("mode") == "placeholder":
+        pending_post["mode"] = "normal"
+
+    user_id = update.effective_user.id
+    has_photo = bool(getattr(update.message, "photo", None))
+    text_len = len((update.message.text or update.message.caption or "").strip())
+    _lg("ROUTE>", f"uid={user_id} incoming text_len={text_len} photo={has_photo}")
+
+    # 0) Если включён форс-роутинг в планировщик — НИЧЕГО не делаем (planner.py перехватит в group=0)
+    if user_id in ROUTE_TO_PLANNER:
+        # Для дебага посмотрим текущее состояние планировщика
+        try:
+            st = PLANNER_STATE.get(user_id, {}).get("current")
+            step = getattr(st, "step", None) if st else None
+            mode = getattr(st, "mode", None) if st else None
+            _lg("ROUTE>", f"uid={user_id} -> PLANNER (forced). state step={step} mode={mode}")
+        except Exception:
+            _lg("ROUTE>", f"uid={user_id} -> PLANNER (forced). state n/a")
+        return
+
+    # 1) «Сделай сам» — ручной режим
+    if manual_expected_until and now <= manual_expected_until:
+        _lg("ROUTE>", f"uid={user_id} -> MANUAL (window open)")
+        return await handle_manual_input(update, context)
+
+    # 2) если планировщик активен — он перехватит (group=0). Мы не мешаем.
+    try:
+        st_row = PLANNER_STATE.get(user_id) or {}
+        cur = st_row.get("current")
+        cur_mode = getattr(cur, "mode", "none") if cur else "none"
+        cur_step = getattr(cur, "step", "idle") if cur else "idle"
+        if (cur_mode in ("plan", "gen", "edit")) or (cur_step in (
+            "waiting_topic", "waiting_text", "waiting_time",
+            "editing_time", "editing_text", "editing_topic", "editing_image"
+        )):
+            _lg("ROUTE>", f"uid={user_id} planner active step={cur_step} mode={cur_mode} -> let planner (group=0) handle")
+            return
+    except Exception:
+        pass
+
+    # 3) иначе — ручной ввод
+    _lg("ROUTE>", f"uid={user_id} -> MANUAL (fallback)")
+    return await handle_manual_input(update, context)
+
+# -----------------------------------------------------------------------------
+# STARTUP / SHUTDOWN / MAIN
+# -----------------------------------------------------------------------------
+async def on_start(app: Application):
+    await init_db()
+
+    # Генерим авто-контент для стартового предпросмотра (с фоллбэком при 429)
+    try:
+        text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
+    except Exception:
+        text_en, ai_tags, img = post_data["text_en"], post_data.get("ai_hashtags") or [], post_data.get("image_url")
+
+    post_data["text_en"] = text_en
+    post_data["ai_hashtags"] = ai_tags
+    post_data["image_url"] = img
+
+    # ЕДИНЫЙ запланированный предпросмотр (ровно одно сообщение)
+    await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=post_data["image_url"], header="Предпросмотр")
+
+    log.info("Бот запущен. Отправлен ЕДИНЫЙ запланированный предпросмотр. Планирование — в planner.py.")
+
+async def check_inactivity_shutdown():
+    global last_button_pressed_at
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if last_button_pressed_at is None:
+                continue
+            idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
+            if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
+                try:
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Нет активности 10 минут. Отключаюсь.")
+                except Exception:
+                    pass
+                shutdown_bot_and_exit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"check_inactivity_shutdown error: {e}")
+
+def shutdown_bot_and_exit():
+    try:
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="🔴 Бот полностью выключен. GitHub Actions больше не тратит минуты!")
         )
+    except Exception:
+        pass
+    import time; time.sleep(2)
+    os._exit(0)
 
-# =========================
-# РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
-# =========================
-def register_planner_handlers(app: Application):
-    _db_init()
+def main():
+    app = (
+        Application
+        .builder()
+        .token(TELEGRAM_BOT_TOKEN_APPROVAL)
+        .post_init(on_start)
+        .concurrent_updates(False)
+        .build()
+    )
 
-    # Режимы
-    app.add_handler(CallbackQueryHandler(cb_open_plan_mode,    pattern="^OPEN_PLAN_MODE$"),    group=0)
-    app.add_handler(CallbackQueryHandler(cb_open_gen_mode,     pattern="^OPEN_GEN_MODE$"),     group=0)
-    app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$"),   group=0)
-    app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$"), group=0)
+    # Планировщик (group=0)
+    register_planner_handlers(app)
+    _lg("INIT>", "planner handlers registered in group=0")
 
-    # Навигация
-    app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$"),         group=0)
-    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$"),    group=0)
-
-    # Завершение шагов
-    app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$"),         group=0)
-    app.add_handler(CallbackQueryHandler(cb_gen_done,          pattern="^GEN_DONE$"),          group=0)
-    app.add_handler(CallbackQueryHandler(cb_add_more,          pattern="^(PLAN_ADD_MORE|GEN_ADD_MORE)$"), group=0)
-
-    # Управление элементами
-    app.add_handler(CallbackQueryHandler(cb_item_menu,         pattern="^ITEM_MENU:\\d+$"),      group=0)
-    app.add_handler(CallbackQueryHandler(cb_delete_item,       pattern="^DEL_ITEM:\\d+$"),       group=0)
-    app.add_handler(CallbackQueryHandler(cb_edit_time_shortcut,pattern="^EDIT_TIME:\\d+$"),      group=0)
-    app.add_handler(CallbackQueryHandler(cb_edit_item,         pattern="^EDIT_ITEM:\\d+$"),      group=0)
-    app.add_handler(CallbackQueryHandler(cb_edit_field,        pattern="^EDIT_FIELD:(topic|text|image|time):\\d+$"), group=0)
-    app.add_handler(CallbackQueryHandler(cb_ai_fill_text,      pattern="^AI_FILL_TEXT:\\d+$"),   group=0)
-    app.add_handler(CallbackQueryHandler(cb_clone_item,        pattern="^CLONE_ITEM:\\d+$"),     group=0)
-    app.add_handler(CallbackQueryHandler(cb_ai_new_from,       pattern="^AI_NEW_FROM:\\d+$"),    group=0)
-
-    # Пользовательский ввод на шагах/редактировании
+    # Наши обработчики
+    app.add_handler(CallbackQueryHandler(callback_handler), group=5)
     app.add_handler(
-        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message),
-        group=0
+        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
+        group=10
     )
+    _lg("INIT>", "core handlers registered: CB group=5, MSG group=10")
 
-# =========================
-# (опц.) унификация CallbackQuery из Message
-# =========================
-from typing import Optional as _Optional
+    # Фоновый авто-выключатель
+    asyncio.get_event_loop().create_task(check_inactivity_shutdown())
+    _lg("INIT>", "inactivity watchdog started")
 
-async def _build_fake_callback_from_message(message: Message, bot) -> CallbackQuery:
-    cq = CallbackQuery(
-        id="fake",
-        from_user=message.from_user,
-        chat_instance="",
-        message=message,
-        bot=bot
-    )
-    return cq
+    app.run_polling(poll_interval=0.12, timeout=1)
 
-async def _update_to_callback_query(update: Update, bot) -> _Optional[CallbackQuery]:
-    if update.callback_query:
-        return update.callback_query
-    if update.message:
-        return await _build_fake_callback_from_message(update.message, bot)
-    return None
-
-setattr(Update, "to_callback_query", _update_to_callback_query)
+if __name__ == "__main__":
+    main()
