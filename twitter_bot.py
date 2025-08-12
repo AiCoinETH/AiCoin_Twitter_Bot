@@ -69,7 +69,7 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# URL Cloudflare Worker для ручного запуска после выключения
+# URL Cloudflare Worker для ручного запуска после выключения (должен принимать GET)
 AICOIN_WORKER_URL = os.getenv(
     "AICOIN_WORKER_URL",
     "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
@@ -715,7 +715,7 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# TRIGGER WORKER (ручной запуск воркера)
+# TRIGGER WORKER (ручной запуск воркера через POST — оставлено на будущее)
 # -----------------------------------------------------------------------------
 async def trigger_worker() -> Tuple[bool, str]:
     """
@@ -821,18 +821,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "shutdown_bot":
         ROUTE_TO_PLANNER.discard(uid)
         do_not_disturb["active"] = True
-        # Запланируем "на завтра 09:00" как в end_day
+        # Следующая запланированная публикация (как в end_day): завтра 09:00 по Киеву
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         msg = (
             "🔴 Бот выключен.\n"
             f"Следующий пост запланирован: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
             "Чтобы перезапустить обработчик вручную, нажмите «▶️ Старт воркера»."
         )
+        # ВАЖНО: URL-кнопка (GET), т.к. после жёсткого выключения колбэки не работают
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")]
+            [InlineKeyboardButton("▶️ Старт воркера", url=AICOIN_WORKER_URL)]
         ])
-        log.debug("[callback_handler] shutdown_bot -> soft off + start_worker button")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=kb)
+        try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=kb)
+        finally:
+            # ЖЁСТКО: сразу выходим из процесса
+            await asyncio.sleep(1)
+            shutdown_bot_and_exit()
         return
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
@@ -898,13 +903,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
+    # Этот хендлер оставлен на случай, если когда-то понадобится soft-старт без URL.
     if data == "start_worker":
         ok, info = await trigger_worker()
         prefix = "✅ Запуск воркера: " if ok else "❌ Запуск воркера: "
         try:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=prefix + info)
         finally:
-            # В любом случае покажем стартовое меню, как просили
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         log.debug(f"[callback_handler] start_worker -> {ok} {info}")
         return
