@@ -28,7 +28,14 @@ from urllib.parse import urlencode  # <-- для сборки URL ?s=SECRET
 import tweepy
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CommandHandler,   # <-- добавлено
+)
 import aiosqlite
 from github import Github
 from openai import OpenAI  # openai>=1.35.0
@@ -211,6 +218,7 @@ def start_preview_keyboard():
          InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
+        [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")],  # <—
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
@@ -222,6 +230,7 @@ def get_start_menu():
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
+        [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")],  # <—
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
@@ -932,7 +941,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-    # Этот хендлер оставлен на случай, если когда-то понадобится soft-старт без URL.
+    # Мягкий старт через callback (без открытия ссылки пользователем)
     if data == "start_worker":
         ok, info = await trigger_worker()
         prefix = "✅ Запуск воркера: " if ok else "❌ Запуск воркера: "
@@ -1132,6 +1141,14 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start — просто показывает главное меню."""
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Главное меню:",
+        reply_markup=get_start_menu()
+    )
+
 def main():
     log.debug("[main] building Application…")
     app = (
@@ -1147,6 +1164,7 @@ def main():
     register_planner_handlers(app)  # (в planner.py все хендлеры стоят group=0, и мы включим block=True там)
 
     # Наши обработчики
+    app.add_handler(CommandHandler("start", cmd_start), group=4)  # <— добавлено
     app.add_handler(CallbackQueryHandler(callback_handler), group=5)
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
