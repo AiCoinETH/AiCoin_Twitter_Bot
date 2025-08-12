@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — основной бот согласования/генерации/публикации.
-Полная версия.
+Стартует одним сообщением «Главное меню» (без предпросмотров).
+Кнопка «🗓 ИИ план на день» ведёт в planner.py.
 """
 
 import os
@@ -27,7 +28,7 @@ from openai import OpenAI  # openai>=1.35.0
 # === ПЛАНИРОВЩИК ===
 from planner import register_planner_handlers, open_planner
 try:
-    from planner import set_ai_generator  # может отсутствовать — ок
+    from planner import set_ai_generator
 except ImportError:
     set_ai_generator = None
 from planner import USER_STATE as PLANNER_STATE
@@ -48,7 +49,7 @@ log = logging.getLogger("twitter_bot")
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
-TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # может быть @username или числовой id
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # @username или id
 
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
@@ -90,12 +91,12 @@ client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
 # Таймеры
-TIMER_PUBLISH_DEFAULT = 180       # авто-пост плейсхолдера через 3 минуты
-TIMER_PUBLISH_EXTEND  = 600       # при активности таймер продлеваем
-AUTO_SHUTDOWN_AFTER_SECONDS = 600 # автовыключение при бездействии 10 минут
+TIMER_PUBLISH_DEFAULT = 180       # авто-пост плейсхолдера (если включим) через 3 минуты
+TIMER_PUBLISH_EXTEND  = 600       # продление при активности
+AUTO_SHUTDOWN_AFTER_SECONDS = 600 # автовыключение при бездействии
 
 DISABLE_WEB_PREVIEW = True
-TELEGRAM_SIGNATURE_HTML = ""  # пусто, чтобы не добавлять ссылки
+TELEGRAM_SIGNATURE_HTML = ""  # пусто, без ссылок
 
 # -----------------------------------------------------------------------------
 # ДЕФОЛТНЫЕ ДАННЫЕ ПОСТА
@@ -363,7 +364,7 @@ async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=No
                                parse_mode="HTML", reply_markup=tg_markup, disable_web_page_preview=True)
 
 # -----------------------------------------------------------------------------
-# Отправка фото с локальным скачиванием
+# Отправка фото c локальным скачиванием
 # -----------------------------------------------------------------------------
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     def is_valid_image_url(url):
@@ -646,106 +647,15 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# Стартовое сообщение (плейсхолдер)
-# -----------------------------------------------------------------------------
-async def send_start_placeholder():
-    text_en = post_data["text_en"]
-    ai_tags = post_data.get("ai_hashtags") or []
-    img_url = post_data.get("image_url")
-
-    tg_preview = build_telegram_preview(text_en, ai_tags)
-
-    try:
-        if img_url:
-            await send_photo_with_download(
-                approval_bot,
-                TELEGRAM_APPROVAL_CHAT_ID,
-                img_url,
-                caption=tg_preview,
-                reply_markup=get_start_menu()
-            )
-        else:
-            await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text=tg_preview,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=get_start_menu()
-            )
-    except Exception as e:
-        log.warning(f"send_start_placeholder image failed, fallback to text: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=tg_preview,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=get_start_menu()
-        )
-
-    pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
-
-# -----------------------------------------------------------------------------
-# Таймеры
-# -----------------------------------------------------------------------------
-async def check_timer():
-    while True:
-        await asyncio.sleep(0.5)
-        try:
-            if pending_post["active"] and pending_post.get("timer"):
-                passed = (datetime.now(TZ) - pending_post["timer"]).total_seconds()
-                if passed > pending_post.get("timeout", TIMER_PUBLISH_DEFAULT):
-                    if pending_post.get("mode") == "placeholder":
-                        base_text_en = (post_data.get("text_en") or "").strip()
-                        hashtags = post_data.get("ai_hashtags") or []
-                        twitter_text = build_twitter_preview(base_text_en, hashtags)
-                        telegram_text = build_telegram_preview(base_text_en, hashtags)
-
-                        tg_ok = await publish_post_to_telegram(telegram_text, post_data.get("image_url"))
-                        tw_ok = publish_post_to_twitter(twitter_text, post_data.get("image_url"))
-
-                        await approval_bot.send_message(
-                            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                            text=f"Автопост: Telegram — {'✅' if tg_ok else '❌'}, Twitter — {'✅' if tw_ok else '❌'}. Выключаюсь."
-                        )
-                        shutdown_bot_and_exit()
-                    else:
-                        pending_post["active"] = False
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning(f"check_timer error: {e}")
-
-async def check_inactivity_shutdown():
-    global last_button_pressed_at
-    while True:
-        try:
-            await asyncio.sleep(5)
-            if last_button_pressed_at is None:
-                continue
-            idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
-            if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
-                try:
-                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Нет активности 10 минут. Отключаюсь.")
-                except Exception:
-                    pass
-                shutdown_bot_and_exit()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning(f"check_inactivity_shutdown error: {e}")
-
-# -----------------------------------------------------------------------------
-# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ
+# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ (если где-то дергают)
 # -----------------------------------------------------------------------------
 def generate_post(topic_hint: str = "General invite and value."):
     """
-    СИНХРОННАЯ обёртка (нужна старым скриптам/CI).
-    Возвращает (text, image_url).
+    Синхронная обёртка: возвращает (text, image_url).
+    На старте НЕ используется. Только для внешних вызовов.
     """
     loop = asyncio.get_event_loop()
     if loop.is_running():
-        # если уже в ивент-лупе (например, Telegram), то обходимся без run_until_complete
-        # — используем заранее сгенерённый плейсхолдер
         text_en = post_data.get("text_en") or ""
         tags = post_data.get("ai_hashtags") or []
         img = post_data.get("image_url")
@@ -753,39 +663,6 @@ def generate_post(topic_hint: str = "General invite and value."):
     else:
         text_en, tags, img = loop.run_until_complete(ai_generate_content_en(topic_hint))
         return build_telegram_post(text_en, tags), img
-
-async def send_post_for_approval():
-    """
-    Для GitHub Actions: генерим пост, показываем превью (обе платформы) и выдаём меню действий.
-    """
-    text, image_url = generate_post("General invite and value.")
-
-    post_data["text_en"] = text   # уже с хэштегами
-    post_data["ai_hashtags"] = [] # хэштеги уже в тексте
-    post_data["image_url"] = image_url
-    post_data["post_id"] += 1
-    post_data["is_manual"] = False
-
-    await preview_split(
-        approval_bot,
-        TELEGRAM_APPROVAL_CHAT_ID,
-        post_data["text_en"],
-        post_data.get("ai_hashtags") or [],
-        image_url=post_data["image_url"],
-        header="Предпросмотр"
-    )
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Выберите действие:",
-        reply_markup=post_choice_keyboard()
-    )
-
-    pending_post.update({
-        "active": True,
-        "timer": datetime.now(TZ),
-        "timeout": TIMER_PUBLISH_DEFAULT,
-        "mode": "placeholder"
-    })
 
 # -----------------------------------------------------------------------------
 # CALLBACKS / INPUT / FLOW
@@ -873,6 +750,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_url=post_data.get("image_url"),
             header="Предпросмотр"
         )
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Выберите действие:",
+            reply_markup=post_choice_keyboard()
+        )
         return
 
     if data in ("post_twitter", "post_telegram", "post_both"):
@@ -895,6 +777,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
+# --- Ручной ввод ---
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     pending_post["active"] = True
@@ -949,6 +832,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     finally:
         manual_expected_until = None
 
+# --- Публикация ---
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     ai_tags = post_data.get("ai_hashtags") or []
@@ -987,6 +871,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
+# --- Маршрутизация сообщений ---
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, manual_expected_until
     now = datetime.now(TZ)
@@ -1025,23 +910,35 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-    asyncio.create_task(check_timer())
+    # Фоновые задачи (если используешь автопост плейсхолдера/авто-выключение)
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Первичное авто-содержимое (на случай fallback)
-    text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
-    post_data["text_en"] = text_en
-    post_data["ai_hashtags"] = ai_tags
-    post_data["image_url"] = img
+    # Никаких предпросмотров на старте — только «Главное меню»
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Главное меню:",
+        reply_markup=get_start_menu()
+    )
+    log.info("Бот запущен. Отправлено только главное меню. Планирование — в planner.py.")
 
-    # Основной путь для CI: превью + кнопки
-    try:
-        await send_post_for_approval()
-    except Exception as e:
-        log.warning(f"send_post_for_approval failed, fallback to placeholder: {e}")
-        await send_start_placeholder()
-
-    log.info("Бот запущен. Предпросмотр отправлен. Планирование — в planner.py.")
+async def check_inactivity_shutdown():
+    global last_button_pressed_at
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if last_button_pressed_at is None:
+                continue
+            idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
+            if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
+                try:
+                    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Нет активности 10 минут. Отключаюсь.")
+                except Exception:
+                    pass
+                shutdown_bot_and_exit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"check_inactivity_shutdown error: {e}")
 
 def shutdown_bot_and_exit():
     try:
