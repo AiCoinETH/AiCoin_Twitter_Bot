@@ -123,6 +123,9 @@ last_action_time = {}
 last_button_pressed_at = None
 manual_expected_until = None  # datetime | None
 
+# >>> ФЛАГ-РОУТЕР для планировщика (чтобы ввод не улетал в «Сделай сам»)
+ROUTE_TO_PLANNER = set()  # set(user_id)
+
 # -----------------------------------------------------------------------------
 # МЕНЮ/КНОПКИ
 # -----------------------------------------------------------------------------
@@ -282,6 +285,7 @@ def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
 # GitHub helpers (хостинг изображений)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
+    # фикс синтаксиса: без лишней ')'
     with open(image_path, "rb") as img_file:
         content = img_file.read()
     try:
@@ -714,23 +718,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "show_day_plan":
         manual_expected_until = None
+        ROUTE_TO_PLANNER.add(user_id)  # <<< включаем принудительную маршрутизацию в планировщик
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
+        ROUTE_TO_PLANNER.discard(user_id)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
         await asyncio.sleep(1)
         shutdown_bot_and_exit()
         return
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
+        ROUTE_TO_PLANNER.discard(user_id)  # <<< выходим из режима планировщика
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
     if data == "self_post":
-        # Сброс состояния планировщика (чтобы не перехватывал ручной ввод)
+        # Выключаем форс‑роутинг в планировщик и сбрасываем его состояние
+        ROUTE_TO_PLANNER.discard(user_id)
         try:
-            uid = update.effective_user.id
-            st = PLANNER_STATE.get(uid)
+            st = PLANNER_STATE.get(user_id)
             if st:
                 cur = st.get("current")
                 if cur:
@@ -774,6 +781,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "end_day":
+        ROUTE_TO_PLANNER.discard(user_id)
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -880,14 +888,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
+    user_id = update.effective_user.id
+
+    # 0) Если включён форс‑роутинг в планировщик — НИЧЕГО не делаем
+    #    (planner.py перехватит в group=0 и спросит время/текст по своему сценарию)
+    if user_id in ROUTE_TO_PLANNER:
+        return
+
     # 1) «Сделай сам» — ручной режим
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
     # 2) если планировщик активен — он перехватит (group=0)
     try:
-        uid = update.effective_user.id
-        st = PLANNER_STATE.get(uid) or {}
+        st = PLANNER_STATE.get(user_id) or {}
         cur = st.get("current")
         cur_mode = getattr(cur, "mode", "none") if cur else "none"
         cur_step = getattr(cur, "step", "idle") if cur else "idle"
