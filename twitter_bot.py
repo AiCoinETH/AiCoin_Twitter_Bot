@@ -3,12 +3,6 @@
 twitter_bot.py — основной бот согласования/генерации/публикации.
 Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто-превью поста)
 c меню действий, где есть кнопка «🗓 ИИ план на день» (в planner.py).
-
-Важно:
-— Кнопка «🔴 Выключить» отправляет сообщение со ссылкой «▶️ Старт воркера»
-  (GET /tg/webhook?s=PUBLIC_TRIGGER_SECRET) и сразу ЖЁСТКО завершает процесс.
-— Для совместимости оставлена функция trigger_worker(), которая при наличии
-  PUBLIC_TRIGGER_SECRET дёргает GET, иначе — защищённый POST.
 """
 
 import os
@@ -23,19 +17,11 @@ from datetime import datetime, timedelta, time as dt_time
 from unicodedata import normalize
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
-from urllib.parse import urlencode  # <-- для сборки URL ?s=SECRET
 
 import tweepy
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    CommandHandler,   # <-- добавлено
-)
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import aiosqlite
 from github import Github
 from openai import OpenAI  # openai>=1.35.0
@@ -58,7 +44,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("twitter_bot")
 
-# Доп. детализация ptb/urllib при DEBUG
 if LOG_LEVEL == "DEBUG":
     logging.getLogger("telegram").setLevel(logging.DEBUG)
     logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
@@ -83,27 +68,27 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# --- Cloudflare Worker триггер ---
-# Базовый URL воркера (путь /tg/webhook)
+# --- Cloudflare Worker --------------------------------------------------------
+# Базовый URL воркера (без секрета в самом значении):
 AICOIN_WORKER_URL = os.getenv(
     "AICOIN_WORKER_URL",
     "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
 )
-# Публичный секрет для GET триггера (?s=...), ДОЛЖЕН совпадать со значением в воркере (PUBLIC_TRIGGER_SECRET)
+# Секрет для публичного GET-триггера (?s=...)
 PUBLIC_TRIGGER_SECRET = os.getenv("PUBLIC_TRIGGER_SECRET", "").strip()
-# Секрет для защищённого POST (совместимость, заголовок X-Telegram-Bot-Api-Secret-Token)
+
+# Старый секрет для заголовка X-Telegram-Bot-Api-Secret-Token (если потребуется POST):
 AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
 
-def _build_start_url(base: str, secret: str) -> str:
+def _worker_url_with_secret() -> str:
+    """Прикручивает ?s=<PUBLIC_TRIGGER_SECRET> к URL воркера (если секрет задан)."""
+    base = AICOIN_WORKER_URL or ""
     if not base:
-        return ""
-    if secret:
-        sep = '&' if ('?' in base) else '?'
-        return f"{base}{sep}{urlencode({'s': secret})}"
+        return base
+    if PUBLIC_TRIGGER_SECRET:
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}s={PUBLIC_TRIGGER_SECRET}"
     return base
-
-# Итоговый URL для кнопки запуска воркера (GET /tg/webhook?s=PUBLIC_TRIGGER_SECRET)
-AICOIN_WORKER_START_URL = _build_start_url(AICOIN_WORKER_URL, PUBLIC_TRIGGER_SECRET)
 
 # Жёсткие проверки окружения
 missing_env = []
@@ -138,11 +123,9 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
 
-# OpenAI
 client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
-# Таймеры
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND  = 600
 AUTO_SHUTDOWN_AFTER_SECONDS = 600
@@ -175,8 +158,7 @@ last_action_time: Dict[int, datetime] = {}
 last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None  # datetime | None
 
-# >>> ФЛАГ-РОУТЕР для планировщика (чтобы ввод не улетал в «Сделай сам»)
-ROUTE_TO_PLANNER: set[int] = set()  # set(user_id)
+ROUTE_TO_PLANNER: set[int] = set()
 
 # -----------------------------------------------------------------------------
 # УТИЛИТЫ ЛОГИРОВАНИЯ
@@ -209,7 +191,6 @@ def _dbg_where(update: Update) -> str:
 # МЕНЮ/КНОПКИ
 # -----------------------------------------------------------------------------
 def start_preview_keyboard():
-    # Компактное меню под единый предпросмотр
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
@@ -218,19 +199,16 @@ def start_preview_keyboard():
          InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
-        [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")],  # <—
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
 def get_start_menu():
-    # Запасное «Главное меню» (используется в некоторых ответах)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
-        [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")],  # <—
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
 
@@ -424,7 +402,7 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     return url
 
 # -----------------------------------------------------------------------------
-# ЕДИНЫЙ ПРЕДПРОСМОТР (1 сообщение)
+# ЕДИНЫЙ ПРЕДПРОСМОТР
 # -----------------------------------------------------------------------------
 async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, header: str | None = "Предпросмотр"):
     caption = build_telegram_preview(text_en, ai_hashtags or [])
@@ -460,7 +438,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
         )
 
 # -----------------------------------------------------------------------------
-# Отправка фото c локальным скачиванием
+# Отправка фото
 # -----------------------------------------------------------------------------
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     def is_valid_image_url(url):
@@ -499,7 +477,7 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         return None, None
 
 # -----------------------------------------------------------------------------
-# БД истории (дедупликация)
+# БД истории (дедуп)
 # -----------------------------------------------------------------------------
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -613,7 +591,6 @@ async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optio
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# регистрируем генератор для planner.py
 try:
     if set_ai_generator:
         set_ai_generator(ai_generate_content_en)
@@ -744,25 +721,23 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# TRIGGER WORKER (GET ?s=... либо POST с секретом)
+# TRIGGER WORKER
 # -----------------------------------------------------------------------------
 async def trigger_worker() -> Tuple[bool, str]:
     """
-    Пытаемся стартовать воркер.
-    1) Если задан PUBLIC_TRIGGER_SECRET — дергаем GET /tg/webhook?s=...
-    2) Иначе пробуем защищённый POST с X-Telegram-Bot-Api-Secret-Token.
+    Запуск воркера.
+    Если задан PUBLIC_TRIGGER_SECRET — используем GET ?s=...
+    иначе — пробуем старый POST с X-Telegram-Bot-Api-Secret-Token.
     """
     if not AICOIN_WORKER_URL:
         return False, "AICOIN_WORKER_URL не задан."
-
     try:
         if PUBLIC_TRIGGER_SECRET:
-            resp = await asyncio.to_thread(
-                requests.get, AICOIN_WORKER_START_URL, timeout=10
-            )
+            url = _worker_url_with_secret()
+            resp = await asyncio.to_thread(requests.get, url, timeout=10)
             if 200 <= resp.status_code < 300:
-                return True, f"GET {resp.status_code}"
-            return False, f"GET {resp.status_code}: {resp.text[:200]}"
+                return True, f"Воркер ответил {resp.status_code}"
+            return False, f"{resp.status_code}: {resp.text[:200]}"
         else:
             ts = int(datetime.now(TZ).timestamp())
             payload = {
@@ -786,19 +761,15 @@ async def trigger_worker() -> Tuple[bool, str]:
                 timeout=10
             )
             if 200 <= resp.status_code < 300:
-                return True, f"POST {resp.status_code}"
-            return False, f"POST {resp.status_code}: {resp.text[:200]}"
+                return True, f"Воркер ответил {resp.status_code}"
+            return False, f"{resp.status_code}: {resp.text[:200]}"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
 # -----------------------------------------------------------------------------
-# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ (если где-то дергают)
+# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ
 # -----------------------------------------------------------------------------
 def generate_post(topic_hint: str = "General invite and value."):
-    """
-    Синхронная обёртка: возвращает (text, image_url).
-    На старте не вызываем. Только для внешних вызовов.
-    """
     loop = asyncio.get_event_loop()
     if loop.is_running():
         text_en = post_data.get("text_en") or ""
@@ -821,7 +792,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.debug(f"[callback_handler:IN] data={data} | {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
     await query.answer()
 
-    # Всё «планировочное» — отдаём planner.py (group=0)
     planner_exact = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
@@ -859,21 +829,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "shutdown_bot":
         ROUTE_TO_PLANNER.discard(uid)
         do_not_disturb["active"] = True
-        # Следующая запланированная публикация (как в end_day): завтра 09:00 по Киеву
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         msg = (
             "🔴 Бот выключен.\n"
             f"Следующий пост запланирован: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
             "Чтобы перезапустить обработчик вручную, нажмите «▶️ Старт воркера»."
         )
-        # ВАЖНО: URL-кнопка (GET), т.к. после жёсткого выключения колбэки не работают
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Старт воркера", url=AICOIN_WORKER_START_URL)]
-        ])
+        # URL-кнопка с секретом:
+        start_url = _worker_url_with_secret()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=start_url)]])
         try:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=kb)
         finally:
-            # ЖЁСТКО: сразу выходим из процесса
             await asyncio.sleep(1)
             shutdown_bot_and_exit()
         return
@@ -941,7 +908,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-    # Мягкий старт через callback (без открытия ссылки пользователем)
     if data == "start_worker":
         ok, info = await trigger_worker()
         prefix = "✅ Запуск воркера: " if ok else "❌ Запуск воркера: "
@@ -1062,17 +1028,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.debug(f"[message_handler:IN] {_dbg_where(update)} | {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
 
-    # 0) Если включён форс-роутинг в планировщик — НИЧЕГО не делаем
     if uid in ROUTE_TO_PLANNER:
         log.debug("[message_handler] Forced routed to planner -> skip")
         return
 
-    # 1) «Сделай сам» — ручной режим
     if manual_expected_until and now <= manual_expected_until:
         log.debug("[message_handler] manual_expected -> handle_manual_input")
         return await handle_manual_input(update, context)
 
-    # 2) если планировщик активен — он перехватит (group=0)
     try:
         st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
@@ -1087,7 +1050,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.debug(f"[message_handler] planner state check error: {e}")
 
-    # 3) иначе — ручной ввод
     log.debug("[message_handler] fallback -> handle_manual_input")
     return await handle_manual_input(update, context)
 
@@ -1096,8 +1058,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-
-    # Генерим авто-контент для стартового предпросмотра (с фоллбэком при 429)
     try:
         text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     except Exception as e:
@@ -1141,14 +1101,6 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — просто показывает главное меню."""
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Главное меню:",
-        reply_markup=get_start_menu()
-    )
-
 def main():
     log.debug("[main] building Application…")
     app = (
@@ -1160,18 +1112,14 @@ def main():
         .build()
     )
 
-    # Планировщик
-    register_planner_handlers(app)  # (в planner.py все хендлеры стоят group=0, и мы включим block=True там)
+    register_planner_handlers(app)
 
-    # Наши обработчики
-    app.add_handler(CommandHandler("start", cmd_start), group=4)  # <— добавлено
     app.add_handler(CallbackQueryHandler(callback_handler), group=5)
     app.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
         group=10
     )
 
-    # Фоновый авто-выключатель
     asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
     log.debug("[main] run_polling…")
