@@ -69,6 +69,15 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# URL Cloudflare Worker для ручного запуска после выключения
+AICOIN_WORKER_URL = os.getenv(
+    "AICOIN_WORKER_URL",
+    "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
+)
+# Секрет для заголовка X-Telegram-Bot-Api-Secret-Token:
+# если AICOIN_WORKER_SECRET не задан, используем TELEGRAM_BOT_TOKEN_APPROVAL (как просили)
+AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
+
 # Жёсткие проверки окружения
 missing_env = []
 for k in ("TELEGRAM_BOT_TOKEN_APPROVAL","TELEGRAM_APPROVAL_CHAT_ID",
@@ -706,6 +715,45 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
+# TRIGGER WORKER (ручной запуск воркера)
+# -----------------------------------------------------------------------------
+async def trigger_worker() -> Tuple[bool, str]:
+    """
+    Делает POST на Cloudflare Worker. Возвращает (ok, сообщение).
+    Заголовок X-Telegram-Bot-Api-Secret-Token берём из AICOIN_WORKER_SECRET
+    или, если пусто, из TELEGRAM_BOT_TOKEN_APPROVAL.
+    """
+    if not AICOIN_WORKER_URL:
+        return False, "AICOIN_WORKER_URL не задан."
+    try:
+        ts = int(datetime.now(TZ).timestamp())
+        payload = {
+            "update_id": ts,
+            "message": {
+                "message_id": ts,
+                "date": ts,
+                "chat": {"id": TELEGRAM_APPROVAL_CHAT_ID},
+                "text": "ping-from-approval-bot"
+            }
+        }
+        headers = {}
+        if AICOIN_WORKER_SECRET:
+            headers["X-Telegram-Bot-Api-Secret-Token"] = AICOIN_WORKER_SECRET
+
+        resp = await asyncio.to_thread(
+            requests.post,
+            AICOIN_WORKER_URL,
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        if 200 <= resp.status_code < 300:
+            return True, f"Воркер ответил {resp.status_code}"
+        return False, f"{resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+# -----------------------------------------------------------------------------
 # СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ (если где-то дергают)
 # -----------------------------------------------------------------------------
 def generate_post(topic_hint: str = "General invite and value."):
@@ -772,10 +820,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "shutdown_bot":
         ROUTE_TO_PLANNER.discard(uid)
-        log.debug("[callback_handler] shutdown_bot -> exit")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
-        await asyncio.sleep(1)
-        shutdown_bot_and_exit()
+        do_not_disturb["active"] = True
+        # Запланируем "на завтра 09:00" как в end_day
+        tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
+        msg = (
+            "🔴 Бот выключен.\n"
+            f"Следующий пост запланирован: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
+            "Чтобы перезапустить обработчик вручную, нажмите «▶️ Старт воркера»."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Старт воркера", callback_data="start_worker")]
+        ])
+        log.debug("[callback_handler] shutdown_bot -> soft off + start_worker button")
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=kb)
         return
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
@@ -839,6 +896,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML", reply_markup=get_start_menu())
+        return
+
+    if data == "start_worker":
+        ok, info = await trigger_worker()
+        prefix = "✅ Запуск воркера: " if ok else "❌ Запуск воркера: "
+        try:
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=prefix + info)
+        finally:
+            # В любом случае покажем стартовое меню, как просили
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+        log.debug(f"[callback_handler] start_worker -> {ok} {info}")
         return
 
     log.debug(f"[callback_handler:OUT] unhandled data={data}")
