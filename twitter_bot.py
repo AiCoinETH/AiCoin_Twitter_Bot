@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — основной бот согласования/генерации/публикации.
-Стартует одним сообщением «Главное меню» (без предпросмотров).
-Кнопка «🗓 ИИ план на день» ведёт в planner.py.
+Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто‑превью поста)
+c меню действий, где есть кнопка «🗓 ИИ план на день» (в planner.py).
 """
 
 import os
@@ -91,12 +91,12 @@ client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
 # Таймеры
-TIMER_PUBLISH_DEFAULT = 180       # авто-пост плейсхолдера (если включим) через 3 минуты
-TIMER_PUBLISH_EXTEND  = 600       # продление при активности
-AUTO_SHUTDOWN_AFTER_SECONDS = 600 # автовыключение при бездействии
+TIMER_PUBLISH_DEFAULT = 180
+TIMER_PUBLISH_EXTEND  = 600
+AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
 DISABLE_WEB_PREVIEW = True
-TELEGRAM_SIGNATURE_HTML = ""  # пусто, без ссылок
+TELEGRAM_SIGNATURE_HTML = ""
 
 # -----------------------------------------------------------------------------
 # ДЕФОЛТНЫЕ ДАННЫЕ ПОСТА
@@ -126,9 +126,23 @@ manual_expected_until = None  # datetime | None
 # -----------------------------------------------------------------------------
 # МЕНЮ/КНОПКИ
 # -----------------------------------------------------------------------------
-def get_start_menu():
+def start_preview_keyboard():
+    # Компактное меню под единый предпросмотр
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Пост", callback_data="approve")],
+        [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
+        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
+         InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post"),
+         InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
+         InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+    ])
+
+def get_start_menu():
+    # Запасное «Главное меню» (используется в некоторых ответах)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
@@ -137,29 +151,22 @@ def get_start_menu():
     ])
 
 def post_choice_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
-        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
-        [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
-    ])
+    return start_preview_keyboard()
 
 def twitter_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
 
 def telegram_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")]
     ])
 
 # -----------------------------------------------------------------------------
@@ -275,7 +282,7 @@ def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
 # GitHub helpers (хостинг изображений)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
-    with open(image_path, "rb") as img_file:
+    with open(image_path, "rb") as img_file):
         content = img_file.read()
     try:
         github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
@@ -313,8 +320,7 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None,
         r = requests.get(url_or_file_id, headers=headers, timeout=15)
         r.raise_for_status()
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp_file.write(r.content)
-        tmp_file.close()
+        tmp_file.write(r.content); tmp_file.close()
         return tmp_file.name
 
 async def save_image_and_get_github_url(image_path):
@@ -334,34 +340,39 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     return url
 
 # -----------------------------------------------------------------------------
-# Предпросмотр (две карточки подряд)
+# ЕДИНЫЙ ПРЕДПРОСМОТР (1 сообщение)
 # -----------------------------------------------------------------------------
-async def preview_split(bot, chat_id, ai_text_en, ai_hashtags=None, image_url=None, header: str | None = None):
-    twitter_txt = build_twitter_preview(ai_text_en, ai_hashtags)
-    telegram_txt = build_telegram_preview(ai_text_en, ai_hashtags)
+async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, header: str | None = "Предпросмотр"):
+    caption = build_telegram_preview(text_en, ai_hashtags or [])
     hdr = f"<b>{header}</b>\n" if header else ""
+    text = f"{hdr}{caption}".strip()
 
-    tw_markup = twitter_preview_keyboard()
     try:
         if image_url:
-            await send_photo_with_download(bot, chat_id, image_url, caption=f"{hdr}<b>Twitter:</b>\n{twitter_txt}", reply_markup=tw_markup)
+            await send_photo_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                image_url,
+                caption=text,
+                reply_markup=start_preview_keyboard()
+            )
         else:
-            await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Twitter:</b>\n{twitter_txt}",
-                                   parse_mode="HTML", reply_markup=tw_markup, disable_web_page_preview=True)
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Twitter:</b>\n{twitter_txt}",
-                               parse_mode="HTML", reply_markup=tw_markup, disable_web_page_preview=True)
-
-    tg_markup = telegram_preview_keyboard()
-    try:
-        if image_url:
-            await send_photo_with_download(bot, chat_id, image_url, caption=f"{hdr}<b>Telegram:</b>\n{telegram_txt}", reply_markup=tg_markup)
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Telegram:</b>\n{telegram_txt}",
-                                   parse_mode="HTML", reply_markup=tg_markup, disable_web_page_preview=True)
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=f"{hdr}<b>Telegram:</b>\n{telegram_txt}",
-                               parse_mode="HTML", reply_markup=tg_markup, disable_web_page_preview=True)
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=start_preview_keyboard()
+            )
+    except Exception as e:
+        log.warning(f"send_single_preview failed, fallback to text: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=start_preview_keyboard()
+        )
 
 # -----------------------------------------------------------------------------
 # Отправка фото c локальным скачиванием
@@ -652,7 +663,7 @@ async def publish_post_to_telegram(text, image_url=None):
 def generate_post(topic_hint: str = "General invite and value."):
     """
     Синхронная обёртка: возвращает (text, image_url).
-    На старте НЕ используется. Только для внешних вызовов.
+    На старте не вызываем. Только для внешних вызовов.
     """
     loop = asyncio.get_event_loop()
     if loop.is_running():
@@ -716,7 +727,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
-        # Сброс состояния планировщика, чтобы не перехватывал ручной ввод
+        # Сброс состояния планировщика (чтобы не перехватывал ручной ввод)
         try:
             uid = update.effective_user.id
             st = PLANNER_STATE.get(uid)
@@ -742,18 +753,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
-        await preview_split(
-            approval_bot,
-            TELEGRAM_APPROVAL_CHAT_ID,
+        await send_single_preview(
             post_data.get("text_en") or "",
             post_data.get("ai_hashtags") or [],
             image_url=post_data.get("image_url"),
             header="Предпросмотр"
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Выберите действие:",
-            reply_markup=post_choice_keyboard()
         )
         return
 
@@ -813,18 +817,11 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_data["is_manual"] = True
 
     try:
-        await preview_split(
-            approval_bot,
-            TELEGRAM_APPROVAL_CHAT_ID,
+        await send_single_preview(
             post_data["text_en"],
             post_data.get("ai_hashtags") or [],
             image_url=post_data["image_url"],
             header="Предпросмотр"
-        )
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Выберите действие:",
-            reply_markup=post_choice_keyboard()
         )
     except Exception as e:
         log.error(f"handle_manual_input preview failed: {e}")
@@ -910,16 +907,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-    # Фоновые задачи (если используешь автопост плейсхолдера/авто-выключение)
-    asyncio.create_task(check_inactivity_shutdown())
 
-    # Никаких предпросмотров на старте — только «Главное меню»
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Главное меню:",
-        reply_markup=get_start_menu()
-    )
-    log.info("Бот запущен. Отправлено только главное меню. Планирование — в planner.py.")
+    # Генерим авто‑контент для стартового предпросмотра (с фоллбэком при 429)
+    try:
+        text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
+    except Exception:
+        text_en, ai_tags, img = post_data["text_en"], post_data.get("ai_hashtags") or [], post_data.get("image_url")
+
+    post_data["text_en"] = text_en
+    post_data["ai_hashtags"] = ai_tags
+    post_data["image_url"] = img
+
+    # ЕДИНЫЙ запланированный предпросмотр (ровно одно сообщение)
+    await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=post_data["image_url"], header="Предпросмотр")
+
+    log.info("Бот запущен. Отправлен ЕДИНЫЙ запланированный предпросмотр. Планирование — в planner.py.")
 
 async def check_inactivity_shutdown():
     global last_button_pressed_at
@@ -970,6 +972,9 @@ def main():
         MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, message_handler),
         group=10
     )
+
+    # Фоновый авто‑выключатель
+    asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
     app.run_polling(poll_interval=0.12, timeout=1)
 
