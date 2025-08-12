@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — основной бот согласования/генерации/публикации.
-Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто‑превью поста)
+Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто-превью поста)
 c меню действий, где есть кнопка «🗓 ИИ план на день» (в planner.py).
 """
 
@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timedelta, time as dt_time
 from unicodedata import normalize
 from zoneinfo import ZoneInfo
+from typing import Optional, Tuple, List, Dict, Any
 
 import tweepy
 import requests
@@ -43,6 +44,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("twitter_bot")
 
+# Доп. детализация ptb/urllib при DEBUG
+if LOG_LEVEL == "DEBUG":
+    logging.getLogger("telegram").setLevel(logging.DEBUG)
+    logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.INFO)
+
 # -----------------------------------------------------------------------------
 # ENV
 # -----------------------------------------------------------------------------
@@ -63,16 +70,25 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Жёсткие проверки окружения
-if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID_STR, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
-    log.error("Не заданы обязательные переменные окружения Telegram!")
+missing_env = []
+for k in ("TELEGRAM_BOT_TOKEN_APPROVAL","TELEGRAM_APPROVAL_CHAT_ID",
+          "TELEGRAM_BOT_TOKEN_CHANNEL","TELEGRAM_CHANNEL_USERNAME_ID"):
+    if not os.getenv(k): missing_env.append(k)
+if missing_env:
+    log.error(f"Не заданы обязательные переменные окружения Telegram: {missing_env}")
     sys.exit(1)
 TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID_STR)
-if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET]):
-    log.error("Не заданы обязательные переменные окружения для Twitter!")
-    sys.exit(1)
-if not all([GITHUB_TOKEN, GITHUB_REPO]):
-    log.error("Не заданы обязательные переменные окружения GitHub!")
-    sys.exit(1)
+
+for k in ("TWITTER_API_KEY","TWITTER_API_SECRET","TWITTER_ACCESS_TOKEN","TWITTER_ACCESS_TOKEN_SECRET"):
+    if not os.getenv(k):
+        log.error(f"Не заданы обязательные переменные окружения для Twitter: {k}")
+        sys.exit(1)
+
+for k in ("ACTION_PAT_GITHUB","ACTION_REPO_GITHUB"):
+    if not os.getenv(k):
+        log.error(f"Не заданы обязательные переменные окружения GitHub: {k}")
+        sys.exit(1)
+
 if not OPENAI_API_KEY:
     log.error("Не задан OPENAI_API_KEY!")
     sys.exit(1)
@@ -107,7 +123,7 @@ fallback_images = [
     "https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg"
 ]
 
-post_data = {
+post_data: Dict[str, Any] = {
     "text_en": "AI Coin blends blockchain with AI for smarter, faster, community-driven decisions.",
     "ai_hashtags": ["#AiCoin", "#AI", "$Ai", "#crypto"],
     "image_url": random.choice(fallback_images),
@@ -119,12 +135,39 @@ prev_data = post_data.copy()
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
-last_action_time = {}
-last_button_pressed_at = None
-manual_expected_until = None  # datetime | None
+last_action_time: Dict[int, datetime] = {}
+last_button_pressed_at: Optional[datetime] = None
+manual_expected_until: Optional[datetime] = None  # datetime | None
 
 # >>> ФЛАГ-РОУТЕР для планировщика (чтобы ввод не улетал в «Сделай сам»)
-ROUTE_TO_PLANNER = set()  # set(user_id)
+ROUTE_TO_PLANNER: set[int] = set()  # set(user_id)
+
+# -----------------------------------------------------------------------------
+# УТИЛИТЫ ЛОГИРОВАНИЯ
+# -----------------------------------------------------------------------------
+def _planner_snapshot(uid: int) -> str:
+    st = PLANNER_STATE.get(uid) or {}
+    cur = st.get("current")
+    mode = getattr(cur, "mode", "none") if cur else "none"
+    step = getattr(cur, "step", "idle") if cur else "idle"
+    return f"planner.mode={mode}, planner.step={step}"
+
+def _route_snapshot(uid: int) -> str:
+    in_router = uid in ROUTE_TO_PLANNER
+    manual = (manual_expected_until and datetime.now(TZ) <= manual_expected_until)
+    return f"in_ROUTER={in_router}, manual_expected={bool(manual)}, DND={do_not_disturb['active']}"
+
+def _dbg_where(update: Update) -> str:
+    typ = "unknown"
+    if update.callback_query:
+        typ = f"CB:{update.callback_query.data}"
+    elif update.message:
+        kinds = []
+        if update.message.text: kinds.append("text")
+        if update.message.photo: kinds.append("photo")
+        if getattr(update.message, 'document', None): kinds.append("doc")
+        typ = "MSG:" + "+".join(kinds)
+    return typ
 
 # -----------------------------------------------------------------------------
 # МЕНЮ/КНОПКИ
@@ -285,7 +328,6 @@ def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
 # GitHub helpers (хостинг изображений)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
-    # фикс синтаксиса: без лишней ')'
     with open(image_path, "rb") as img_file:
         content = img_file.read()
     try:
@@ -351,6 +393,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
     hdr = f"<b>{header}</b>\n" if header else ""
     text = f"{hdr}{caption}".strip()
 
+    log.debug(f"[send_single_preview] image_url={bool(image_url)} len(text)={len(text)}")
     try:
         if image_url:
             await send_photo_with_download(
@@ -436,6 +479,7 @@ async def init_db():
             ON posts (COALESCE(text_hash, ''), COALESCE(image_hash, ''));
         """)
         await db.commit()
+    log.debug("[init_db] ok")
 
 def normalize_text_for_hashing(text: str) -> str:
     if not text: return ""
@@ -479,7 +523,7 @@ async def save_post_to_history(text, image_url=None):
                              (text, text_hash, datetime.now(TZ).isoformat(), image_hash))
             await db.commit()
         except Exception as e:
-            log.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
+            log.warning(f"save_post_to_history: возможно дубликат/ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
 # ИИ-генерация
@@ -513,7 +557,7 @@ def _oa_chat_text(prompt: str) -> str:
             pass
         return "Ai Coin fuses AI with blockchain to turn community ideas into real actions. Join builders shaping the next wave of crypto utility."
 
-async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str | None]:
+async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optional[str]]:
     text_prompt = (
         "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
         "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, clear benefits, no jargon. "
@@ -573,7 +617,7 @@ def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_si
         log.warning(f"Pillow недоступен или ошибка сжатия: {e}")
         return False
 
-def _download_to_temp_file(image_url: str) -> str | None:
+def _download_to_temp_file(image_url: str) -> Optional[str]:
     try:
         r = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
         r.raise_for_status()
@@ -686,6 +730,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until
     query = update.callback_query
     data = query.data
+    uid = update.effective_user.id
+
+    log.debug(f"[callback_handler:IN] data={data} | {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
     await query.answer()
 
     # Всё «планировочное» — отдаём planner.py (group=0)
@@ -693,13 +740,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
         "STEP_BACK", "PLAN_LIST_TODAY", "PLAN_AI_BUILD_NOW",
-        "BACK_MAIN_MENU"
+        "BACK_MAIN_MENU", "ITEM_MENU", "DEL_ITEM", "EDIT_TIME", "EDIT_ITEM"
     }
     planner_prefixes = (
         "PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:",
         "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"
     )
     if (data in planner_exact) or any(data.startswith(p) for p in planner_prefixes):
+        log.debug(f"[callback_handler] Routed to planner (skip).")
         return
 
     now = datetime.now(TZ)
@@ -711,42 +759,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    user_id = update.effective_user.id
-    if user_id in last_action_time and (now - last_action_time[user_id]).seconds < 1:
+    if uid in last_action_time and (now - last_action_time[uid]).seconds < 1:
+        log.debug("[callback_handler] Debounced duplicate click")
         return
-    last_action_time[user_id] = now
+    last_action_time[uid] = now
 
     if data == "show_day_plan":
         manual_expected_until = None
-        ROUTE_TO_PLANNER.add(user_id)  # <<< включаем принудительную маршрутизацию в планировщик
+        ROUTE_TO_PLANNER.add(uid)
+        log.debug(f"[callback_handler] -> open_planner; ROUTE_TO_PLANNER.add({uid})")
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
-        ROUTE_TO_PLANNER.discard(user_id)
+        ROUTE_TO_PLANNER.discard(uid)
+        log.debug("[callback_handler] shutdown_bot -> exit")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🔴 Бот выключен.")
         await asyncio.sleep(1)
         shutdown_bot_and_exit()
         return
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
-        ROUTE_TO_PLANNER.discard(user_id)  # <<< выходим из режима планировщика
+        ROUTE_TO_PLANNER.discard(uid)
+        log.debug(f"[callback_handler] Back to main; ROUTE_TO_PLANNER.discard({uid})")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
     if data == "self_post":
-        # Выключаем форс‑роутинг в планировщик и сбрасываем его состояние
-        ROUTE_TO_PLANNER.discard(user_id)
+        ROUTE_TO_PLANNER.discard(uid)
+        log.debug("[callback_handler] self_post -> manual flow; ROUTE cleared")
         try:
-            st = PLANNER_STATE.get(user_id)
+            st = PLANNER_STATE.get(uid)
             if st:
                 cur = st.get("current")
                 if cur:
-                    cur.mode = "none"
-                    cur.step = "idle"
-                    cur.text = None
-                    cur.topic = None
-                    cur.time_str = None
-                    cur.image_url = None
+                    cur.mode = "none"; cur.step = "idle"
+                    cur.text = None; cur.topic = None
+                    cur.time_str = None; cur.image_url = None
                 st["mode"] = "none"
         except Exception:
             pass
@@ -760,6 +808,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
+        log.debug("[callback_handler] approve -> send_single_preview")
         await send_single_preview(
             post_data.get("text_en") or "",
             post_data.get("ai_hashtags") or [],
@@ -771,27 +820,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("post_twitter", "post_telegram", "post_both"):
         publish_tg = data in ("post_telegram", "post_both")
         publish_tw = data in ("post_twitter", "post_both")
+        log.debug(f"[callback_handler] publish_flow tg={publish_tg} tw={publish_tw}")
         await publish_flow(publish_tg=publish_tg, publish_tw=publish_tw)
         return
 
     if data == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
+        log.debug(f"[callback_handler] DND -> {status}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
         return
 
     if data == "end_day":
-        ROUTE_TO_PLANNER.discard(user_id)
+        ROUTE_TO_PLANNER.discard(uid)
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
+        log.debug("[callback_handler] end_day -> DND on & main menu")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
+    log.debug(f"[callback_handler:OUT] unhandled data={data}")
+
 # --- Ручной ввод ---
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
+    uid = update.effective_user.id
+    log.debug(f"[handle_manual_input:IN] {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
+
     pending_post["active"] = True
     pending_post["timer"] = datetime.now(TZ)
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -836,6 +893,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
     finally:
         manual_expected_until = None
+        log.debug("[handle_manual_input:OUT] preview sent")
 
 # --- Публикация ---
 async def publish_flow(publish_tg: bool, publish_tw: bool):
@@ -846,12 +904,13 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     twitter_text = build_twitter_preview(base_text_en, ai_tags)
     telegram_text = build_telegram_preview(base_text_en, ai_tags)
 
-    tg_status = None
-    tw_status = None
-
     if do_not_disturb["active"]:
+        log.debug("[publish_flow] DND active -> cancel")
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "🌙 Режим «Не беспокоить» активен. Публикация отменена.")
         return
+
+    tg_status = None
+    tw_status = None
 
     if publish_tg:
         if await is_duplicate_post(telegram_text, img):
@@ -874,11 +933,13 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
+    log.debug(f"[publish_flow] result tg={tg_status} tw={tw_status}")
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
 # --- Маршрутизация сообщений ---
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, manual_expected_until
+    uid = update.effective_user.id
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
@@ -888,20 +949,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    user_id = update.effective_user.id
+    log.debug(f"[message_handler:IN] {_dbg_where(update)} | {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
 
-    # 0) Если включён форс‑роутинг в планировщик — НИЧЕГО не делаем
+    # 0) Если включён форс-роутинг в планировщик — НИЧЕГО не делаем
     #    (planner.py перехватит в group=0 и спросит время/текст по своему сценарию)
-    if user_id in ROUTE_TO_PLANNER:
+    if uid in ROUTE_TO_PLANNER:
+        log.debug("[message_handler] Forced routed to planner -> skip")
         return
 
     # 1) «Сделай сам» — ручной режим
     if manual_expected_until and now <= manual_expected_until:
+        log.debug("[message_handler] manual_expected -> handle_manual_input")
         return await handle_manual_input(update, context)
 
     # 2) если планировщик активен — он перехватит (group=0)
     try:
-        st = PLANNER_STATE.get(user_id) or {}
+        st = PLANNER_STATE.get(uid) or {}
         cur = st.get("current")
         cur_mode = getattr(cur, "mode", "none") if cur else "none"
         cur_step = getattr(cur, "step", "idle") if cur else "idle"
@@ -909,11 +972,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "waiting_topic", "waiting_text", "waiting_time",
             "editing_time", "editing_text", "editing_topic", "editing_image"
         )):
+            log.debug("[message_handler] planner state active -> skip")
             return
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[message_handler] planner state check error: {e}")
 
     # 3) иначе — ручной ввод
+    log.debug("[message_handler] fallback -> handle_manual_input")
     return await handle_manual_input(update, context)
 
 # -----------------------------------------------------------------------------
@@ -922,19 +987,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_start(app: Application):
     await init_db()
 
-    # Генерим авто‑контент для стартового предпросмотра (с фоллбэком при 429)
+    # Генерим авто-контент для стартового предпросмотра (с фоллбэком при 429)
     try:
         text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
-    except Exception:
+    except Exception as e:
+        log.warning(f"ai_generate_content_en failed at start: {e}")
         text_en, ai_tags, img = post_data["text_en"], post_data.get("ai_hashtags") or [], post_data.get("image_url")
 
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
 
-    # ЕДИНЫЙ запланированный предпросмотр (ровно одно сообщение)
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=post_data["image_url"], header="Предпросмотр")
-
     log.info("Бот запущен. Отправлен ЕДИНЫЙ запланированный предпросмотр. Планирование — в planner.py.")
 
 async def check_inactivity_shutdown():
@@ -968,6 +1032,7 @@ def shutdown_bot_and_exit():
     os._exit(0)
 
 def main():
+    log.debug("[main] building Application…")
     app = (
         Application
         .builder()
@@ -978,7 +1043,7 @@ def main():
     )
 
     # Планировщик
-    register_planner_handlers(app)
+    register_planner_handlers(app)  # (в planner.py все хендлеры стоят group=0, и мы включим block=True там)
 
     # Наши обработчики
     app.add_handler(CallbackQueryHandler(callback_handler), group=5)
@@ -987,9 +1052,10 @@ def main():
         group=10
     )
 
-    # Фоновый авто‑выключатель
+    # Фоновый авто-выключатель
     asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
+    log.debug("[main] run_polling…")
     app.run_polling(poll_interval=0.12, timeout=1)
 
 if __name__ == "__main__":
