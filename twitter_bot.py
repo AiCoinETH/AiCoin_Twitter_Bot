@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — основной бот согласования/генерации/публикации.
-Часть 1/2.
+Полная версия.
 """
 
 import os
@@ -33,7 +33,7 @@ except ImportError:
 from planner import USER_STATE as PLANNER_STATE
 
 # -----------------------------------------------------------------------------
-# ЛОГИРОВАНИЕ (структурное)
+# ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -43,12 +43,12 @@ logging.basicConfig(
 log = logging.getLogger("twitter_bot")
 
 # -----------------------------------------------------------------------------
-# НАСТРОЙКИ/ENV
+# ENV
 # -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
 TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
-TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")  # может быть @username или числовой id
 
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
@@ -61,7 +61,7 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Проверки окружения (жесткие — как было)
+# Жёсткие проверки окружения
 if not all([TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID_STR, TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID]):
     log.error("Не заданы обязательные переменные окружения Telegram!")
     sys.exit(1)
@@ -85,7 +85,7 @@ channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 DB_FILE = "post_history.db"
 TZ = ZoneInfo("Europe/Kyiv")
 
-# OpenAI клиент
+# OpenAI
 client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
 OPENAI_QUOTA_WARNED = False
 
@@ -162,7 +162,7 @@ def telegram_preview_keyboard():
     ])
 
 # -----------------------------------------------------------------------------
-# TWITTER / GITHUB КЛИЕНТЫ
+# TWITTER / GITHUB
 # -----------------------------------------------------------------------------
 def get_twitter_clients():
     client_v2 = tweepy.Client(
@@ -186,7 +186,7 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# ПОМОЩНИКИ ПО ТЕКСТУ/ХЭШТЕГАМ/ОГРАНИЧЕНИЮ ДЛИНЫ
+# ТЕКСТ/ХЭШТЕГИ/ДЛИНЫ
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
@@ -293,7 +293,7 @@ def delete_image_from_github(filename):
         log.error(f"Ошибка удаления файла на GitHub: {e}")
 
 # -----------------------------------------------------------------------------
-# Изображения: загрузка/сохранение
+# Изображения
 # -----------------------------------------------------------------------------
 async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None, retries=3):
     if is_telegram_file:
@@ -466,7 +466,7 @@ async def save_post_to_history(text, image_url=None):
             log.warning(f"save_post_to_history: возможно дубликат или ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# ИИ-генерация короткого текста и хэштегов
+# ИИ-генерация
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
@@ -515,7 +515,7 @@ async def ai_generate_content_en(topic_hint: str) -> tuple[str, list[str], str |
     image_url = random.choice(fallback_images)
     return (text_en, ai_tags, image_url)
 
-# Связь с планировщиком (регистрация генератора)
+# регистрируем генератор для planner.py
 try:
     if set_ai_generator:
         set_ai_generator(ai_generate_content_en)
@@ -526,7 +526,7 @@ except Exception as e:
     log.warning(f"Cannot register planner AI generator: {e}")
 
 # -----------------------------------------------------------------------------
-# Публикация в Twitter (с компрессией изображений)
+# Публикация
 # -----------------------------------------------------------------------------
 def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_side: int = 2048) -> bool:
     try:
@@ -618,9 +618,6 @@ def publish_post_to_twitter(text, image_url=None):
             delete_image_from_github(github_filename)
         return False
 
-# -----------------------------------------------------------------------------
-# Публикация в Telegram-канал
-# -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text, image_url=None):
     try:
         text_with_signature = (text or "")
@@ -649,7 +646,7 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# Стартовое сообщение (плейсхолдер) + активация таймера
+# Стартовое сообщение (плейсхолдер)
 # -----------------------------------------------------------------------------
 async def send_start_placeholder():
     text_en = post_data["text_en"]
@@ -688,7 +685,7 @@ async def send_start_placeholder():
     pending_post.update({"active": True, "timer": datetime.now(TZ), "timeout": TIMER_PUBLISH_DEFAULT, "mode": "placeholder"})
 
 # -----------------------------------------------------------------------------
-# Таймеры фоновые (автопост и автошатдаун)
+# Таймеры
 # -----------------------------------------------------------------------------
 async def check_timer():
     while True:
@@ -737,59 +734,38 @@ async def check_inactivity_shutdown():
         except Exception as e:
             log.warning(f"check_inactivity_shutdown error: {e}")
 
-# === ДАЛЕЕ: callback_handler / handle_manual_input / publish_flow / message_handler
-# === on_start / shutdown_bot_and_exit / main — будут в Части 2/2
-
-# =======================  КОНЕЦ ЧАСТИ 1/2  =======================
-# --- ОТПРАВКА В TWITTER ---
-# =======================  ЧАСТЬ 2/2  =======================
-# Всё ниже — продолжение к определённым выше объектам/функциям:
-# approval_bot, channel_bot, preview_split, ai_generate_content_en, etc.
-
-# --- SHIM для старого кода: generate_post() ---
+# -----------------------------------------------------------------------------
+# СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ
+# -----------------------------------------------------------------------------
 def generate_post(topic_hint: str = "General invite and value."):
     """
-    СИНХРОННАЯ обёртка, которую требует старый пайплайн.
+    СИНХРОННАЯ обёртка (нужна старым скриптам/CI).
     Возвращает (text, image_url).
-    Хэштеги добавим в тексте так же, как в предпросмотрах.
     """
-    text_en, tags, img = asyncio.get_event_loop().run_until_complete(
-        ai_generate_content_en(topic_hint)
-    )
-    # Собираем полный текст как для Telegram
-    full_text = build_telegram_post(text_en, tags)
-    return full_text, img
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # если уже в ивент-лупе (например, Telegram), то обходимся без run_until_complete
+        # — используем заранее сгенерённый плейсхолдер
+        text_en = post_data.get("text_en") or ""
+        tags = post_data.get("ai_hashtags") or []
+        img = post_data.get("image_url")
+        return build_telegram_post(text_en, tags), img
+    else:
+        text_en, tags, img = loop.run_until_complete(ai_generate_content_en(topic_hint))
+        return build_telegram_post(text_en, tags), img
 
-
-# --- КНОПКИ ПОДТВЕРЖДЕНИЯ ПОСЛЕ ПРЕДПРОСМОТРА ---
-def post_choice_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter")],
-        [InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
-        [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_to_main")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
-    ])
-
-
-# --- ПРЕВЬЮ/СОГЛАСОВАНИЕ ПО СТАРОЙ СХЕМЕ (совместимость) ---
 async def send_post_for_approval():
     """
-    Совместим со старым пайплайном GitHub Actions:
-    генерим пост, показываем превью (обе платформы) и выдаём меню действий.
+    Для GitHub Actions: генерим пост, показываем превью (обе платформы) и выдаём меню действий.
     """
-    # Генерим текст/картинку
     text, image_url = generate_post("General invite and value.")
 
-    # Сохраняем в общую структуру, чтобы publish_flow использовал те же данные
-    post_data["text_en"] = text
-    post_data["ai_hashtags"] = []  # уже внутри текста
+    post_data["text_en"] = text   # уже с хэштегами
+    post_data["ai_hashtags"] = [] # хэштеги уже в тексте
     post_data["image_url"] = image_url
     post_data["post_id"] += 1
     post_data["is_manual"] = False
 
-    # Двойной предпросмотр (Twitter/Telegram)
     await preview_split(
         approval_bot,
         TELEGRAM_APPROVAL_CHAT_ID,
@@ -798,14 +774,12 @@ async def send_post_for_approval():
         image_url=post_data["image_url"],
         header="Предпросмотр"
     )
-    # Меню действий
     await approval_bot.send_message(
         chat_id=TELEGRAM_APPROVAL_CHAT_ID,
         text="Выберите действие:",
         reply_markup=post_choice_keyboard()
     )
 
-    # Запускаем таймер на автопост: как и в современном сценарии
     pending_post.update({
         "active": True,
         "timer": datetime.now(TZ),
@@ -813,15 +787,16 @@ async def send_post_for_approval():
         "mode": "placeholder"
     })
 
-
-# --- CALLBACK HANDLER (единая точка, НЕ трогаем коды planner.py) ---
+# -----------------------------------------------------------------------------
+# CALLBACKS / INPUT / FLOW
+# -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until
     query = update.callback_query
     data = query.data
     await query.answer()
 
-    # ВАЖНО: всё, что относится к планировщику — пропускаем, перехватит planner.py (group=0)
+    # Всё «планировочное» — отдаём planner.py (group=0)
     planner_exact = {
         "PLAN_OPEN", "OPEN_PLAN_MODE", "OPEN_GEN_MODE",
         "PLAN_DONE", "GEN_DONE", "PLAN_ADD_MORE", "GEN_ADD_MORE",
@@ -829,15 +804,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "BACK_MAIN_MENU"
     }
     planner_prefixes = (
-        "PLAN_",        # общие шаги
-        "ITEM_MENU:",   # меню элемента
-        "DEL_ITEM:",    # удаление
-        "EDIT_TIME:",   # шорткат времени
-        "EDIT_ITEM:",   # меню редактирования
-        "EDIT_FIELD:",  # выбор поля
-        "AI_FILL_TEXT:",
-        "CLONE_ITEM:",
-        "AI_NEW_FROM:"
+        "PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:",
+        "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"
     )
     if (data in planner_exact) or any(data.startswith(p) for p in planner_prefixes):
         return
@@ -927,8 +895,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-
-# --- РУЧНОЙ ВВОД (текст/фото) ---
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     pending_post["active"] = True
@@ -983,8 +949,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     finally:
         manual_expected_until = None
 
-
-# --- ПУБЛИКАЦИЯ ---
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     ai_tags = post_data.get("ai_hashtags") or []
@@ -1023,8 +987,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
-
-# --- MESSAGE HANDLER (маршрутизация между ручным вводом и планировщиком) ---
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, manual_expected_until
     now = datetime.now(TZ)
@@ -1036,11 +998,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # 1) если недавно нажали «Сделай сам» — принудительно в ручной режим
+    # 1) «Сделай сам» — ручной режим
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    # 2) иначе — отдать планировщику, если он АКТИВЕН или ждёт ввод
+    # 2) если планировщик активен — он перехватит (group=0)
     try:
         uid = update.effective_user.id
         st = PLANNER_STATE.get(uid) or {}
@@ -1051,39 +1013,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "waiting_topic", "waiting_text", "waiting_time",
             "editing_time", "editing_text", "editing_topic", "editing_image"
         )):
-            # planner.py перехватит (group=0)
             return
     except Exception:
         pass
 
-    # 3) дефолт — ручной ввод
+    # 3) иначе — ручной ввод
     return await handle_manual_input(update, context)
 
-
-# --- STARTUP ---
+# -----------------------------------------------------------------------------
+# STARTUP / SHUTDOWN / MAIN
+# -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
     asyncio.create_task(check_timer())
     asyncio.create_task(check_inactivity_shutdown())
 
-    # Первичное авто-содержимое для стартового плейсхолдера
+    # Первичное авто-содержимое (на случай fallback)
     text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     post_data["text_en"] = text_en
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
 
-    # Если пайплайн зовёт старую функцию — используем send_post_for_approval()
+    # Основной путь для CI: превью + кнопки
     try:
         await send_post_for_approval()
     except Exception as e:
-        # Фоллбэк: просто одно стартовое сообщение + кнопки
         log.warning(f"send_post_for_approval failed, fallback to placeholder: {e}")
         await send_start_placeholder()
 
-    log.info("Бот запущен. Стартовое сообщение отправлено. Планирование — в planner.py.")
+    log.info("Бот запущен. Предпросмотр отправлен. Планирование — в planner.py.")
 
-
-# --- Выключение ---
 def shutdown_bot_and_exit():
     try:
         asyncio.create_task(approval_bot.send_message(
@@ -1095,8 +1054,6 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
-
-# --- MAIN ---
 def main():
     app = (
         Application
@@ -1118,7 +1075,6 @@ def main():
     )
 
     app.run_polling(poll_interval=0.12, timeout=1)
-
 
 if __name__ == "__main__":
     main()
