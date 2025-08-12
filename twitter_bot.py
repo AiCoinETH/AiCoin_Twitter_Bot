@@ -377,7 +377,6 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
             disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
-
 # -----------------------------------------------------------------------------
 # Отправка фото c локальным скачиванием
 # -----------------------------------------------------------------------------
@@ -660,7 +659,6 @@ async def publish_post_to_telegram(text, image_url=None):
             text=f"❌ Ошибка при публикации в Telegram: {e}"
         )
         return False
-
 # -----------------------------------------------------------------------------
 # СОВМЕСТИМОСТЬ СО СТАРЫМ ПАЙПЛАЙНОМ (если где-то дергают)
 # -----------------------------------------------------------------------------
@@ -678,6 +676,14 @@ def generate_post(topic_hint: str = "General invite and value."):
     else:
         text_en, tags, img = loop.run_until_complete(ai_generate_content_en(topic_hint))
         return build_telegram_post(text_en, tags), img
+
+# -----------------------------------------------------------------------------
+# РОУТЕР В ПЛАНИРОВЩИК (если не объявлен ранее)
+# -----------------------------------------------------------------------------
+try:
+    ROUTE_TO_PLANNER
+except NameError:
+    ROUTE_TO_PLANNER = set()  # set(user_id)
 
 # -----------------------------------------------------------------------------
 # CALLBACKS / INPUT / FLOW
@@ -700,7 +706,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"
     )
     if (data in planner_exact) or any(data.startswith(p) for p in planner_prefixes):
-        return
+        return  # planner.py перехватит в group=0
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -718,7 +724,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "show_day_plan":
         manual_expected_until = None
-        ROUTE_TO_PLANNER.add(user_id)  # <<< включаем принудительную маршрутизацию в планировщик
+        ROUTE_TO_PLANNER.add(user_id)
         return await open_planner(update, context)
 
     if data == "shutdown_bot":
@@ -729,7 +735,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
-        ROUTE_TO_PLANNER.discard(user_id)  # <<< выходим из режима планировщика
+        ROUTE_TO_PLANNER.discard(user_id)
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
@@ -777,16 +783,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"🌙 Режим «Не беспокоить» {status}.",
+            reply_markup=get_start_menu()
+        )
         return
 
     if data == "end_day":
         ROUTE_TO_PLANNER.discard(user_id)
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
-            parse_mode="HTML", reply_markup=get_start_menu())
+            parse_mode="HTML",
+            reply_markup=get_start_menu()
+        )
         return
 
 # --- Ручной ввод ---
@@ -994,4 +1007,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
