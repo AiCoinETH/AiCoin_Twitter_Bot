@@ -3,6 +3,12 @@
 twitter_bot.py — основной бот согласования/генерации/публикации.
 Стартует ОДНИМ сообщением: «Предпросмотр» (запланированный авто-превью поста)
 c меню действий, где есть кнопка «🗓 ИИ план на день» (в planner.py).
+
+Важно:
+— Кнопка «🔴 Выключить» отправляет сообщение со ссылкой «▶️ Старт воркера»
+  (GET /tg/webhook?s=PUBLIC_TRIGGER_SECRET) и сразу ЖЁСТКО завершает процесс.
+— Для совместимости оставлена функция trigger_worker(), которая при наличии
+  PUBLIC_TRIGGER_SECRET дёргает GET, иначе — защищённый POST.
 """
 
 import os
@@ -17,6 +23,7 @@ from datetime import datetime, timedelta, time as dt_time
 from unicodedata import normalize
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
+from urllib.parse import urlencode  # <-- для сборки URL ?s=SECRET
 
 import tweepy
 import requests
@@ -69,14 +76,27 @@ GITHUB_IMAGE_PATH = "images_for_posts"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# URL Cloudflare Worker для ручного запуска после выключения (должен принимать GET)
+# --- Cloudflare Worker триггер ---
+# Базовый URL воркера (путь /tg/webhook)
 AICOIN_WORKER_URL = os.getenv(
     "AICOIN_WORKER_URL",
     "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
 )
-# Секрет для заголовка X-Telegram-Bot-Api-Secret-Token:
-# если AICOIN_WORKER_SECRET не задан, используем TELEGRAM_BOT_TOKEN_APPROVAL (как просили)
+# Публичный секрет для GET триггера (?s=...), ДОЛЖЕН совпадать со значением в воркере (PUBLIC_TRIGGER_SECRET)
+PUBLIC_TRIGGER_SECRET = os.getenv("PUBLIC_TRIGGER_SECRET", "").strip()
+# Секрет для защищённого POST (совместимость, заголовок X-Telegram-Bot-Api-Secret-Token)
 AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
+
+def _build_start_url(base: str, secret: str) -> str:
+    if not base:
+        return ""
+    if secret:
+        sep = '&' if ('?' in base) else '?'
+        return f"{base}{sep}{urlencode({'s': secret})}"
+    return base
+
+# Итоговый URL для кнопки запуска воркера (GET /tg/webhook?s=PUBLIC_TRIGGER_SECRET)
+AICOIN_WORKER_START_URL = _build_start_url(AICOIN_WORKER_URL, PUBLIC_TRIGGER_SECRET)
 
 # Жёсткие проверки окружения
 missing_env = []
@@ -715,41 +735,50 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# TRIGGER WORKER (ручной запуск воркера через POST — оставлено на будущее)
+# TRIGGER WORKER (GET ?s=... либо POST с секретом)
 # -----------------------------------------------------------------------------
 async def trigger_worker() -> Tuple[bool, str]:
     """
-    Делает POST на Cloudflare Worker. Возвращает (ok, сообщение).
-    Заголовок X-Telegram-Bot-Api-Secret-Token берём из AICOIN_WORKER_SECRET
-    или, если пусто, из TELEGRAM_BOT_TOKEN_APPROVAL.
+    Пытаемся стартовать воркер.
+    1) Если задан PUBLIC_TRIGGER_SECRET — дергаем GET /tg/webhook?s=...
+    2) Иначе пробуем защищённый POST с X-Telegram-Bot-Api-Secret-Token.
     """
     if not AICOIN_WORKER_URL:
         return False, "AICOIN_WORKER_URL не задан."
-    try:
-        ts = int(datetime.now(TZ).timestamp())
-        payload = {
-            "update_id": ts,
-            "message": {
-                "message_id": ts,
-                "date": ts,
-                "chat": {"id": TELEGRAM_APPROVAL_CHAT_ID},
-                "text": "ping-from-approval-bot"
-            }
-        }
-        headers = {}
-        if AICOIN_WORKER_SECRET:
-            headers["X-Telegram-Bot-Api-Secret-Token"] = AICOIN_WORKER_SECRET
 
-        resp = await asyncio.to_thread(
-            requests.post,
-            AICOIN_WORKER_URL,
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
-        if 200 <= resp.status_code < 300:
-            return True, f"Воркер ответил {resp.status_code}"
-        return False, f"{resp.status_code}: {resp.text[:200]}"
+    try:
+        if PUBLIC_TRIGGER_SECRET:
+            resp = await asyncio.to_thread(
+                requests.get, AICOIN_WORKER_START_URL, timeout=10
+            )
+            if 200 <= resp.status_code < 300:
+                return True, f"GET {resp.status_code}"
+            return False, f"GET {resp.status_code}: {resp.text[:200]}"
+        else:
+            ts = int(datetime.now(TZ).timestamp())
+            payload = {
+                "update_id": ts,
+                "message": {
+                    "message_id": ts,
+                    "date": ts,
+                    "chat": {"id": TELEGRAM_APPROVAL_CHAT_ID},
+                    "text": "ping-from-approval-bot"
+                }
+            }
+            headers = {}
+            if AICOIN_WORKER_SECRET:
+                headers["X-Telegram-Bot-Api-Secret-Token"] = AICOIN_WORKER_SECRET
+
+            resp = await asyncio.to_thread(
+                requests.post,
+                AICOIN_WORKER_URL,
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+            if 200 <= resp.status_code < 300:
+                return True, f"POST {resp.status_code}"
+            return False, f"POST {resp.status_code}: {resp.text[:200]}"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
@@ -830,7 +859,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         # ВАЖНО: URL-кнопка (GET), т.к. после жёсткого выключения колбэки не работают
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Старт воркера", url=AICOIN_WORKER_URL)]
+            [InlineKeyboardButton("▶️ Старт воркера", url=AICOIN_WORKER_START_URL)]
         ])
         try:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=kb)
@@ -1025,7 +1054,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.debug(f"[message_handler:IN] {_dbg_where(update)} | {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
 
     # 0) Если включён форс-роутинг в планировщик — НИЧЕГО не делаем
-    #    (planner.py перехватит в group=0 и спросит время/текст по своему сценарию)
     if uid in ROUTE_TO_PLANNER:
         log.debug("[message_handler] Forced routed to planner -> skip")
         return
