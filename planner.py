@@ -30,6 +30,45 @@ def _lg(msg: str):
     log.info(f"PLNR> {msg}")
 
 # =========================
+# АКТОР/ЧАТ: нормализация uid и фильтр чата
+# =========================
+GROUP_ANON_UID = 1087968824   # Telegram GroupAnonymousBot (анонимный админ)
+TG_SERVICE_UID = 777000       # Telegram service
+
+_admin_env = os.getenv("APPROVAL_ADMIN_UID") or os.getenv("PLANNER_ADMIN_UID")
+try:
+    ADMIN_UID: Optional[int] = int(_admin_env) if _admin_env else None
+except Exception:
+    ADMIN_UID = None
+
+_chat_env = os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or os.getenv("PLANNER_APPROVAL_CHAT_ID")
+try:
+    APPROVAL_CHAT_ID: Optional[int] = int(_chat_env) if _chat_env else None
+except Exception:
+    APPROVAL_CHAT_ID = None
+
+def _norm_uid(raw_uid: int) -> int:
+    """Склеиваем анонимного админа/служебные uid с реальным админом (если задан)."""
+    if raw_uid in (GROUP_ANON_UID, TG_SERVICE_UID) and ADMIN_UID:
+        return ADMIN_UID
+    return raw_uid
+
+def _allowed_chat(update: Update) -> bool:
+    """Если задан APPROVAL_CHAT_ID — работаем только в этом чате."""
+    if APPROVAL_CHAT_ID is None:
+        return True
+    ch = update.effective_chat
+    return bool(ch and ch.id == APPROVAL_CHAT_ID)
+
+def _uid_from_update(update: Update) -> int:
+    u = update.effective_user
+    raw = u.id if u else (ADMIN_UID or 0)
+    return _norm_uid(raw)
+
+def _uid_from_q(q: CallbackQuery) -> int:
+    return _norm_uid(q.from_user.id)
+
+# =========================
 # ПАМЯТЬ СЕССИЙ ПЛАНИРОВЩИКА
 # =========================
 USER_STATE: Dict[int, Dict[str, Any]] = {}
@@ -276,9 +315,11 @@ async def _openai_usable() -> bool:
 # ОТКРЫТИЕ ПЛАНИРОВЩИКА
 # =========================
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     _db_init()
     q = update.callback_query
-    uid = update.effective_user.id
+    uid = _uid_from_update(update)
     USER_STATE.setdefault(uid, {"mode": "none", "items": [], "current": PlannedItem(), "seq": 0})
     _lg(f"open_planner uid={uid}")
     if q:
@@ -291,7 +332,7 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ПРОСЬБЫ/ШАГИ
 # =========================
 async def _ask_topic(q: CallbackQuery, mode: str):
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     st.mode = mode
     st.step = "waiting_topic"
@@ -305,7 +346,7 @@ async def _ask_topic(q: CallbackQuery, mode: str):
     )
 
 async def _ask_text(q: CallbackQuery):
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     st.mode = "gen"
     st.step = "waiting_text"
@@ -317,7 +358,7 @@ async def _ask_text(q: CallbackQuery):
     )
 
 async def _ask_time(q: CallbackQuery):
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     st.step = "waiting_time"
     _lg(f"ask_time via callback uid={uid} step={st.step} mode={st.mode}")
@@ -327,7 +368,7 @@ async def _ask_time(q: CallbackQuery):
     )
 
 async def _ask_time_via_msg(msg: Message):
-    uid = msg.from_user.id
+    uid = _norm_uid(msg.from_user.id)
     st = _ensure(uid)
     st.step = "waiting_time"
     _lg(f"ask_time via message uid={uid} step={st.step} mode={st.mode}")
@@ -338,7 +379,7 @@ async def _ask_time_via_msg(msg: Message):
     )
 
 async def _show_ready_add_cancel(q: CallbackQuery):
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     prefix = "PLAN_" if st.mode == "plan" else "GEN_"
     lines: List[str] = []
@@ -363,8 +404,10 @@ async def _show_ready_add_cancel(q: CallbackQuery):
 # CALLBACKS (режимы и список)
 # =========================
 async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    _lg(f"cb_open_plan_mode uid={q.from_user.id}")
+    _lg(f"cb_open_plan_mode uid={_uid_from_q(q)}")
     usable = await _openai_usable()
     if not usable:
         try:
@@ -377,7 +420,9 @@ async def cb_open_plan_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _ask_topic(q, mode="plan")
 
 async def cb_open_gen_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _lg(f"cb_open_gen_mode uid={update.callback_query.from_user.id}")
+    if not _allowed_chat(update):
+        return
+    _lg(f"cb_open_gen_mode uid={_uid_from_q(update.callback_query)}")
     await _ask_text(update.callback_query)
 
 def _format_item_row(i: int, it: Dict[str, Any]) -> str:
@@ -405,8 +450,10 @@ def _list_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     _lg(f"cb_list_today uid={uid}")
     items = USER_STATE.get(uid, {}).get("items", [])
     if not items:
@@ -420,8 +467,10 @@ async def cb_list_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ITEM MENU / EDIT / DELETE / TIME / AI_FILL / CLONE / AI_NEW_FROM
 # =========================
 async def cb_item_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -450,8 +499,10 @@ async def cb_item_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, "\n".join(lines), reply_markup=_item_actions_kb(pid, it["mode"]))
 
 async def cb_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -466,8 +517,10 @@ async def cb_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, f"Удалено #{pid}.", reply_markup=main_planner_menu())
 
 async def cb_edit_time_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -483,8 +536,10 @@ async def cb_edit_time_shortcut(update: Update, context: ContextTypes.DEFAULT_TY
     ]))
 
 async def cb_edit_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -496,8 +551,10 @@ async def cb_edit_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, "Что меняем?", reply_markup=_edit_fields_kb(pid, it["mode"]))
 
 async def cb_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         _, field, pid_s = q.data.split(":", 2)
         pid = int(pid_s)
@@ -539,8 +596,10 @@ async def cb_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, "Неизвестное поле.", reply_markup=main_planner_menu())
 
 async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -570,8 +629,10 @@ async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _safe_edit_or_send(q, "Не удалось сгенерировать текст ИИ.", reply_markup=_item_actions_kb(pid, it["mode"]))
 
 async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -605,8 +666,10 @@ async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _safe_edit_or_send(q, f"Создан клон #{nid} (сохр. тему/время).", reply_markup=_item_actions_kb(nid, it["mode"]))
 
 async def cb_ai_new_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     try:
         pid = int(q.data.split(":", 1)[1])
     except Exception:
@@ -653,8 +716,10 @@ async def cb_ai_new_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CALLBACKS (шаги завершения)
 # =========================
 async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     USER_STATE.setdefault(uid, {"items": [], "current": PlannedItem(), "seq": 0})
     USER_STATE[uid]["current"] = PlannedItem()
     USER_STATE[uid].pop("edit_target", None)
@@ -662,15 +727,17 @@ async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
 
 async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    _lg(f"back_main_menu uid={q.from_user.id}")
+    _lg(f"back_main_menu uid={_uid_from_q(q)}")
     await _safe_edit_or_send(
         q, "Открываю основное меню…",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Открыть основное меню", callback_data="cancel_to_main")]])
     )
 
 async def _finalize_current_and_back(q: CallbackQuery):
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     if _can_finalize(st):
         _lg(f"finalize uid={uid} mode={st.mode} time={st.time_str}")
@@ -681,14 +748,20 @@ async def _finalize_current_and_back(q: CallbackQuery):
         return await _safe_edit_or_send(q, "Нечего сохранять — заполни данные и время.", reply_markup=main_planner_menu())
 
 async def cb_plan_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     await _finalize_current_and_back(update.callback_query)
 
 async def cb_gen_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     await _finalize_current_and_back(update.callback_query)
 
 async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     st = _ensure(uid)
     if _can_finalize(st):
         _push(uid, st)
@@ -702,8 +775,10 @@ async def cb_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # AI build now (по кнопке)
 # =========================
 async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed_chat(update):
+        return
     q = update.callback_query
-    uid = q.from_user.id
+    uid = _uid_from_q(q)
     usable = await _openai_usable()
     _lg(f"ai_build_now uid={uid} openai_usable={usable}")
 
@@ -786,7 +861,9 @@ async def cb_plan_ai_build_now(update: Update, context: ContextTypes.DEFAULT_TYP
 # =========================
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перехватываем ввод только когда реально на шаге планировщика."""
-    uid = update.effective_user.id
+    if not _allowed_chat(update):
+        return
+    uid = _uid_from_update(update)
     st = _ensure(uid)
     active_steps = {
         "waiting_topic", "waiting_text", "waiting_time",
@@ -987,8 +1064,15 @@ def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_ai_new_from,       pattern="^AI_NEW_FROM:\\d+$", block=True),    group=0)
 
     # Пользовательский ввод на шагах/редактировании
+    chat_filter = filters.ALL
+    if APPROVAL_CHAT_ID is not None:
+        try:
+            chat_filter = filters.Chat(APPROVAL_CHAT_ID)
+        except Exception:
+            pass
+
     app.add_handler(
-        MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, on_user_message, block=True),
+        MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & chat_filter, on_user_message, block=True),
         group=0
     )
 
