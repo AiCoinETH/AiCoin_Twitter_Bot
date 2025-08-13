@@ -266,7 +266,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
-TW_MAX = 200
+TW_MAX = 200  # использовалось в старых превью — оставим для совместимости
 
 def twitter_len(s: str) -> int:
     if not s: return 0
@@ -313,6 +313,55 @@ def _dedup_hashtags(*tags_groups):
     for g in tags_groups: feed(g)
     return " ".join(out)
 
+# =========================
+#   СБОРКА ТЕКСТОВ
+# =========================
+def build_x_tweet_275(body_text: str, ai_hashtags=None) -> str:
+    """
+    Собирает твит: тело + обязательный хвост + (если влезут) теги.
+    Общий безопасный лимит 275 символов.
+    """
+    MAX_TWEET_SAFE = 275
+    tail_required = "🌐 https://getaicoin.com | 💬 @AiCoin_ETH"  # короткий хвост
+    tags_str = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
+
+    # полный хвост с тегами, если влезет
+    tail_full = (tail_required + (f" {tags_str}" if tags_str else "")).strip()
+    body = (body_text or "").strip()
+
+    def compose(b, t):
+        return f"{b} {t}".strip() if (b and t) else (b or t)
+
+    allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
+    if allowed_for_body < 0:
+        tail = tail_required
+        allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
+    else:
+        tail = tail_full
+
+    body_trimmed = trim_to_twitter_len(body, allowed_for_body)
+    tweet = compose(body_trimmed, tail)
+
+    while twitter_len(tweet) > MAX_TWEET_SAFE and body_trimmed:
+        body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
+        tweet = compose(body_trimmed, tail)
+
+    if twitter_len(tweet) > MAX_TWEET_SAFE:
+        tweet = tail_required  # крайний случай
+
+    return tweet
+
+def build_telegram_post_with_tail(body_text: str) -> str:
+    """
+    Телеграм: БЕЗ хэштегов. Обязательный хвост: сайт + X юзернейм.
+    """
+    tail = "🌐 https://getaicoin.com | X: @AiCoin_ETH"
+    body = trim_plain_to((body_text or "").strip(), 4000)  # TG лимит безопасно
+    if body:
+        return f"{body}\n\n{tail}"
+    return tail
+
+# Старые вспомогательные (оставлены на всякий случай совместимости)
 def compose_full_text_without_links(ai_text_en: str, ai_hashtags=None) -> str:
     body = trim_plain_to((ai_text_en or "").strip(), 666)
     tags = _dedup_hashtags(MY_HASHTAGS_STR, ai_hashtags or [])
@@ -337,13 +386,15 @@ def build_twitter_post(ai_text_en: str, ai_hashtags=None) -> str:
     return composed
 
 def build_telegram_post(ai_text_en: str, ai_hashtags=None) -> str:
+    # НЕ используется для публикации; оставлено для ранних превью
     return compose_full_text_without_links(ai_text_en, ai_hashtags)
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_twitter_post(ai_text_en, ai_hashtags)
 
 def build_telegram_preview(ai_text_en: str, ai_hashtags=None) -> str:
-    return build_telegram_post(ai_text_en, ai_hashtags)
+    # В предпросмотре теперь показываем реальный стиль Телеграма — без тегов + хвост
+    return build_telegram_post_with_tail(ai_text_en)
 
 # -----------------------------------------------------------------------------
 # GitHub helpers (хостинг изображений)
@@ -449,7 +500,8 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
     def is_valid_image_url(url):
         try:
             resp = requests.head(url, timeout=5)
-            return resp.headers.get('Content-Type', '').startswith('image/')
+            ct = resp.headers.get('Content-Type', '')
+            return isinstance(ct, str) and ct.startswith('image/')
         except Exception:
             return False
     try:
@@ -656,51 +708,10 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
     - хэштегов (MY_HASHTAGS_STR + ai_hashtags) с дедупликацией,
     - правил t.co (twitter_len считает URL как ~23 символа).
     """
-    MAX_TWEET_SAFE = 275
-
-    def build_tweet_with_tail(body_text: str, ai_tags):
-        # Обязательный хвост (короткий и читаемый)
-        tail_required = "🌐 https://getaicoin.com | 💬 @AiCoin_ETH"
-
-        # Дедуп базовых и динамических хэштегов
-        tags_str = _dedup_hashtags(MY_HASHTAGS_STR, ai_tags or [])
-
-        # Полный хвост: ссылки + (если влезут) хэштеги
-        tail_full = (tail_required + (f" {tags_str}" if tags_str else "")).strip()
-        body = (body_text or "").strip()
-
-        def compose(b, t):
-            return f"{b} {t}".strip() if (b and t) else (b or t)
-
-        # Пытаемся вместить всё
-        allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
-        if allowed_for_body < 0:
-            # Хэштеги не влезают — оставляем только обязательный хвост
-            tail = tail_required
-            allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
-        else:
-            tail = tail_full
-
-        # Режем тело под доступное место
-        body_trimmed = trim_to_twitter_len(body, allowed_for_body)
-        tweet = compose(body_trimmed, tail)
-
-        # Перестраховка: дожимаем, если всё ещё длинно
-        while twitter_len(tweet) > MAX_TWEET_SAFE and body_trimmed:
-            body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
-            tweet = compose(body_trimmed, tail)
-
-        # Крайний случай — оставить только обязательный хвост
-        if twitter_len(tweet) > MAX_TWEET_SAFE:
-            tweet = tail_required
-
-        return tweet
-
     github_filename = None
     try:
         media_ids = None
-        # Готовим финальный текст строго под 275 с хвостом и тегами
-        final_text = build_tweet_with_tail(text_en, ai_hashtags)
+        final_text = build_x_tweet_275(text_en, ai_hashtags)
 
         # --- Загрузка изображения через API v1 ---
         if image_url and str(image_url).startswith("http"):
@@ -760,6 +771,37 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
         ))
         if github_filename:
             delete_image_from_github(github_filename)
+        return False
+
+async def publish_post_to_telegram(text: str, image_url: str | None = None):
+    """
+    Публикация в Telegram-канал БЕЗ хэштегов, но с обязательным хвостом:
+    '🌐 https://getaicoin.com | X: @AiCoin_ETH'
+    """
+    try:
+        text_with_tail = build_telegram_post_with_tail(text)
+        if image_url:
+            await send_photo_with_download(
+                channel_bot,
+                TELEGRAM_CHANNEL_USERNAME_ID,
+                image_url,
+                caption=text_with_tail,
+                reply_markup=None
+            )
+        else:
+            await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=text_with_tail,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        return True
+    except Exception as e:
+        log.error(f"Ошибка публикации в Telegram: {e}")
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Telegram: {e}"
+        )
         return False
 
 # -----------------------------------------------------------------------------
@@ -824,10 +866,11 @@ def generate_post(topic_hint: str = "General invite and value."):
         text_en = post_data.get("text_en") or ""
         tags = post_data.get("ai_hashtags") or []
         img = post_data.get("image_url")
-        return build_telegram_post(text_en, tags), img
+        # Превью теперь телеграм-стиль (без тегов):
+        return build_telegram_post_with_tail(text_en), img
     else:
         text_en, tags, img = loop.run_until_complete(ai_generate_content_en(topic_hint))
-        return build_telegram_post(text_en, tags), img
+        return build_telegram_post_with_tail(text_en), img
 
 # -----------------------------------------------------------------------------
 # CALLBACKS / INPUT / FLOW
@@ -1028,8 +1071,9 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     ai_tags = post_data.get("ai_hashtags") or []
     img = post_data.get("image_url") or None
 
-    twitter_text = build_twitter_preview(base_text_en, ai_tags)
-    telegram_text = build_telegram_preview(base_text_en, ai_tags)
+    # Готовим КОНЕЧНЫЕ тексты
+    twitter_text = build_x_tweet_275(base_text_en, ai_tags)
+    telegram_text = build_telegram_post_with_tail(base_text_en)
 
     if do_not_disturb["active"]:
         log.debug("[publish_flow] DND active -> cancel")
@@ -1118,6 +1162,7 @@ async def on_start(app: Application):
     post_data["ai_hashtags"] = ai_tags
     post_data["image_url"] = img
 
+    # Предпросмотр в стиле Телеграма (без хэштегов)
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=post_data["image_url"], header="Предпросмотр")
     log.info("Бот запущен. Отправлен ЕДИНЫЙ запланированный предпросмотр. Планирование — в planner.py.")
 
