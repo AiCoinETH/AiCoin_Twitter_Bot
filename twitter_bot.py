@@ -296,12 +296,19 @@ def _dedup_hashtags(*tags_groups):
     return " ".join(out)
 
 # ---------- Хвосты ----------
-TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | TG:https://t.me/AiCoin_ETH"
-TG_LINKS_TAIL = "website: https://getaicoin.com | Twitter: https://x.com/AiCoin_ETH"
+# --- ХВОСТЫ ---
+
+# Для X: лучше сразу X-ссылку, как ты и хотел
+TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | X:https://x.com/AiCoin_ETH"
+
+# Для Telegram: HTML-хвост (без ведущих \n\n — добавим их в функции)
+TG_LINKS_TAIL_HTML = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/aicoin_eth">Twitter X</a>'
+
+from html import escape
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     """
-    Лимит 275. Хвост: сайт + @AiCoin_ETH + (если влезут) базовые/динамические хэштеги.
+    Лимит 275. Хвост: сайт + X + (если влезут) хэштеги.
     """
     MAX_TWEET_SAFE = 275
     tail_required = TW_TAIL_REQUIRED
@@ -334,15 +341,15 @@ def build_telegram_text_no_hashtags(ai_text_en: str) -> str:
     """Телеграм без хэштегов. Внизу кликабельные ссылки website | Twitter."""
     body = trim_plain_to((ai_text_en or "").strip(), 2000)
     if body:
-        return f"{body}\n\n{TG_LINKS_TAIL}"
-    return TG_LINKS_TAIL
+        # Экранируем HTML, чтобы не сломать разметку, и добавляем хвост
+        return f"{escape(body)}\n\n{TG_LINKS_TAIL_HTML}"
+    return TG_LINKS_TAIL_HTML
 
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_tweet_with_tail_275(ai_text_en, ai_hashtags or [])
 
 def build_telegram_preview(ai_text_en: str, _ai_hashtags_ignored=None) -> str:
     return build_telegram_text_no_hashtags(ai_text_en)
-
 # -----------------------------------------------------------------------------
 # GitHub helpers (хостинг изображений)
 # -----------------------------------------------------------------------------
