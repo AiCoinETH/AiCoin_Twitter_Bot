@@ -10,7 +10,7 @@ c меню действий, где есть кнопка «🗓 ИИ план �
   "website: https://getaicoin.com | Twitter: https://x.com/AiCoin_ETH".
 - Исправлена публикация в X/Twitter: корректные параметры Tweepy v2 (media / media_ids)
   с автоматическим фолбэком и безопасной обработкой ограничений доступа.
-- Добавлена publish_post_to_telegram (её раньше не было, но вызывалась).
+- Добавлена publish_post_to_telegram и возвращён message_handler.
 """
 
 import os
@@ -82,11 +82,8 @@ AICOIN_WORKER_URL = os.getenv(
     "AICOIN_WORKER_URL",
     "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
 )
-# Секрет для публичного GET-триггера (?s=...)
 PUBLIC_TRIGGER_SECRET = os.getenv("PUBLIC_TRIGGER_SECRET", "").strip()
-# РЕЗЕРВ, если ENV не подхватился
 FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
-# Старый секрет для заголовка X-Telegram-Bot-Api-Secret-Token (если понадобится POST):
 AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
 
 def _worker_url_with_secret() -> str:
@@ -139,8 +136,6 @@ OPENAI_QUOTA_WARNED = False
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND  = 600
 AUTO_SHUTDOWN_AFTER_SECONDS = 600
-
-DISABLE_WEB_PREVIEW = True
 
 # -----------------------------------------------------------------------------
 # ДЕФОЛТНЫЕ ДАННЫЕ ПОСТА
@@ -319,7 +314,6 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
 
     allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
     if allowed_for_body < 0:
-        # не влезают хэштеги — оставляем только обязательный хвост
         tail = tail_required
         allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
     else:
@@ -337,20 +331,16 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     return tweet
 
 def build_telegram_text_no_hashtags(ai_text_en: str) -> str:
-    """
-    Телеграм без хэштегов. Внизу кликабельные ссылки website | Twitter.
-    """
+    """Телеграм без хэштегов. Внизу кликабельные ссылки website | Twitter."""
     body = trim_plain_to((ai_text_en or "").strip(), 2000)
     if body:
         return f"{body}\n\n{TG_LINKS_TAIL}"
     return TG_LINKS_TAIL
 
-# ------ Превью/Компоновка ------
 def build_twitter_preview(ai_text_en: str, ai_hashtags=None) -> str:
     return build_tweet_with_tail_275(ai_text_en, ai_hashtags or [])
 
 def build_telegram_preview(ai_text_en: str, _ai_hashtags_ignored=None) -> str:
-    # Хештеги в Телеграм НЕ используются
     return build_telegram_text_no_hashtags(ai_text_en)
 
 # -----------------------------------------------------------------------------
@@ -437,7 +427,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text=text,
                 parse_mode="HTML",
-                disable_web_page_preview=False,  # ссылки кликабельные
+                disable_web_page_preview=False,
                 reply_markup=start_preview_keyboard()
             )
     except Exception as e:
@@ -617,11 +607,8 @@ except Exception as e:
 # Публикация: Telegram
 # -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text: str, image_url: Optional[str] = None) -> bool:
-    """
-    Публикуем в канал Telegram (без хэштегов; текст уже содержит хвост ссылок).
-    """
+    """Публикуем в канал Telegram (без хэштегов; текст уже содержит хвост ссылок)."""
     try:
-        # Если ссылка на картинку корректна — отправляем фото, иначе текст
         if image_url and image_url.startswith("http"):
             try:
                 r = requests.head(image_url, timeout=5)
@@ -636,7 +623,6 @@ async def publish_post_to_telegram(text: str, image_url: Optional[str] = None) -
                     return True
             except Exception:
                 pass
-        # Фолбэк: просто текст
         await channel_bot.send_message(
             chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
             text=text,
@@ -658,7 +644,6 @@ def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_si
         initial_size = os.path.getsize(path)
         if initial_size <= target_bytes:
             return True
-
         img = Image.open(path)
         img = img.convert("RGB")
         w, h = img.size
@@ -666,7 +651,6 @@ def _try_compress_image_inplace(path: str, target_bytes: int = 4_900_000, max_si
         if scale < 1.0:
             new_size = (int(w * scale), int(h * scale))
             img = img.resize(new_size, Image.LANCZOS)
-
         for q in (85, 80, 75, 70, 65, 60, 55, 50, 45, 40):
             tmp = path + ".tmp.jpg"
             img.save(tmp, format="JPEG", quality=q, optimize=True)
@@ -696,14 +680,13 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
     Публикация в X/Twitter.
     - Жёсткий лимит 275 с учётом хвоста (site + TG + базовые/динамические хэштеги).
     - Гибкая поддержка Tweepy v2: media={"media_ids": [...]} ИЛИ media_ids=[...].
-    - Если доступ к эндпоинтам ограничен (403/453) — отдаём понятное сообщение в апрув-чат.
+    - Если доступ к эндпоинтам ограничен (403/453) — отправляем понятное сообщение в апрув-чат.
     """
     github_filename = None
     try:
-        # Финальный текст
         final_text = build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
-        # --- Загрузка изображения через API v1 (media_upload) ---
+        # Загрузка картинки через v1.1 (media_upload)
         media_ids = None
         if image_url and str(image_url).startswith("http"):
             file_path = _download_to_temp_file(image_url)
@@ -734,22 +717,20 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
                     except Exception:
                         pass
 
-        # --- Публикация через v2 (user context) ---
-        # Попытка №1: современный параметр "media"
+        # Публикация через v2
         try:
             if media_ids:
                 twitter_client_v2.create_tweet(text=final_text, media={"media_ids": media_ids})
             else:
                 twitter_client_v2.create_tweet(text=final_text)
         except TypeError as e_wrong_sig:
-            # Старый tweepy: попробуем media_ids=[]
-            log.warning(f"Tweepy create_tweet сигнатура не приняла 'media': {e_wrong_sig} -> retry with media_ids")
+            # Старые версии Tweepy — поддержка media_ids=[]
+            log.warning(f"Tweepy v2 create_tweet не принял 'media': {e_wrong_sig} -> retry with media_ids")
             if media_ids:
                 twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
             else:
                 twitter_client_v2.create_tweet(text=final_text)
         except Exception as e_v2:
-            # Если v2 не доступен — пробуем v1.1 update_status, зная что он может быть закрыт на вашем тарифе.
             log.warning(f"API v2 не сработал, пробуем через API v1: {e_v2}")
             try:
                 if media_ids:
@@ -757,7 +738,6 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
                 else:
                     twitter_api_v1.update_status(status=final_text)
             except Exception as e_v1:
-                # Сообщаем понятнее про лимиты X API
                 msg = (
                     "❌ Публикация в X недоступна для текущего уровня доступа API.\n\n"
                     f"Ошибка v2: {e_v2}\nОшибка v1: {e_v1}\n\n"
@@ -767,13 +747,11 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
                 asyncio.create_task(
                     approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg)
                 )
-                # Если изображение было с GitHub — подчистим
                 if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
                     github_filename = image_url.split('/')[-1]
                     delete_image_from_github(github_filename)
                 return False
 
-        # Удаляем raw-файл из GitHub, если использовали его URL
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
@@ -794,11 +772,7 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
 # TRIGGER WORKER (возвращаем текст воркера)
 # -----------------------------------------------------------------------------
 async def trigger_worker() -> Tuple[bool, str]:
-    """
-    Запуск воркера.
-    Если есть секрет (из ENV или FALLBACK_PUBLIC_TRIGGER_SECRET) — используем GET ?s=...
-    иначе — пробуем старый POST с X-Telegram-Bot-Api-Secret-Token.
-    """
+    """Запуск воркера с секретом (?s=...) или POST с X-Telegram-Bot-Api-Secret-Token."""
     if not AICOIN_WORKER_URL:
         return False, "AICOIN_WORKER_URL не задан."
     try:
@@ -824,7 +798,6 @@ async def trigger_worker() -> Tuple[bool, str]:
             headers = {}
             if AICOIN_WORKER_SECRET:
                 headers["X-Telegram-Bot-Api-Secret-Token"] = AICOIN_WORKER_SECRET
-
             resp = await asyncio.to_thread(
                 requests.post,
                 AICOIN_WORKER_URL,
@@ -908,7 +881,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Следующий пост запланирован: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
             "Чтобы перезапустить обработчик вручную, нажмите «▶️ Старт воркера»."
         )
-        # URL-кнопка с секретом:
         start_url = _worker_url_with_secret()
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=start_url)]])
         try:
@@ -920,13 +892,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data in ("cancel_to_main", "BACK_MAIN_MENU"):
         ROUTE_TO_PLANNER.discard(uid)
-        log.debug(f"[callback_handler] Back to main; ROUTE_TO_PLANNER.discard({uid})")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
     if data == "self_post":
         ROUTE_TO_PLANNER.discard(uid)
-        log.debug("[callback_handler] self_post -> manual flow; ROUTE cleared")
         try:
             st = PLANNER_STATE.get(uid)
             if st:
@@ -948,7 +918,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "approve":
-        log.debug("[callback_handler] approve -> send_single_preview")
         await send_single_preview(
             post_data.get("text_en") or "",
             post_data.get("ai_hashtags") or [],
@@ -960,14 +929,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("post_twitter", "post_telegram", "post_both"):
         publish_tg = data in ("post_telegram", "post_both")
         publish_tw = data in ("post_twitter", "post_both")
-        log.debug(f"[callback_handler] publish_flow tg={publish_tg} tw={publish_tw}")
         await publish_flow(publish_tg=publish_tg, publish_tw=publish_tw)
         return
 
     if data == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
-        log.debug(f"[callback_handler] DND -> {status}")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
         return
 
@@ -975,7 +942,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.discard(uid)
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
-        log.debug("[callback_handler] end_day -> DND on & main menu")
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=f"🔚 Работа завершена на сегодня.\nСледующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML", reply_markup=get_start_menu())
@@ -989,17 +955,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text_msg)
         finally:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
-        log.debug(f"[callback_handler] start_worker -> {ok} {info}")
         return
-
-    log.debug(f"[callback_handler:OUT] unhandled data={data}")
 
 # --- Ручной ввод ---
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     uid = update.effective_user.id
-    log.debug(f"[handle_manual_input:IN] {_planner_snapshot(uid)} | {_route_snapshot(uid)}")
-
     pending_post["active"] = True
     pending_post["timer"] = datetime.now(TZ)
     pending_post["timeout"] = TIMER_PUBLISH_EXTEND
@@ -1013,7 +974,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             image_url = await process_telegram_photo(update.message.photo[-1].file_id, approval_bot)
         except Exception as e:
-            log.warning(f"handle_manual_input: cannot process photo: {e}")
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать фото. Пришлите ещё раз или только текст.")
             manual_expected_until = None
             return
@@ -1022,7 +982,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 image_url = await process_telegram_photo(update.message.document.file_id, approval_bot)
             except Exception as e:
-                log.warning(f"handle_manual_input: cannot process image document: {e}")
                 await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось обработать изображение-документ. Пришлите ещё раз или только текст.")
                 manual_expected_until = None
                 return
@@ -1039,12 +998,10 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             image_url=post_data["image_url"],
             header="Предпросмотр"
         )
-    except Exception as e:
-        log.error(f"handle_manual_input preview failed: {e}")
+    except Exception:
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="❌ Не удалось показать предпросмотр. Попробуйте снова.")
     finally:
         manual_expected_until = None
-        log.debug("[handle_manual_input:OUT] preview sent")
 
 # --- Публикация ---
 async def publish_flow(publish_tg: bool, publish_tw: bool):
@@ -1056,7 +1013,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     telegram_text = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
-        log.debug("[publish_flow] DND active -> cancel")
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "🌙 Режим «Не беспокоить» активен. Публикация отменена.")
         return
 
@@ -1084,8 +1040,46 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
-    log.debug(f"[publish_flow] result tg={tg_status} tw={tw_status}")
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
+
+# --- Маршрутизация сообщений ---
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единая точка входа для любых сообщений (текст/фото/док)."""
+    global last_button_pressed_at, manual_expected_until
+    uid = update.effective_user.id
+    now = datetime.now(TZ)
+    last_button_pressed_at = now
+
+    pending_post["active"] = True
+    pending_post["timer"] = now
+    pending_post["timeout"] = TIMER_PUBLISH_EXTEND
+    if pending_post.get("mode") == "placeholder":
+        pending_post["mode"] = "normal"
+
+    # Если пользователь в режиме планировщика — не перехватываем
+    try:
+        st = PLANNER_STATE.get(uid) or {}
+        cur = st.get("current")
+        cur_mode = getattr(cur, "mode", "none") if cur else "none"
+        cur_step = getattr(cur, "step", "idle") if cur else "idle"
+        if (cur_mode in ("plan", "gen", "edit")) or (cur_step in (
+            "waiting_topic", "waiting_text", "waiting_time",
+            "editing_time", "editing_text", "editing_topic", "editing_image"
+        )):
+            return
+    except Exception:
+        pass
+
+    # Если ожидается ручной ввод — обрабатываем
+    if manual_expected_until and now <= manual_expected_until:
+        return await handle_manual_input(update, context)
+
+    # Если принудительно маршрутизирован в планировщик — пропускаем
+    if uid in ROUTE_TO_PLANNER:
+        return
+
+    # По умолчанию — считаем, что это ручной ввод (текст/фото)
+    return await handle_manual_input(update, context)
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
