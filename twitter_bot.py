@@ -721,7 +721,7 @@ async def publish_post_to_telegram(text, image_url=None):
         return False
 
 # -----------------------------------------------------------------------------
-# TRIGGER WORKER
+# TRIGGER WORKER (исправлено: возвращаем текст воркера)
 # -----------------------------------------------------------------------------
 async def trigger_worker() -> Tuple[bool, str]:
     """
@@ -734,10 +734,11 @@ async def trigger_worker() -> Tuple[bool, str]:
     try:
         if PUBLIC_TRIGGER_SECRET:
             url = _worker_url_with_secret()
-            resp = await asyncio.to_thread(requests.get, url, timeout=10)
+            resp = await asyncio.to_thread(requests.get, url, timeout=20)
             if 200 <= resp.status_code < 300:
-                return True, f"Воркер ответил {resp.status_code}"
-            return False, f"{resp.status_code}: {resp.text[:200]}"
+                body = (resp.text or "").strip()
+                return True, (body or f"Воркер ответил {resp.status_code}")
+            return False, f"{resp.status_code}: {resp.text[:300]}"
         else:
             ts = int(datetime.now(TZ).timestamp())
             payload = {
@@ -758,11 +759,12 @@ async def trigger_worker() -> Tuple[bool, str]:
                 AICOIN_WORKER_URL,
                 json=payload,
                 headers=headers,
-                timeout=10
+                timeout=20
             )
             if 200 <= resp.status_code < 300:
-                return True, f"Воркер ответил {resp.status_code}"
-            return False, f"{resp.status_code}: {resp.text[:200]}"
+                body = (resp.text or "").strip()
+                return True, (body or f"Воркер ответил {resp.status_code}")
+            return False, f"{resp.status_code}: {resp.text[:300]}"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
@@ -911,8 +913,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "start_worker":
         ok, info = await trigger_worker()
         prefix = "✅ Запуск воркера: " if ok else "❌ Запуск воркера: "
+        text_msg = info if (ok and (info or "").strip().startswith("✅")) else (prefix + info)
         try:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=prefix + info)
+            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=text_msg)
         finally:
             await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         log.debug(f"[callback_handler] start_worker -> {ok} {info}")
