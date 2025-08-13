@@ -581,15 +581,23 @@ def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
                     TELEGRAM_APPROVAL_CHAT_ID,
                     "⚠️ В Twitter нечего публиковать: нет ни текста, ни картинки. Нажми «Старт воркера», чтобы перезапустить."
                 ))
-                return False
-            twitter_client_v2.create_tweet(text=final_text)
-            return True
+            else:
+                twitter_client_v2.create_tweet(text=final_text)
+                return True
+            return False
 
         # Твит с медиа (текст может быть пустым)
         try:
-            twitter_client_v2.create_tweet(text=(final_text if final_text else None), media={"media_ids": media_ids})
+            if final_text:
+                twitter_client_v2.create_tweet(text=final_text, media={"media_ids": media_ids})
+            else:
+                twitter_client_v2.create_tweet(media={"media_ids": media_ids})
         except TypeError:
-            twitter_client_v2.create_tweet(text=(final_text if final_text else None), media_ids=media_ids)
+            # Старый Tweepy: параметр media_ids
+            if final_text:
+                twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
+            else:
+                twitter_client_v2.create_tweet(media_ids=media_ids)
         return True
 
     except Exception as e:
@@ -773,8 +781,10 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     img = post_data.get("image_url") or None
+    ai_tags = post_data.get("ai_hashtags") or []
 
-    twitter_text = build_twitter_preview(base_text_en, post_data.get("ai_hashtags") or [])
+    # Строим итоговые строки только для дедупа/истории
+    twitter_text_final = build_twitter_preview(base_text_en, ai_tags)
     telegram_text = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
@@ -792,12 +802,13 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             if tg_status: await save_post_to_history(telegram_text, img)
 
     if publish_tw:
-        if await is_duplicate_post(twitter_text, img):
+        if await is_duplicate_post(twitter_text_final, img):
             await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
-            tw_status = publish_post_to_twitter(twitter_text, img, post_data.get("ai_hashtags") or [])
-            if tw_status: await save_post_to_history(twitter_text, img)
+            # В публикацию — СЫРОЙ текст; хвост/лимит применятся один раз внутри publish_post_to_twitter
+            tw_status = publish_post_to_twitter(base_text_en, img, ai_tags)
+            if tw_status: await save_post_to_history(twitter_text_final, img)
 
     if publish_tg:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram.")
