@@ -75,20 +75,25 @@ AICOIN_WORKER_URL = os.getenv(
     "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook"
 )
 # Секрет для публичного GET-триггера (?s=...)
+# Секрет из ENV (если процесс его видит)
 PUBLIC_TRIGGER_SECRET = os.getenv("PUBLIC_TRIGGER_SECRET", "").strip()
+
+# РЕЗЕРВ на случай, если ENV не подхватился (твой публичный триггер-секрет)
+FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
 
 # Старый секрет для заголовка X-Telegram-Bot-Api-Secret-Token (если потребуется POST):
 AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
 
 def _worker_url_with_secret() -> str:
-    """Прикручивает ?s=<PUBLIC_TRIGGER_SECRET> к URL воркера (если секрет задан)."""
+    """Всегда добавляет ?s=<секрет> к URL воркера (берёт из ENV или из fallback)."""
     base = AICOIN_WORKER_URL or ""
     if not base:
         return base
-    if PUBLIC_TRIGGER_SECRET:
-        sep = "&" if "?" in base else "?"
-        return f"{base}{sep}s={PUBLIC_TRIGGER_SECRET}"
-    return base
+    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
+    if not sec:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}s={sec}"
 
 # Жёсткие проверки окружения
 missing_env = []
@@ -643,21 +648,69 @@ def _download_to_temp_file(image_url: str) -> Optional[str]:
         log.warning(f"Не удалось скачать картинку для Twitter: {e}")
         return None
 
-def publish_post_to_twitter(text, image_url=None):
+def publish_post_to_twitter(text_en: str, image_url=None, ai_hashtags=None):
+    """
+    Публикация в X/Twitter. Общий лимит 275 символов с учётом:
+    - тела поста,
+    - обязательного хвоста (сайт + телеграм),
+    - хэштегов (MY_HASHTAGS_STR + ai_hashtags) с дедупликацией,
+    - правил t.co (twitter_len считает URL как ~23 символа).
+    """
+    MAX_TWEET_SAFE = 275
+
+    def build_tweet_with_tail(body_text: str, ai_tags):
+        # Обязательный хвост (короткий и читаемый)
+        tail_required = "🌐 https://getaicoin.com | 💬 @AiCoin_ETH"
+
+        # Дедуп базовых и динамических хэштегов
+        tags_str = _dedup_hashtags(MY_HASHTAGS_STR, ai_tags or [])
+
+        # Полный хвост: ссылки + (если влезут) хэштеги
+        tail_full = (tail_required + (f" {tags_str}" if tags_str else "")).strip()
+        body = (body_text or "").strip()
+
+        def compose(b, t):
+            return f"{b} {t}".strip() if (b and t) else (b or t)
+
+        # Пытаемся вместить всё
+        allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
+        if allowed_for_body < 0:
+            # Хэштеги не влезают — оставляем только обязательный хвост
+            tail = tail_required
+            allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
+        else:
+            tail = tail_full
+
+        # Режем тело под доступное место
+        body_trimmed = trim_to_twitter_len(body, allowed_for_body)
+        tweet = compose(body_trimmed, tail)
+
+        # Перестраховка: дожимаем, если всё ещё длинно
+        while twitter_len(tweet) > MAX_TWEET_SAFE and body_trimmed:
+            body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
+            tweet = compose(body_trimmed, tail)
+
+        # Крайний случай — оставить только обязательный хвост
+        if twitter_len(tweet) > MAX_TWEET_SAFE:
+            tweet = tail_required
+
+        return tweet
+
     github_filename = None
     try:
         media_ids = None
-        final_text = build_twitter_post(text, [])
+        # Готовим финальный текст строго под 275 с хвостом и тегами
+        final_text = build_tweet_with_tail(text_en, ai_hashtags)
 
+        # --- Загрузка изображения через API v1 ---
         if image_url and str(image_url).startswith("http"):
             file_path = _download_to_temp_file(image_url)
             if file_path:
                 ok = _try_compress_image_inplace(file_path)
                 if not ok:
-                    log.warning("Картинку не удалось сжать до лимита — публикуем твит без изображений.")
+                    log.warning("Картинку не удалось сжать до лимита — публикуем твит без изображения.")
                     os.remove(file_path)
                     file_path = None
-
             if file_path:
                 try:
                     media = twitter_api_v1.media_upload(filename=file_path)
@@ -679,45 +732,34 @@ def publish_post_to_twitter(text, image_url=None):
                     except Exception:
                         pass
 
-        twitter_client_v2.create_tweet(text=final_text, media_ids=media_ids)
+        # --- Публикация: v2 с фолбэком на v1 ---
+        try:
+            if media_ids:
+                twitter_client_v2.create_tweet(text=final_text, media={"media_ids": media_ids})
+            else:
+                twitter_client_v2.create_tweet(text=final_text)
+        except Exception as e_v2:
+            log.warning(f"API v2 не сработал, пробуем через API v1: {e_v2}")
+            if media_ids:
+                twitter_api_v1.update_status(status=final_text, media_ids=media_ids)
+            else:
+                twitter_api_v1.update_status(status=final_text)
 
+        # Удаляем raw-файл из GitHub, если использовали его URL
         if image_url and image_url.startswith(f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/"):
             github_filename = image_url.split('/')[-1]
             delete_image_from_github(github_filename)
+
         return True
 
     except Exception as e:
         log.error(f"Ошибка публикации в Twitter: {e}")
-        asyncio.create_task(approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"❌ Ошибка при публикации в Twitter: {e}"))
+        asyncio.create_task(approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"❌ Ошибка при публикации в Twitter: {e}"
+        ))
         if github_filename:
             delete_image_from_github(github_filename)
-        return False
-
-async def publish_post_to_telegram(text, image_url=None):
-    try:
-        text_with_signature = (text or "")
-        if image_url:
-            await send_photo_with_download(
-                channel_bot,
-                TELEGRAM_CHANNEL_USERNAME_ID,
-                image_url,
-                caption=text_with_signature,
-                reply_markup=None
-            )
-        else:
-            await channel_bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                text=text_with_signature,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-        return True
-    except Exception as e:
-        log.error(f"Ошибка публикации в Telegram: {e}")
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"❌ Ошибка при публикации в Telegram: {e}"
-        )
         return False
 
 # -----------------------------------------------------------------------------
@@ -726,13 +768,17 @@ async def publish_post_to_telegram(text, image_url=None):
 async def trigger_worker() -> Tuple[bool, str]:
     """
     Запуск воркера.
-    Если задан PUBLIC_TRIGGER_SECRET — используем GET ?s=...
+    Если есть секрет (из ENV или FALLBACK_PUBLIC_TRIGGER_SECRET) — используем GET ?s=...
     иначе — пробуем старый POST с X-Telegram-Bot-Api-Secret-Token.
     """
     if not AICOIN_WORKER_URL:
         return False, "AICOIN_WORKER_URL не задан."
     try:
-        if PUBLIC_TRIGGER_SECRET:
+        # берём секрет из ENV или из резервной константы
+        sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
+
+        if sec:
+            # всегда добавляем ?s=секрет
             url = _worker_url_with_secret()
             resp = await asyncio.to_thread(requests.get, url, timeout=20)
             if 200 <= resp.status_code < 300:
@@ -740,6 +786,7 @@ async def trigger_worker() -> Tuple[bool, str]:
                 return True, (body or f"Воркер ответил {resp.status_code}")
             return False, f"{resp.status_code}: {resp.text[:300]}"
         else:
+            # Резервный путь через POST (если вдруг нет секрета вообще)
             ts = int(datetime.now(TZ).timestamp())
             payload = {
                 "update_id": ts,
