@@ -296,7 +296,7 @@ def _dedup_hashtags(*tags_groups):
     return " ".join(out)
 
 # ---------- Хвосты ----------
-TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 💬 @AiCoin_ETH"
+TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | TG:https://t.me/AiCoin_ETH"
 TG_LINKS_TAIL = "website: https://getaicoin.com | Twitter: https://x.com/AiCoin_ETH"
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
