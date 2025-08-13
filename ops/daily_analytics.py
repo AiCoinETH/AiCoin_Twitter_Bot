@@ -22,13 +22,11 @@ try:
 except Exception:
     SNS_OK = False
 
-# ------------------ ENV ------------------
-TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
-CHAT_ID     = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")   # -100... или @username
-BOT_USERNAME= os.getenv("TELEGRAM_BOT_USERNAME")       # без @, для deeplink
-
-if not TOKEN or not CHAT_ID or not BOT_USERNAME:
-    raise SystemExit("Set TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_BOT_USERNAME")
+# ------------------ ENV (тестовые значения) ------------------
+TOKEN        = "8326777624:AAG_Owp9T4zsFryttparUnqjqtrVhpHR_LQ"
+CHAT_ID      = "-1002892475684"   # канал
+BOT_USERNAME = "AiCoinBot"        # без @, для deeplink
+APPROVAL_USER_ID = "6105016521"   # твой Telegram ID (на будущее)
 
 # ------------------ НАСТРОЙКИ ------------------
 SEARCH_TERMS = ["Ai Coin", "AI crypto", "blockchain AI", "$Ai"]
@@ -129,7 +127,6 @@ def twitter_domains_and_tags(country_label: str, limit=TW_SAMPLE) -> tuple[list[
 def build_message_and_buttons():
     now_kyiv = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
     countries = trends_top_countries()
-    # возьмём первые 3 уникальных по ISO2
     picked, seen = [], set()
     for name, iso2, score in countries:
         if iso2 in seen: continue
@@ -152,14 +149,8 @@ def build_message_and_buttons():
         for idx, (country, iso2, score) in enumerate(picked, 1):
             flag = _flag(iso2)
             local_now, tzkey = _local_time_label(iso2)
-
-            # Google related queries / домены
             top_queries, rq_domains = related_queries_top(iso2)
-
-            # Twitter: домены и хэштеги
             tw_domains, tw_tags = twitter_domains_and_tags(country)
-
-            # Объединённые домены (обрежем до 3–4)
             seen_d, domains = set(), []
             for d in (rq_domains + tw_domains):
                 if d in seen_d: continue
@@ -170,13 +161,12 @@ def build_message_and_buttons():
             block = textwrap.dedent(f"""\
                 {idx}️⃣ {flag} <b>{country}</b>
                 🕒 Локальное время сейчас: {local_now} [{tzkey}]
-                📈 Топ‑3 темы (Google): {(' · '.join(top_queries) if top_queries else '—')}
+                📈 Топ-3 темы (Google): {(' · '.join(top_queries) if top_queries else '—')}
                 🌐 Часто встречающиеся сайты: {', '.join(domains[:3])}
                 🏷️ Хэштеги X: {(' '.join(tw_tags[:3]) if tw_tags else '#AiCoin #AI #crypto')}
             """).rstrip()
             lines.append(block)
 
-            # Кнопка копирования через deeplink в ЛС
             deeplink = f"https://t.me/{BOT_USERNAME}?start=copy_{iso2}"
             buttons.append([InlineKeyboardButton(f"📋 Копировать — {country}", url=deeplink)])
 
