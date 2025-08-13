@@ -1,57 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-Ежедневная аналитика (RU) для канала согласования:
-- Google Trends: топ-3 страны по ключам (now 7-d)
-- Для каждой страны: топ-3 related queries, домены (из queries и твитов), топ хэштеги X
-- Кнопки "📋 Копировать — <страна>" -> deeplink в ЛС бота /start copy_<ISO2>
+Ежедневная аналитика (RU) для канала согласования — ОТ ЗАПРОСА К СТРАНАМ
+Для КАЖДОГО поискового запроса:
+  • Google Trends: топ-страны (now 7-d) по этому запросу
+  • Для каждой страны: топ-3 related queries (по этому запросу), свежие хэштеги X
+  • Внизу: кнопки «📋 Копировать — <запрос>/<страна>» (deeplink в ЛС бота /start copy_<ISO2>_<slug>)
 
 Зависимости: pytrends, snscrape, python-telegram-bot==21.*, pycountry
 """
 
-import os, re, textwrap, ssl, warnings, asyncio
+import os, re, textwrap, asyncio
 from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-# --- SSL workaround для GitHub Actions / snscrape (небезопасно, но нужно для тестов) ---
-try:
-    ssl._create_default_https_context = ssl._create_unverified_context  # noqa: SLF001
-except Exception:
-    pass
-warnings.filterwarnings("ignore", message=".*certificate verify failed.*", category=UserWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from pytrends.request import TrendReq
 import pycountry
 
+# snscrape (X/Twitter) — опционально
 try:
     import snscrape.modules.twitter as sntwitter
     SNS_OK = True
 except Exception:
     SNS_OK = False
 
-# ------------------ ENV (тестовые значения — по твоей просьбе) ------------------
-TOKEN        = "8326777624:AAG_Owp9T4zsFryttparUnqjqtrVhpHR_LQ"
-CHAT_ID      = "-1002892475684"    # канал согласования
-BOT_USERNAME = "AiCoinBot"         # без @, для deeplink
-APPROVAL_USER_ID = "6105016521"    # твой Telegram ID (на будущее)
+# ------------------ ENV ------------------
+TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+CHAT_ID      = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")       # -100... или @username
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME") or ""     # без @, для deeplink (если есть)
+
+if not TOKEN or not CHAT_ID:
+    raise SystemExit("Set TELEGRAM_BOT_TOKEN_APPROVAL and TELEGRAM_APPROVAL_CHAT_ID")
 
 # ------------------ НАСТРОЙКИ ------------------
-SEARCH_TERMS = ["Ai Coin", "AI crypto", "blockchain AI", "$Ai"]
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
-MAX_COUNTRIES = 3
-TOP_N_QUERIES = 3
-TW_SAMPLE = 180  # сколько твитов сэмплировать максимум
+# ключи, по которым строим аналитику
+SEARCH_TERMS = [
+    "Ai Coin",
+    "AI crypto",
+    "blockchain AI",
+    "$Ai",
+]
 
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# Сколько стран показывать на каждый запрос
+TOP_COUNTRIES_PER_TERM = 3
+# Сколько related queries на страну/запрос
+TOP_RELATED_QUERIES = 3
+# Ограничение по твитам на страну/запрос (для выборки хэштегов)
+TW_SAMPLE = 150
+
+# регэксп для доменов (если когда-то решим вернуть домены из текста)
 DOMAIN_RE = re.compile(r"(?:https?://)?([a-z0-9\-]+\.[a-z\.]{2,})(?:/|$)", re.I)
 
-def _extract_domains(text: str) -> list[str]:
-    return [m.group(1).lower() for m in DOMAIN_RE.finditer(text or "")]
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 def _iso2_from_name(name: str) -> str | None:
     try:
-        if name == "United States": name = "United States of America"
+        if name == "United States":  # pycountry нюанс
+            name = "United States of America"
         return pycountry.countries.lookup(name).alpha_2
     except Exception:
         return None
@@ -72,148 +81,146 @@ def _local_time_label(iso2: str) -> tuple[str, str]:
     now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
     return now_local, tz.key
 
-# ---------------- Безопасные вызовы ----------------
-def _safe(callable_, default):
-    try:
-        return callable_()
-    except Exception:
-        return default
+# -------------- Google Trends: топ стран для КОНКРЕТНОГО запроса --------------
+def trends_top_countries_for_term(term: str, top_n: int) -> list[tuple[str, str, int]]:
+    """
+    Возвращает [(country_name, iso2, score), ...] для одного поискового запроса.
+    """
+    py = TrendReq(hl='en-US', tz=0)
+    # payload строим на ОДНОМ запросе, а не на списке
+    py.build_payload([term], timeframe='now 7-d', geo='')
+    df = py.interest_by_region(resolution='COUNTRY', inc_low_vol=True)
+    if df.empty:
+        return []
+    # в df будет столбец с именем term
+    series = df[term].fillna(0).astype(int).sort_values(ascending=False)
+    out = []
+    for country_name, score in series.head(10).items():
+        iso2 = _iso2_from_name(country_name)
+        if not iso2: 
+            continue
+        out.append((country_name, iso2, int(score)))
+        if len(out) >= top_n:
+            break
+    return out
 
-# ---------------- Google Trends ----------------
-def trends_top_countries() -> list[tuple[str, str, int]]:
-    def _inner():
-        py = TrendReq(hl='en-US', tz=0)
-        py.build_payload(SEARCH_TERMS, timeframe='now 7-d', geo='')
-        df = py.interest_by_region(resolution='COUNTRY', inc_low_vol=True)
-        if df.empty:
-            return []
-        df['score'] = df.sum(axis=1)
-        df = df[df['score'] > 0].sort_values('score', ascending=False)
-        out = []
-        for name, score in df['score'].head(10).items():
-            iso2 = _iso2_from_name(name)
-            if iso2:
-                out.append((name, iso2, int(score)))
-            if len(out) >= 6:
-                break
-        return out
-    return _safe(_inner, [])
+# -------------- Google Trends: related queries для (term, country) --------------
+def related_queries_top_for(term: str, iso2: str, top_k: int) -> list[str]:
+    """
+    Возвращает ТОЛЬКО связанные запросы для конкретного (term, iso2)
+    """
+    py = TrendReq(hl='en-US', tz=0)
+    py.build_payload([term], timeframe='now 7-d', geo=iso2)
+    rq = py.related_queries() or {}
+    # структура: {'<term>': {'top': df|None, 'rising': df|None}}
+    pack = rq.get(term) or {}
+    items = []
+    for kind in ("top", "rising"):
+        df = pack.get(kind)
+        if df is None or df.empty:
+            continue
+        for _, row in df.head(10).iterrows():
+            q = (row.get('query') or '').strip()
+            v = int(row.get('value') or 0)
+            if q:
+                items.append((q, v))
+    if not items:
+        return []
+    # агрегируем одинаковые query
+    agg = Counter()
+    for q, v in items:
+        agg[q] += v
+    return [q for q, _ in agg.most_common(top_k)]
 
-def related_queries_top(iso2: str, top_n: int = TOP_N_QUERIES) -> tuple[list[str], list[str]]:
-    def _inner():
-        py = TrendReq(hl='en-US', tz=0)
-        py.build_payload(SEARCH_TERMS, timeframe='now 7-d', geo=iso2)
-        rq = py.related_queries()
-        q_counter = Counter()
-        d_counter = Counter()
-        for _, data in (rq or {}).items():
-            if not data: continue
-            for kind in ("rising", "top"):
-                df = data.get(kind)
-                if df is None: continue
-                for _, row in df.head(12).iterrows():
-                    q = str(row.get('query') or '').strip()
-                    if not q: continue
-                    q_counter[q] += int(row.get('value') or 0)
-                    for d in _extract_domains(q):
-                        d_counter[d] += 1
-        top_queries = [q for q,_ in q_counter.most_common(top_n)]
-        top_domains = [d for d,_ in d_counter.most_common(5)]
-        return top_queries, top_domains
-    return _safe(_inner, ([], []))
-
-# ---------------- Twitter (snscrape) ----------------
-def twitter_domains_and_tags(country_label: str, limit=TW_SAMPLE) -> tuple[list[str], list[str]]:
+# -------------- Twitter (snscrape): хэштеги для (term, country) --------------
+def twitter_tags_for(term: str, country_label: str, limit=TW_SAMPLE) -> list[str]:
     if not SNS_OK:
-        return [], []
-    def _inner():
-        query = f'("Ai Coin" OR "AI crypto" OR "blockchain AI" OR "$Ai") {country_label} since:{(datetime.utcnow()-timedelta(days=1)).date()}'
-        domains = Counter()
-        tags = Counter()
+        return []
+    # свежий суточный срез по термину + названию страны
+    since = (datetime.utcnow() - timedelta(days=1)).date()
+    query = f'"{term}" {country_label} since:{since}'
+    tags = Counter()
+    try:
         for i, tw in enumerate(sntwitter.TwitterSearchScraper(query).get_items()):
-            if i >= limit: break
-            for d in _extract_domains(getattr(tw, "content", "")):
-                domains[d] += 1
+            if i >= limit:
+                break
             for tag in (getattr(tw, "hashtags", []) or []):
                 t = str(tag).lower().lstrip("#")
-                if t: tags[t] += 1
-        return [d for d,_ in domains.most_common(6)], [f"#{t}" for t,_ in tags.most_common(6)]
-    return _safe(_inner, ([], []))
+                if t:
+                    tags[t] += 1
+    except Exception:
+        # если у snscrape проблемы с SSL/доступом — возвращаем пусто
+        return []
+    return [f"#{t}" for t, _ in tags.most_common(6)]
 
-# ---------------- Формирование текста и кнопок ----------------
-def build_message_and_buttons():
+# -------------- Текст и кнопки --------------
+def build_message_and_buttons() -> tuple[str, InlineKeyboardMarkup | None]:
     now_kyiv = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
-    countries = trends_top_countries()
 
-    # возьмём первые 3 уникальных по ISO2
-    picked, seen = [], set()
-    for name, iso2, score in countries:
-        if iso2 in seen: continue
-        picked.append((name, iso2, score))
-        seen.add(iso2)
-        if len(picked) >= MAX_COUNTRIES: break
-
-    lines = [
-        f"📊 <b>Ежедневная аналитика трендов</b>",
+    lines: list[str] = [
+        "📊 <b>Ежедневная аналитика трендов</b>",
         f"🕒 Время анализа: {now_kyiv} (Киев)",
-        f"🔎 Источники: Google Trends + Twitter (snscrape)",
-        f"💡 Тема: {', '.join(SEARCH_TERMS)}",
-        ""
+        "🔎 Источники: Google Trends + Twitter (snscrape)",
+        "",
     ]
-    buttons = []
+    buttons: list[list[InlineKeyboardButton]] = []
 
-    if not picked:
-        lines.append("Данных по странам нет сегодня.")
-    else:
-        for idx, (country, iso2, score) in enumerate(picked, 1):
+    for term in SEARCH_TERMS:
+        lines.append(f"📌 <b>Запрос</b>: {term}")
+        countries = trends_top_countries_for_term(term, TOP_COUNTRIES_PER_TERM)
+
+        if not countries:
+            lines.append("— нет данных по странам за 7 дней\n")
+            continue
+
+        for (country_name, iso2, score) in countries:
             flag = _flag(iso2)
             local_now, tzkey = _local_time_label(iso2)
 
-            top_queries, rq_domains = related_queries_top(iso2)
-            tw_domains, tw_tags = twitter_domains_and_tags(country)
-
-            # Объединяем домены (из Trends и Twitter), убираем повторы
-            seen_d, domains = set(), []
-            for d in (rq_domains + tw_domains):
-                if d in seen_d: continue
-                seen_d.add(d); domains.append(d)
-            if not domains:
-                domains = ["getaicoin.com"]
+            rel_q = related_queries_top_for(term, iso2, TOP_RELATED_QUERIES)
+            tags  = twitter_tags_for(term, country_name)
 
             block = textwrap.dedent(f"""\
-                {idx}️⃣ {flag} <b>{country}</b>
-                🕒 Локальное время сейчас: {local_now} [{tzkey}]
-                📈 Топ‑3 темы (Google): {(' · '.join(top_queries) if top_queries else '—')}
-                🌐 Часто встречающиеся сайты: {', '.join(domains[:3])}
-                🏷️ Хэштеги X: {(' '.join(tw_tags[:3]) if tw_tags else '#AiCoin #AI #crypto')}
+                {flag} <b>{country_name}</b> · score {score}
+                🕒 Сейчас: {local_now} [{tzkey}]
+                📈 Related (Google): {(' · '.join(rel_q) if rel_q else '—')}
+                🏷️ Хэштеги X: {(' '.join(tags[:3]) if tags else '—')}
             """).rstrip()
             lines.append(block)
 
             if BOT_USERNAME:
-                deeplink = f"https://t.me/{BOT_USERNAME}?start=copy_{iso2}"
-                buttons.append([InlineKeyboardButton(f"📋 Копировать — {country}", url=deeplink)])
+                deeplink = f"https://t.me/{BOT_USERNAME}?start=copy_{iso2}_{_slug(term)}"
+                buttons.append([InlineKeyboardButton(f"📋 Копировать — {country_name} / {term}", url=deeplink)])
 
-    text = "\n\n".join(lines)
+        lines.append("")  # пустая строка между запросами
+
+    text = "\n".join(lines).strip()
     kb = InlineKeyboardMarkup(buttons) if buttons else None
     return text, kb
 
-# ---------------- Отправка (асинхронная) ----------------
+# -------------- Отправка (разбиение на части, if needed) --------------
 async def _send_long(bot: Bot, chat_id: str, text: str, **kw):
     LIMIT = 3900  # запас под HTML-теги
     if len(text) <= LIMIT:
         await bot.send_message(chat_id=chat_id, text=text, **kw)
         return
-    parts = []
-    cur = ""
+    chunk = []
+    total = 0
+    parts: list[str] = []
     for line in text.splitlines(True):
-        if len(cur) + len(line) > LIMIT:
-            parts.append(cur)
-            cur = line
+        if total + len(line) > LIMIT:
+            parts.append("".join(chunk))
+            chunk, total = [line], len(line)
         else:
-            cur += line
-    if cur: parts.append(cur)
+            chunk.append(line); total += len(line)
+    if chunk:
+        parts.append("".join(chunk))
     for i, p in enumerate(parts):
-        await bot.send_message(chat_id=chat_id, text=p, **kw if i == 0 else {k:v for k,v in kw.items() if k != "reply_markup"})
+        await bot.send_message(
+            chat_id=chat_id,
+            text=p,
+            **(kw if i == 0 else {k:v for k,v in kw.items() if k != "reply_markup"})
+        )
 
 async def amain():
     bot = Bot(token=TOKEN)
