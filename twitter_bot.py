@@ -129,19 +129,14 @@ def get_twitter_clients():
         access_token=TWITTER_ACCESS_TOKEN,
         access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
     )
+
     api_v1 = tweepy.API(
         tweepy.OAuth1UserHandler(
             TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET
         )
     )
-        return client_v2, api_v1
 
-twitter_client_v2, twitter_api_v1 = get_twitter_clients()
-
-# GitHub (для предпросмотра изображений из TG)
-github_client = Github(GITHUB_TOKEN)
-github_repo = github_client.get_repo(GITHUB_REPO)
-
+    return client_v2, api_v1
 # -----------------------------------------------------------------------------
 # СТЕЙТ
 # -----------------------------------------------------------------------------
