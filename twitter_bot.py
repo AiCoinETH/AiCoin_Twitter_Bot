@@ -1048,6 +1048,17 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"⚠️ Ошибка: {context.error}"
+        )
+    except Exception:
+        pass
+
 def main():
     app = (
         Application.builder()
