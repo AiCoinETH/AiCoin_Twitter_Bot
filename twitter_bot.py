@@ -173,26 +173,19 @@ _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 
 def twitter_len(s: str) -> int:
-    if not s: return 0
+    if not s:
+        return 0
     s = normalize("NFC", s)
-        return len(_URL_RE.sub('X' * _TCO_LEN, s))
+    return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_plain_to(s: str, max_len: int) -> str:
-    if not s: return s
+    if not s:
+        return s
     s = normalize("NFC", s).strip()
-    if len(s) <= max_len: return s
+    if len(s) <= max_len:
+        return s
     ell = '…'
-        return (s[: max_len - len(ell)] + ell).rstrip()
-
-def trim_to_twitter_len(s: str, max_len: int) -> str:
-    if not s: return s
-    s = normalize("NFC", s).strip()
-    if twitter_len(s) <= max_len: return s
-    ell = '…'
-    while s and twitter_len(s + ell) > max_len:
-        s = s[:-1]
-        return (s + ell).rstrip()
-
+    return (s[: max_len - len(ell)] + ell).rstrip()
 def _dedup_hashtags(*groups):
     seen, out = set(), []
     def norm(t: str) -> str:
