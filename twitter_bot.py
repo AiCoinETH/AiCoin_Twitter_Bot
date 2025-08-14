@@ -774,6 +774,11 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CALLBACKS / INPUT
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Универсальная проверка на планировщик
+    if uid in ROUTE_TO_PLANNER:
+        await _route_to_planner(update, context)
+        return
+
     global last_button_pressed_at, last_action_time, manual_expected_until
     try:
         q = update.callback_query
