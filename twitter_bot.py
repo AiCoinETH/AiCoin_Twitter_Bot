@@ -776,7 +776,7 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Универсальная проверка на планировщик
     uid = update.effective_user.id
-    if uid in ROUTE_TO_PLANNER:
+    if uid in ROUTE_TO_PLANNER and data not in {"shutdown_bot"}:
         await _route_to_planner(update, context)
         return
 
@@ -803,6 +803,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
         if data == "show_day_plan" or planner_any or planner_exit:
+            # Сбрасываем флаг маршрутизации при выходе из планировщика
+            if planner_exit or data == "BACK_MAIN_MENU":
+                ROUTE_TO_PLANNER.discard(uid)
+                await approval_bot.send_message(
+                    chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="Главное меню:",
+                    reply_markup=get_start_menu()
+                )
             ROUTE_TO_PLANNER.add(uid)
             await _route_to_planner(update, context)
             if planner_exit or data == "BACK_MAIN_MENU":
