@@ -134,7 +134,7 @@ def get_twitter_clients():
             TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET
         )
     )
-    return client_v2, api_v1
+        return client_v2, api_v1
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
@@ -180,14 +180,14 @@ MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 def twitter_len(s: str) -> int:
     if not s: return 0
     s = normalize("NFC", s)
-    return len(_URL_RE.sub('X' * _TCO_LEN, s))
+        return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_plain_to(s: str, max_len: int) -> str:
     if not s: return s
     s = normalize("NFC", s).strip()
     if len(s) <= max_len: return s
     ell = '…'
-    return (s[: max_len - len(ell)] + ell).rstrip()
+        return (s[: max_len - len(ell)] + ell).rstrip()
 
 def trim_to_twitter_len(s: str, max_len: int) -> str:
     if not s: return s
@@ -196,7 +196,7 @@ def trim_to_twitter_len(s: str, max_len: int) -> str:
     ell = '…'
     while s and twitter_len(s + ell) > max_len:
         s = s[:-1]
-    return (s + ell).rstrip()
+        return (s + ell).rstrip()
 
 def _dedup_hashtags(*groups):
     seen, out = set(), []
@@ -218,7 +218,7 @@ def _dedup_hashtags(*groups):
             key = tag.lower()
             if key in seen: continue
             seen.add(key); out.append(tag)
-    return " ".join(out)
+        return " ".join(out)
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     MAX_TWEET_SAFE = 275
@@ -243,10 +243,10 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
         tweet = compose(body_trimmed, tail)
     if twitter_len(tweet) > MAX_TWEET_SAFE:
         tweet = tail_required
-    return tweet
+        return tweet
 
 def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
-    return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
+        return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
 # -----------------------------------------------------------------------------
 # TG: гарантированный хвост в финале публикации
@@ -255,7 +255,7 @@ TG_CAPTION_MAX = 1024
 TG_TEXT_MAX = 4096
 
 def _has_tail(html_text_lower: str) -> bool:
-    return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
+        return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
 
 def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
     body_raw = (body_text or "").strip()
@@ -275,10 +275,10 @@ def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
 
     if len(current_full) > limit:
         current_full = current_full[:limit].rstrip()
-    return current_full
+        return current_full
 
 def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
-    return build_tg_final(text_en, for_photo_caption=False)
+        return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
 # GitHub helpers (для предпросмотра TG‑фото)
@@ -340,7 +340,7 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
 async def save_image_and_get_github_url(image_path):
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
-    return url, filename
+        return url, filename
 
 async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     file_path = await download_image_async(file_id, is_telegram_file=True, bot=bot)
@@ -351,7 +351,7 @@ async def process_telegram_photo(file_id: str, bot: Bot) -> str:
         pass
     if not url:
         raise Exception("Не удалось загрузить фото на GitHub")
-    return url
+        return url
 
 # -----------------------------------------------------------------------------
 # БД истории (дедуп по тексту+медиа)
@@ -377,11 +377,11 @@ async def init_db():
 
 def normalize_text_for_hashing(text: str) -> str:
     if not text: return ""
-    return " ".join(text.strip().lower().split())
+        return " ".join(text.strip().lower().split())
 
 def sha256_hex(data: bytes) -> str:
     import hashlib as _h
-    return _h.sha256(data).hexdigest()
+        return _h.sha256(data).hexdigest()
 
 async def compute_media_hash_from_state() -> Optional[str]:
     """Считает хэш текущего медиа (image/video), если есть. Для TG скачиваем файл временно."""
@@ -464,7 +464,7 @@ async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optio
 
     # Без дефолтного media
     image_url = None
-    return (text_en, ai_tags, image_url)
+        return (text_en, ai_tags, image_url)
 
 if set_ai_generator:
     try:
@@ -477,7 +477,7 @@ if set_ai_generator:
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
 def start_preview_keyboard():
-    return InlineKeyboardMarkup([
+        return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
          InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
@@ -489,7 +489,7 @@ def start_preview_keyboard():
     ])
 
 def get_start_menu():
-    return InlineKeyboardMarkup([
+        return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
@@ -503,10 +503,10 @@ def _worker_url_with_secret() -> str:
     if not base: return base
     sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
     sep = "&" if "?" in base else "?"
-    return f"{base}{sep}s={sec}" if sec else base
+        return f"{base}{sep}s={sec}" if sec else base
 
 def start_worker_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
 
 async def send_with_start_button(chat_id: int, text: str):
     try:
@@ -531,8 +531,8 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
                 await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Telegram: пусто (нет текста и медиа).")
                 return False
             await channel_bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                text=final_html,
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+            text=final_html,
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
@@ -545,22 +545,22 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
         if mk == "image":
             with open(local_path, "rb") as f:
                 await channel_bot.send_photo(
-                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=f,
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=f,
                     caption=(final_html if final_html.strip() else None),
                     parse_mode="HTML"
                 )
         elif mk == "video":
             with open(local_path, "rb") as f:
                 await channel_bot.send_video(
-                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, video=f,
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID, video=f,
                     supports_streaming=True,
                     caption=(final_html if final_html.strip() else None),
                     parse_mode="HTML"
                 )
         else:
             await channel_bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                text=final_html, parse_mode="HTML", disable_web_page_preview=True
+            chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+            text=final_html, parse_mode="HTML", disable_web_page_preview=True
             )
 
         try: os.remove(local_path)
@@ -746,12 +746,12 @@ def _planner_active_for(uid: int) -> bool:
     В планировщик маршрутизируем ТОЛЬКО когда uid отмечен в ROUTE_TO_PLANNER.
     Никаких скрытых состояний из PLANNER_STATE — исключаем ложные перехваты.
     """
-    return uid in ROUTE_TO_PLANNER
+        return uid in ROUTE_TO_PLANNER
 
 async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
         return await open_planner(update, context)
-    return
+        return
 
 # -----------------------------------------------------------------------------
 # CALLBACKS / INPUT
@@ -774,13 +774,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[uid] = now
 
     if data == "BACK_MAIN_MENU":
-    ROUTE_TO_PLANNER.discard(uid)
-    await approval_bot.send_message(
-        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-        text="Главное меню:",
-        reply_markup=get_start_menu()
+        ROUTE_TO_PLANNER.discard(uid)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Главное меню:",
+            reply_markup=get_start_menu()
     )
-    return
+        return
+
+    if data == "BACK_MAIN_MENU":
+        ROUTE_TO_PLANNER.discard(uid)
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Главное меню:",
+            reply_markup=get_start_menu()
+    )
+        return
 
 # --- Планировщик: явные команды/префиксы ---
     planner_any = (
@@ -794,9 +803,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await approval_bot.send_message(
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-                text="Главное меню:",
-                reply_markup=get_start_menu()
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="Главное меню:",
+            reply_markup=get_start_menu()
             )
         return
 
@@ -931,7 +940,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
-    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
 # Роутер сообщений
@@ -954,7 +963,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    return await handle_manual_input(update, context)
+        return await handle_manual_input(update, context)
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
