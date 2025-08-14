@@ -916,6 +916,12 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await msg.reply_text(f"Картинка удалена для #{pid}.", reply_markup=_item_actions_kb(pid, it["mode"]))
 
         if msg.photo:
+    st.image_url = msg.photo[-1].file_id
+if getattr(msg, 'video', None):
+    st.image_url = msg.video.file_id
+if getattr(msg, 'document', None) and getattr(msg.document, 'mime_type', ''):
+    if msg.document.mime_type.startswith('image/') or msg.document.mime_type.startswith('video/'):
+        st.image_url = msg.document.file_id
             it["image_url"] = msg.photo[-1].file_id
         if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
             if msg.document.mime_type.startswith("image/"):
@@ -978,6 +984,12 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "waiting_text":
         st.mode = "gen"
         if msg.photo:
+    st.image_url = msg.photo[-1].file_id
+if getattr(msg, 'video', None):
+    st.image_url = msg.video.file_id
+if getattr(msg, 'document', None) and getattr(msg.document, 'mime_type', ''):
+    if msg.document.mime_type.startswith('image/') or msg.document.mime_type.startswith('video/'):
+        st.image_url = msg.document.file_id
             st.image_url = msg.photo[-1].file_id
         if getattr(msg, "document", None) and getattr(msg.document, "mime_type", ""):
             if msg.document.mime_type.startswith("image/"):
@@ -1062,7 +1074,7 @@ def register_planner_handlers(app: Application):
             pass
 
     app.add_handler(
-        MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & chat_filter, on_user_message, block=True),
+        MessageHandler((filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.IMAGE | filters.Document.VIDEO) & chat_filter, on_user_message, block=True),
         group=0
     )
 
