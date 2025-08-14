@@ -773,7 +773,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[uid] = now
 
-    # --- Планировщик: явные команды/префиксы ---
+    if data == "BACK_MAIN_MENU":
+    ROUTE_TO_PLANNER.discard(uid)
+    await approval_bot.send_message(
+        chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        text="Главное меню:",
+        reply_markup=get_start_menu()
+    )
+    return
+
+# --- Планировщик: явные команды/префиксы ---
     planner_any = (
         data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
     )
