@@ -775,6 +775,7 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Универсальная проверка на планировщик
+    uid = update.effective_user.id
     if uid in ROUTE_TO_PLANNER:
         await _route_to_planner(update, context)
         return
