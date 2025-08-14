@@ -198,57 +198,33 @@ def trim_to_twitter_len(s: str, max_len: int) -> str:
         s = s[:-1]
         return (s + ell).rstrip()
 
+
 def _dedup_hashtags(*groups):
     seen, out = set(), []
     def norm(t: str) -> str:
         t = t.strip()
-        if not t: return ""
+        if not t:
+            return ""
         if not (t.startswith("#") or t.startswith("$")):
             t = "#" + t
-            return t
+        return t
     def ok(t: str) -> bool:
         tl = t.lower()
         return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
     for g in groups:
-        if not g: continue
+        if not g:
+            continue
         items = g.split() if isinstance(g, str) else list(g)
         for raw in items:
             tag = norm(raw)
-            if not tag or not ok(tag): continue
+            if not tag or not ok(tag):
+                continue
             key = tag.lower()
-            if key in seen: continue
-            seen.add(key); out.append(tag)
-            return " ".join(out)
-
-def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
-    MAX_TWEET_SAFE = 275
-    tail_required = TW_TAIL_REQUIRED
-    tags_str = _dedup_hashtags(MY_HASHTAGS_STR, ai_tags or [])
-    tail_full = (tail_required + (f" {tags_str}" if tags_str else "")).strip()
-    body = (body_text or "").strip()
-
-    def compose(b, t): return f"{b} {t}".strip() if (b and t) else (b or t)
-
-    allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
-    if allowed_for_body < 0:
-        tail = tail_required
-        allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
-    else:
-        tail = tail_full
-
-    body_trimmed = trim_to_twitter_len(body, allowed_for_body)
-    tweet = compose(body_trimmed, tail)
-    while twitter_len(tweet) > MAX_TWEET_SAFE and body_trimmed:
-        body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
-        tweet = compose(body_trimmed, tail)
-    if twitter_len(tweet) > MAX_TWEET_SAFE:
-        tweet = tail_required
-        return tweet
-
-def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
-    return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
-
-# -----------------------------------------------------------------------------
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(tag)
+    return " ".join(out)
 # TG: гарантированный хвост в финале публикации
 # -----------------------------------------------------------------------------
 TG_CAPTION_MAX = 1024
@@ -476,6 +452,7 @@ if set_ai_generator:
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
+
 def start_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
@@ -487,34 +464,6 @@ def start_preview_keyboard():
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
-
-def get_start_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
-        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
-    ])
-
-def _worker_url_with_secret() -> str:
-    base = AICOIN_WORKER_URL or ""
-    if not base: return base
-    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}s={sec}" if sec else base
-
-def start_worker_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
-
-async def send_with_start_button(chat_id: int, text: str):
-    try:
-        await approval_bot.send_message(chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
-    except Exception:
-        await approval_bot.send_message(chat_id=chat_id, text=text)
-
-# -----------------------------------------------------------------------------
 # Публикация в Telegram — хвост ВСЕГДА (и у текста, и у фото/видео)
 # -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optional[str] = None) -> bool:
