@@ -10,6 +10,7 @@ twitter_bot.py — согласование/генерация/публикац�
 - ✅ Видео: принимаем photo / video / document(video); Telegram — send_video; X — chunked upload v1.1.
 - ✅ Планировщик: события планирования всегда идут в open_planner() и НЕ попадают в «Сделай сам».
 - ✅ Хендлеры planner.py имеют приоритет (наши — в высоких группах).
+- ✅ FIX: Twitter video — убран run_until_complete (ошибка "event loop is already running"), публикация в X сделана async.
 
 Зависимости:
   pip install python-telegram-bot==20.* tweepy requests aiosqlite pillow openai github.py
@@ -110,7 +111,7 @@ TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 600
 AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
-VERBATIM_MODE = False  # X: как написал — так и публикуем
+VERBATIM_MODE = False  # X: как написал — так и публикуем (False = с хвостом)
 
 # -----------------------------------------------------------------------------
 # ХВОСТЫ
@@ -591,7 +592,7 @@ def _download_to_temp_file(url: str, suffix: str = ".bin") -> Optional[str]:
         log.warning(f"Не удалось скачать медиа для Twitter: {e}")
         return None
 
-def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | None = None, ai_hashtags=None) -> bool:
+async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | None = None, ai_hashtags=None) -> bool:
     """
     Публикация в X (текст/картинка/видео).
       - VERBATIM_MODE=True  → ровно текст пользователя.
@@ -615,10 +616,8 @@ def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | None =
                 if not local_path:
                     raise RuntimeError("Не удалось получить медиа из URL для X")
             else:
-                # из TG
-                local_path = asyncio.get_event_loop().run_until_complete(
-                    download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
-                )
+                # из TG — async без run_until_complete
+                local_path = await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
 
             post_data["media_local_path"] = local_path
 
@@ -743,13 +742,11 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
 # Планировщик — снимки и роутинг
 # -----------------------------------------------------------------------------
 def _planner_active_for(uid: int) -> bool:
-    try:
-        st = PLANNER_STATE.get(uid) or {}
-        cur = st.get("current")
-        any_active_flag = st.get("active") or st.get("mode") or st.get("step")
-        return (uid in ROUTE_TO_PLANNER) or bool(cur) or bool(any_active_flag)
-    except Exception:
-        return (uid in ROUTE_TO_PLANNER)
+    """
+    В планировщик маршрутизируем ТОЛЬКО когда uid отмечен в ROUTE_TO_PLANNER.
+    Никаких скрытых состояний из PLANNER_STATE — исключаем ложные перехваты.
+    """
+    return uid in ROUTE_TO_PLANNER
 
 async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
@@ -776,19 +773,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[uid] = now
 
-    # --- ПРИОРИТЕТ: планировщик ---
-    planner_exact = {"PLAN_OPEN","OPEN_PLAN_MODE","OPEN_GEN_MODE","PLAN_DONE","GEN_DONE","PLAN_ADD_MORE","GEN_ADD_MORE","STEP_BACK","PLAN_LIST_TODAY","PLAN_AI_BUILD_NOW","BACK_MAIN_MENU","ITEM_MENU","DEL_ITEM","EDIT_TIME","EDIT_ITEM"}
-    if (data in planner_exact) or data.startswith(("PLAN_","ITEM_MENU:","DEL_ITEM:","EDIT_TIME:","EDIT_ITEM:","EDIT_FIELD:","AI_FILL_TEXT:","CLONE_ITEM:","AI_NEW_FROM:")):
-        ROUTE_TO_PLANNER.add(uid)
-        return await _route_to_planner(update, context)
+    # --- Планировщик: явные команды/префиксы ---
+    planner_any = (
+        data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
+    )
+    planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
-    if data == "show_day_plan":
+    if data == "show_day_plan" or planner_any or planner_exit:
         ROUTE_TO_PLANNER.add(uid)
-        return await _route_to_planner(update, context)
+        await _route_to_planner(update, context)
+        if planner_exit or data == "BACK_MAIN_MENU":
+            ROUTE_TO_PLANNER.discard(uid)
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Главное меню:",
+                reply_markup=get_start_menu()
+            )
+        return
 
-    if data in ("cancel_to_main","BACK_MAIN_MENU"):
+    if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu()); return
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+        return
 
     if data == "shutdown_bot":
         do_not_disturb["active"] = True
@@ -800,6 +806,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
+        # явный выход из планировщика → больше не перехватываем «Сделай сам»
         ROUTE_TO_PLANNER.discard(uid)
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -907,7 +914,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
-            tw_status = publish_post_to_twitter(twitter_text, None, post_data.get("ai_hashtags") or [])
+            tw_status = await publish_post_to_twitter(twitter_text, None, post_data.get("ai_hashtags") or [])
             if tw_status: await save_post_to_history(twitter_text, media_hash)
 
     if publish_tg:
@@ -930,10 +937,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # если пользователь в планировщике — всё туда
+    # если пользователь в планировщике — всё туда (только по нашему флагу)
     if _planner_active_for(uid):
         return await _route_to_planner(update, context)
 
+    # «Сделай сам»
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
