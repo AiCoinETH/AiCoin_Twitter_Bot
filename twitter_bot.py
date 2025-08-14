@@ -129,14 +129,19 @@ def get_twitter_clients():
         access_token=TWITTER_ACCESS_TOKEN,
         access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
     )
-
     api_v1 = tweepy.API(
         tweepy.OAuth1UserHandler(
             TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET
         )
     )
-
     return client_v2, api_v1
+
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+
+# GitHub (для предпросмотра изображений из TG)
+github_client = Github(GITHUB_TOKEN)
+github_repo = github_client.get_repo(GITHUB_REPO)
+
 # -----------------------------------------------------------------------------
 # СТЕЙТ
 # -----------------------------------------------------------------------------
@@ -173,19 +178,26 @@ _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 
 def twitter_len(s: str) -> int:
-    if not s:
-        return 0
+    if not s: return 0
     s = normalize("NFC", s)
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_plain_to(s: str, max_len: int) -> str:
-    if not s:
-        return s
+    if not s: return s
     s = normalize("NFC", s).strip()
-    if len(s) <= max_len:
-        return s
+    if len(s) <= max_len: return s
     ell = '…'
     return (s[: max_len - len(ell)] + ell).rstrip()
+
+def trim_to_twitter_len(s: str, max_len: int) -> str:
+    if not s: return s
+    s = normalize("NFC", s).strip()
+    if twitter_len(s) <= max_len: return s
+    ell = '…'
+    while s and twitter_len(s + ell) > max_len:
+        s = s[:-1]
+        return (s + ell).rstrip()
+
 def _dedup_hashtags(*groups):
     seen, out = set(), []
     def norm(t: str) -> str:
@@ -193,7 +205,7 @@ def _dedup_hashtags(*groups):
         if not t: return ""
         if not (t.startswith("#") or t.startswith("$")):
             t = "#" + t
-        return t
+            return t
     def ok(t: str) -> bool:
         tl = t.lower()
         return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
@@ -206,7 +218,7 @@ def _dedup_hashtags(*groups):
             key = tag.lower()
             if key in seen: continue
             seen.add(key); out.append(tag)
-        return " ".join(out)
+            return " ".join(out)
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     MAX_TWEET_SAFE = 275
@@ -234,7 +246,7 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
         return tweet
 
 def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
-        return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
+    return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
 # -----------------------------------------------------------------------------
 # TG: гарантированный хвост в финале публикации
@@ -243,7 +255,7 @@ TG_CAPTION_MAX = 1024
 TG_TEXT_MAX = 4096
 
 def _has_tail(html_text_lower: str) -> bool:
-        return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
+    return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
 
 def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
     body_raw = (body_text or "").strip()
@@ -266,7 +278,7 @@ def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
         return current_full
 
 def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
-        return build_tg_final(text_en, for_photo_caption=False)
+    return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
 # GitHub helpers (для предпросмотра TG‑фото)
@@ -328,7 +340,7 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
 async def save_image_and_get_github_url(image_path):
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
-        return url, filename
+    return url, filename
 
 async def process_telegram_photo(file_id: str, bot: Bot) -> str:
     file_path = await download_image_async(file_id, is_telegram_file=True, bot=bot)
@@ -365,11 +377,11 @@ async def init_db():
 
 def normalize_text_for_hashing(text: str) -> str:
     if not text: return ""
-        return " ".join(text.strip().lower().split())
+    return " ".join(text.strip().lower().split())
 
 def sha256_hex(data: bytes) -> str:
     import hashlib as _h
-        return _h.sha256(data).hexdigest()
+    return _h.sha256(data).hexdigest()
 
 async def compute_media_hash_from_state() -> Optional[str]:
     """Считает хэш текущего медиа (image/video), если есть. Для TG скачиваем файл временно."""
@@ -452,7 +464,7 @@ async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optio
 
     # Без дефолтного media
     image_url = None
-        return (text_en, ai_tags, image_url)
+    return (text_en, ai_tags, image_url)
 
 if set_ai_generator:
     try:
@@ -465,7 +477,7 @@ if set_ai_generator:
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
 def start_preview_keyboard():
-        return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
          InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
@@ -477,7 +489,7 @@ def start_preview_keyboard():
     ])
 
 def get_start_menu():
-        return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
@@ -491,10 +503,10 @@ def _worker_url_with_secret() -> str:
     if not base: return base
     sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
     sep = "&" if "?" in base else "?"
-        return f"{base}{sep}s={sec}" if sec else base
+    return f"{base}{sep}s={sec}" if sec else base
 
 def start_worker_keyboard():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
 
 async def send_with_start_button(chat_id: int, text: str):
     try:
@@ -564,7 +576,7 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
             try: os.remove(lp)
             except Exception: pass
             post_data["media_local_path"] = None
-        return False
+            return False
 
 # -----------------------------------------------------------------------------
 # Публикация в Twitter/X (текст/фото/видео; видео — chunked upload)
@@ -649,7 +661,7 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
             except Exception: pass
             post_data["media_local_path"] = None
 
-        return True
+            return True
 
     except tweepy.TweepyException as e:
         log.error(f"Twitter TweepyException: {e}")
@@ -662,7 +674,7 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
             try: os.remove(lp)
             except Exception: pass
             post_data["media_local_path"] = None
-        return False
+            return False
     except Exception as e:
         log.error(f"Twitter general error: {e}")
         asyncio.create_task(send_with_start_button(
@@ -673,7 +685,7 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
             try: os.remove(lp)
             except Exception: pass
             post_data["media_local_path"] = None
-        return False
+            return False
 
 # -----------------------------------------------------------------------------
 # Предпросмотр
@@ -734,7 +746,7 @@ def _planner_active_for(uid: int) -> bool:
     В планировщик маршрутизируем ТОЛЬКО когда uid отмечен в ROUTE_TO_PLANNER.
     Никаких скрытых состояний из PLANNER_STATE — исключаем ложные перехваты.
     """
-        return uid in ROUTE_TO_PLANNER
+    return uid in ROUTE_TO_PLANNER
 
 async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
@@ -768,7 +780,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Главное меню:",
             reply_markup=get_start_menu()
     )
-        return
+    return
 
     if data == "BACK_MAIN_MENU":
         ROUTE_TO_PLANNER.discard(uid)
@@ -777,7 +789,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Главное меню:",
             reply_markup=get_start_menu()
     )
-        return
+    return
 
 # --- Планировщик: явные команды/префиксы ---
     planner_any = (
@@ -795,7 +807,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Главное меню:",
             reply_markup=get_start_menu()
             )
-        return
+            return
 
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
