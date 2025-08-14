@@ -628,7 +628,7 @@ async def cb_ai_fill_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _lg(f"ai_fill_text uid={uid} pid={pid} failed: {e}")
         return await _safe_edit_or_send(q, "Не удалось сгенерировать текст ИИ.", reply_markup=_item_actions_kb(pid, it["mode"]))
 
-async def cb_clone_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_clone_item(update: Update, ContextTypes=None):
     if not _allowed_chat(update):
         return
     q = update.callback_query
@@ -725,16 +725,6 @@ async def cb_step_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_STATE[uid].pop("edit_target", None)
     _lg(f"step_back uid={uid}")
     await _safe_edit_or_send(q, "Отменено. Что дальше?", reply_markup=main_planner_menu())
-
-async def cb_back_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _allowed_chat(update):
-        return
-    q = update.callback_query
-    _lg(f"back_main_menu uid={_uid_from_q(q)}")
-    await _safe_edit_or_send(
-        q, "Открываю основное меню…",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Открыть основное меню", callback_data="cancel_to_main")]])
-    )
 
 async def _finalize_current_and_back(q: CallbackQuery):
     uid = _uid_from_q(q)
@@ -1044,9 +1034,9 @@ def register_planner_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(cb_list_today,        pattern="^PLAN_LIST_TODAY$", block=True),   group=0)
     app.add_handler(CallbackQueryHandler(cb_plan_ai_build_now, pattern="^PLAN_AI_BUILD_NOW$", block=True), group=0)
 
-    # Навигация
+    # Навигация внутри планировщика
     app.add_handler(CallbackQueryHandler(cb_step_back,         pattern="^STEP_BACK$", block=True),         group=0)
-    app.add_handler(CallbackQueryHandler(cb_back_main_menu,    pattern="^BACK_MAIN_MENU$", block=True),    group=0)
+    # ВАЖНО: не перехватываем BACK_MAIN_MENU — пусть его обрабатывает основной бот для мгновенного выхода.
 
     # Завершение шагов
     app.add_handler(CallbackQueryHandler(cb_plan_done,         pattern="^PLAN_DONE$", block=True),         group=0)
