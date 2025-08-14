@@ -11,8 +11,6 @@ twitter_bot.py — согласование/генерация/публикац�
 - ✅ Планировщик: события планирования всегда идут в open_planner() и НЕ попадают в «Сделай сам».
 - ✅ Хендлеры planner.py имеют приоритет (наши — в высоких группах).
 - ✅ FIX: Twitter video — убран run_until_complete (ошибка "event loop is already running"), публикация в X сделана async.
-- ✅ Главный экран ВСЕГДА содержит кнопку «▶️ Старт воркера» (даже после выхода из планировщика и после публикаций).
-- ✅ «Сделай сам» теперь не перехватывает любые сообщения — только в течение 5 минут после нажатия соответствующей кнопки.
 
 Зависимости:
   pip install python-telegram-bot==20.* tweepy requests aiosqlite pillow openai github.py
@@ -286,7 +284,7 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
 # GitHub helpers (для предпросмотра TG‑фото)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
-    with open(image_path, "rb") as img_file):
+    with open(image_path, "rb") as img_file:
         content = img_file.read()
     try:
         github_repo.create_file(f"{GITHUB_IMAGE_PATH}/{filename}", "upload image for post", content, branch="main")
@@ -401,12 +399,9 @@ async def compute_media_hash_from_state() -> Optional[str]:
             tg_file = await approval_bot.get_file(ref)
             tmp = tempfile.NamedTemporaryFile(delete=False)
             await tg_file.download_to_drive(tmp.name)
-            with open(tmp.name, "rb") as f:
-                b = f.read()
-            try:
-                os.remove(tmp.name)
-            except Exception:
-                pass
+            with open(tmp.name, "rb") as f: b = f.read()
+            try: os.remove(tmp.name)
+            except Exception: pass
             return sha256_hex(b)
     except Exception as e:
         log.warning(f"compute_media_hash_from_state fail: {e}")
@@ -481,25 +476,6 @@ if set_ai_generator:
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
-def _worker_url_with_secret() -> str:
-    base = AICOIN_WORKER_URL or ""
-    if not base: return base
-    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}s={sec}" if sec else base
-
-def get_start_menu():
-    # Главный экран со встроенной URL‑кнопкой «Старт воркера» + наши callback‑кнопки
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())],
-        [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
-        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
-        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
-    ])
-
 def start_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
@@ -511,6 +487,23 @@ def start_preview_keyboard():
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
+
+def get_start_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
+        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
+        [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
+    ])
+
+def _worker_url_with_secret() -> str:
+    base = AICOIN_WORKER_URL or ""
+    if not base: return base
+    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}s={sec}" if sec else base
 
 def start_worker_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
@@ -570,10 +563,8 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
                 text=final_html, parse_mode="HTML", disable_web_page_preview=True
             )
 
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+        try: os.remove(local_path)
+        except Exception: pass
         post_data["media_local_path"] = None
         return True
 
@@ -582,10 +573,8 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
         await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"❌ Ошибка публикации в Telegram: {e}")
         lp = post_data.get("media_local_path")
         if lp:
-            try:
-                os.remove(lp)
-            except Exception:
-                pass
+            try: os.remove(lp)
+            except Exception: pass
             post_data["media_local_path"] = None
         return False
 
@@ -668,10 +657,8 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
 
         # уборка
         if local_path:
-            try:
-                os.remove(local_path)
-            except Exception:
-                pass
+            try: os.remove(local_path)
+            except Exception: pass
             post_data["media_local_path"] = None
 
         return True
@@ -684,10 +671,8 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
         ))
         lp = post_data.get("media_local_path")
         if lp:
-            try:
-                os.remove(lp)
-            except Exception:
-                pass
+            try: os.remove(lp)
+            except Exception: pass
             post_data["media_local_path"] = None
         return False
     except Exception as e:
@@ -697,10 +682,8 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
         ))
         lp = post_data.get("media_local_path")
         if lp:
-            try:
-                os.remove(lp)
-            except Exception:
-                pass
+            try: os.remove(lp)
+            except Exception: pass
             post_data["media_local_path"] = None
         return False
 
@@ -791,7 +774,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[uid] = now
 
     # --- Планировщик: явные команды/префиксы ---
-    planner_any = data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
+    planner_any = (
+        data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
+    )
     planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
     if data == "show_day_plan" or planner_any or planner_exit:
@@ -930,15 +915,13 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             tw_status = False
         else:
             tw_status = await publish_post_to_twitter(twitter_text, None, post_data.get("ai_hashtags") or [])
-            if tw_status:
-                await save_post_to_history(twitter_text, media_hash)
+            if tw_status: await save_post_to_history(twitter_text, media_hash)
 
     if publish_tg:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram.")
     if publish_tw:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
 
-    # всегда возвращаем главное меню со «Старт воркера»
     await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
@@ -958,12 +941,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _planner_active_for(uid):
         return await _route_to_planner(update, context)
 
-    # «Сделай сам» — только когда мы его ожидаем (в течение 5 минут после нажатия кнопки)
+    # «Сделай сам»
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    # иначе — показываем главное меню со «Старт воркера»
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+    return await handle_manual_input(update, context)
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
