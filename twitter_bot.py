@@ -442,7 +442,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        resp = client_oa.chat.completions.create(
+        resp = client_oa.chat_completions.create(  # backward compatibility: openai>=1.35 style may vary
             model="gpt-4o-mini",
             messages=[
                 {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
@@ -802,7 +802,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "show_day_plan" or planner_any or planner_exit:
         ROUTE_TO_PLANNER.add(uid)
         await _route_to_planner(update, context)
-        if planner_exit или data == "BACK_MAIN_MENU":
+        if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await approval_bot.send_message(
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
@@ -864,7 +864,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    text = (update.message.text или update.message.caption или "").strip()
+    text = (update.message.text or update.message.caption or "").strip()
 
     media_kind = "none"
     media_src  = "tg"
@@ -1045,3 +1045,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
