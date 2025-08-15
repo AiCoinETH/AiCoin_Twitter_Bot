@@ -442,7 +442,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        resp = client_oa.chat_completions.create(  # backward compatibility: openai>=1.35 style may vary
+        resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
@@ -735,12 +735,76 @@ async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, r
         msg = await bot.send_message(chat_id=chat_id, text=caption or " ", parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
         return msg, None
 
-async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, header: str | None = "Предпросмотр"):
-    caption = build_telegram_preview(text_en, ai_hashtags or [])
-    hdr = f"<b>{html_escape(header)}</b>\n" if header else ""
-    text = f"{hdr}{caption}".strip()
+async def send_video_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
+    """
+    Предпросмотр видео:
+      - TG file_id: пробуем отправить напрямую (без скачивания); при ошибке — скачиваем и отправляем.
+      - URL: скачиваем во временный файл и отправляем.
+    """
+    try:
+        # Сначала пытаемся как file_id (без скачивания)
+        if not str(url_or_file_id).startswith("http"):
+            try:
+                msg = await bot.send_video(
+                    chat_id=chat_id,
+                    video=url_or_file_id,
+                    supports_streaming=True,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup
+                )
+                return msg, None
+            except Exception as _:
+                # Фоллбэк — скачиваем
+                tg_file = await bot.get_file(url_or_file_id)
+                suffix = ".mp4" if (tg_file.file_path or "").lower().endswith(".mp4") else ".bin"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                await tg_file.download_to_drive(tmp.name)
+                with open(tmp.name, "rb") as f:
+                    msg = await bot.send_video(
+                        chat_id=chat_id, video=f,
+                        supports_streaming=True,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                os.remove(tmp.name)
+                return msg, None
+        else:
+            # URL-видео
+            try:
+                response = requests.get(url_or_file_id, timeout=60, headers={'User-Agent':'Mozilla/5.0'})
+                response.raise_for_status()
+                suf = ".mp4" if url_or_file_id.lower().endswith(".mp4") else ".bin"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
+                tmp.write(response.content); tmp.close()
+                with open(tmp.name, "rb") as f:
+                    msg = await bot.send_video(
+                        chat_id=chat_id, video=f,
+                        supports_streaming=True,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                os.remove(tmp.name)
+                return msg, None
+            except Exception:
+                # Если совсем не вышло — покажем текстом ссылку
+                msg = await bot.send_message(chat_id=chat_id, text=(caption or url_or_file_id), parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
+                return msg, None
+    except Exception as e:
+        log.error(f"Ошибка в send_video_with_download: {e}")
+        msg = await bot.send_message(chat_id=chat_id, text=(caption or " "), parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
+        return msg, None
 
-    # Если в стейте картинка (tg/url) — пытаемся показать.
+async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, header: str | None = "Предпросмотр"):
+    # Для сообщений без медиа — длинный лимит; для медиа — caption до 1024
+    text_for_message = build_telegram_preview(text_en, ai_hashtags or [])
+    caption_for_media = build_tg_final(text_en, for_photo_caption=True)
+
+    hdr = f"<b>{html_escape(header)}</b>\n" if header else ""
+    text_message = f"{hdr}{text_for_message}".strip()
+
     preview_image_url = None
     if post_data.get("media_kind") == "image":
         if post_data.get("media_src") == "url":
@@ -752,13 +816,42 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
                 preview_image_url = None
 
     try:
-        if preview_image_url:
-            await send_photo_with_download(approval_bot, TELEGRAM_APPROVAL_CHAT_ID, preview_image_url, caption=(text if text else None), reply_markup=start_preview_keyboard())
+        if post_data.get("media_kind") == "video" and post_data.get("media_ref"):
+            # Для видео показываем именно видео
+            await send_video_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                post_data.get("media_ref"),
+                caption=(caption_for_media if caption_for_media.strip() else None),
+                reply_markup=start_preview_keyboard()
+            )
+        elif preview_image_url:
+            # Для фото показываем фото
+            await send_photo_with_download(
+                approval_bot,
+                TELEGRAM_APPROVAL_CHAT_ID,
+                preview_image_url,
+                caption=(caption_for_media if caption_for_media.strip() else None),
+                reply_markup=start_preview_keyboard()
+            )
         else:
-            await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=(text if text else "<i>(пусто — только изображение/видео)</i>"), parse_mode="HTML", disable_web_page_preview=True, reply_markup=start_preview_keyboard())
+            # Только текст
+            await approval_bot.send_message(
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=start_preview_keyboard()
+            )
     except Exception as e:
         log.warning(f"send_single_preview fallback: {e}")
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=(text if text else "<i>(пусто — только изображение/видео)</i>"), parse_mode="HTML", disable_web_page_preview=True, reply_markup=start_preview_keyboard())
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=start_preview_keyboard()
+        )
 
 # -----------------------------------------------------------------------------
 # Планировщик — снимки и роутинг
@@ -1045,4 +1138,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
