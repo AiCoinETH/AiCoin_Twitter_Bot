@@ -18,6 +18,7 @@ twitter_bot.py — согласование/генерация/публикац�
 Доп. фиксы в этой правке:
 - 🛠 GitHub upload теперь через base64 (PyGithub требует base64-строку).
 - 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
+- 🆕 Режим override: «только ссылки + пользовательские хэштеги (≤275)» без хвостов и автотегов.
 """
 
 import os
@@ -152,7 +153,8 @@ post_data: Dict[str, Any] = {
     "media_local_path": None,
     "timestamp": None,
     "post_id": 0,
-    "is_manual": False
+    "is_manual": False,
+    "user_tags_override": False  # <— если True, X собирается только из ссылок+твоих хэштегов, без хвостов/автотегов
 }
 prev_data = post_data.copy()
 
@@ -217,12 +219,97 @@ def _dedup_hashtags(*groups):
     return " ".join(out)
 
 def _parse_hashtags_line(line: str) -> List[str]:
-    """Парсим свободный ввод: разделители — пробелы, запятые, переносы. Добавляем #, если нужно."""
+    """Парсим свободный ввод: разделители — пробелы, запятые, переносы. Добавляем #, если нужно. (с тематическим фильтром)"""
     if not line: return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
     filtered = _dedup_hashtags(raw).split()
     return filtered
+
+# ======== НОВОЕ: пользовательские теги без тематического фильтра ========
+def _normalize_hashtag_any(t: str) -> str:
+    t = (t or "").strip()
+    if not t:
+        return ""
+    if not (t.startswith("#") or t.startswith("$")):
+        t = "#" + t
+    return t
+
+def _dedup_any_hashtags(tags: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for raw in tags:
+        h = _normalize_hashtag_any(raw)
+        if not h:
+            continue
+        key = h.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+    return out
+
+def _parse_hashtags_line_user(line: str) -> List[str]:
+    """Парсим любые хэштеги пользователя, без тематического фильтра."""
+    if not line:
+        return []
+    tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
+    raw = [w for w in tmp.split() if w]
+    return _dedup_any_hashtags(raw)
+
+# ======== НОВОЕ: трим с сохранением целых URL ========
+def trim_preserving_urls(body: str, max_len: int) -> str:
+    """
+    Обрезает текст так, чтобы twitter_len <= max_len, не разрывая URL.
+    Нелинковые сегменты режем посимвольно, ссылки — либо целиком, либо не вставляем.
+    """
+    body = (body or "").strip()
+    if max_len <= 0 or not body:
+        return ""
+
+    parts = []
+    last = 0
+    for m in _URL_RE.finditer(body):
+        if m.start() > last:
+            parts.append((False, body[last:m.start()]))
+        parts.append((True, m.group(0)))
+        last = m.end()
+    if last < len(body):
+        parts.append((False, body[last:]))
+
+    out = ""
+    for is_url, seg in parts:
+        if not seg:
+            continue
+        if is_url:
+            cand = (out + (" " if out else "") + seg).strip()
+            if twitter_len(cand) <= max_len:
+                out = cand
+            else:
+                continue
+        else:
+            if twitter_len(out) >= max_len:
+                break
+            remain = max_len - twitter_len(out) - (1 if out else 0)
+            if remain <= 0:
+                break
+            chunk = seg.strip()
+            if not chunk:
+                continue
+            if twitter_len((out + (" " if out else "") + chunk).strip()) <= max_len:
+                out = (out + (" " if out else "") + chunk).strip()
+            else:
+                acc = ""
+                for ch in chunk:
+                    test = (out + (" " if out else "") + acc + ch).strip()
+                    if twitter_len(test) <= max_len:
+                        acc += ch
+                    else:
+                        break
+                if acc:
+                    out = (out + (" " if out else "") + acc).strip()
+                break
+    return out.strip()
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     MAX_TWEET_SAFE = 275
@@ -247,6 +334,48 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
         tweet = compose(body_trimmed, tail)
     if twitter_len(tweet) > MAX_TWEET_SAFE:
         tweet = tail_required
+    return tweet
+
+# ======== НОВОЕ: сборка «только ссылки + пользовательские теги» ========
+def build_tweet_user_hashtags_275(body_text: str, user_tags: List[str] | None) -> str:
+    """
+    ТОЧНО по ТЗ:
+      - сохраняем ссылки из body_text
+      - добавляем ТОЛЬКО пользовательские хэштеги (без хвостов и автотегов)
+      - общий лимит 275 (учитывая t.co=23)
+    """
+    MAX_TWEET = 275
+    body = (body_text or "").strip()
+    tags_str = " ".join(user_tags or []).strip()
+
+    tail_len = twitter_len(tags_str)
+    sep = 1 if (body and tags_str) else 0
+    allowed_for_body = MAX_TWEET - tail_len - sep
+    if allowed_for_body < 0:
+        allowed_for_body = 0
+
+    body_trimmed = trim_preserving_urls(body, allowed_for_body)
+
+    def compose(b, t):
+        return f"{b} {t}".strip() if (b and t) else (b or t)
+
+    tweet = compose(body_trimmed, tags_str)
+
+    # страховка
+    while twitter_len(tweet) > MAX_TWEET and body_trimmed:
+        body_trimmed = trim_preserving_urls(body_trimmed[:-1], allowed_for_body)
+        tweet = compose(body_trimmed, tags_str)
+
+    if twitter_len(tweet) > MAX_TWEET:
+        # если даже без текста не влезли — ужимаем теги по одному слева-направо
+        acc = []
+        for t in (user_tags or []):
+            test = " ".join(acc + [t]).strip()
+            if twitter_len(test) <= MAX_TWEET:
+                acc.append(t)
+            else:
+                break
+        tweet = " ".join(acc).strip()
     return tweet
 
 def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
@@ -348,6 +477,8 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         return tmp.name
 
 async def save_image_and_get_github_url(image_path):
+    filename = f"{uuid.uuid4().hex}.jpg}"
+    # небольшой фикс имени
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
@@ -445,7 +576,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        resp = client_oa.chat.completions.create(
+        resp = client_oa.chat_completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
@@ -596,8 +727,7 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
         return False
 
 # -----------------------------------------------------------------------------
-# Публикация в Twitter/X (текст/картинка/видео)
-# ВАЖНО: сюда уже передаём ГОТОВЫЙ текст твита (без повторной сборки).
+# Публикация в Twitter/X (текст/картинка/видео) — без повторной сборки текста.
 # -----------------------------------------------------------------------------
 def _download_to_temp_file(url: str, suffix: str = ".bin") -> Optional[str]:
     try:
@@ -918,8 +1048,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         awaiting_hashtags_until = now + timedelta(minutes=5)
         cur = " ".join(post_data.get("ai_hashtags") or [])
         hint = (
-            "🔖 Отправьте строку с хэштегами (через пробел/запятую). "
-            "Я учту только AI/crypto/$Ai и удалю дубли.\n"
+            "🔖 Отправьте строку с хэштегами (через пробел/запятую).\n"
+            "Я учту любые теги, удалю дубли. В Twitter можно включить режим «только ссылки + твои теги».\n"
             f"Сейчас: {cur if cur else '—'}"
         )
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, hint, reply_markup=InlineKeyboardMarkup([
@@ -930,8 +1060,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "clear_hashtags":
         post_data["ai_hashtags"] = []
+        post_data["user_tags_override"] = False  # сбрасываем режим override
         awaiting_hashtags_until = None
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Хэштеги очищены.")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Хэштеги очищены. Режим Twitter вернулся к стандартному (хвост + автотеги).")
         await send_single_preview(post_data.get("text_en") or "", [], image_url=None, header="Предпросмотр")
         return
 
@@ -1004,7 +1135,10 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
 
     # формируем финальный текст для X один раз
-    twitter_final_text = build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
+    if post_data.get("user_tags_override"):
+        twitter_final_text = build_tweet_user_hashtags_275(base_text_en, post_data.get("ai_hashtags") or [])
+    else:
+        twitter_final_text = build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
     telegram_text_preview = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
@@ -1061,11 +1195,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # если ждём хэштеги — обработаем здесь
     if awaiting_hashtags_until and now <= awaiting_hashtags_until:
         line = (update.message.text or update.message.caption or "").strip()
-        tags = _parse_hashtags_line(line)
+        # пользователь вводит ЛЮБЫЕ теги — без тематического фильтра
+        tags = _parse_hashtags_line_user(line)
         post_data["ai_hashtags"] = tags
+        post_data["user_tags_override"] = True  # включаем режим «только ссылки + мои теги» для X
         awaiting_hashtags_until = None
         cur = " ".join(tags) if tags else "—"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"✅ Хэштеги обновлены: {cur}")
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: только ссылки + твои теги (≤275).")
         return await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], image_url=None, header="Предпросмотр")
 
     # «Сделай сам» — только в течение 5 минут после кнопки
@@ -1150,4 +1286,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
