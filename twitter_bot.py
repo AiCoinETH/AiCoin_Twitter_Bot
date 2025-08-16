@@ -14,12 +14,17 @@ twitter_bot.py — согласование/генерация/публикац�
 - ✅ FIX: Twitter video — убран run_until_complete (ошибка "event loop is already running"), публикация в X async.
 - ✅ Главный экран ВСЕГДА содержит кнопку «▶️ Старт воркера».
 - ✅ «Сделай сам» перехватывает сообщения только 5 минут после нажатия.
+
+Доп. фиксы в этой правке:
+- 🛠 GitHub upload теперь через base64 (PyGithub требует base64-строку).
+- 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
 """
 
 import os
 import re
 import sys
 import uuid
+import base64
 import asyncio
 import logging
 import tempfile
@@ -214,10 +219,8 @@ def _dedup_hashtags(*groups):
 def _parse_hashtags_line(line: str) -> List[str]:
     """Парсим свободный ввод: разделители — пробелы, запятые, переносы. Добавляем #, если нужно."""
     if not line: return []
-    # заменим запятые/точки с запятой на пробел
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
-    # нормализуем и фильтруем по тематике (AI/crypto/$ai)
     filtered = _dedup_hashtags(raw).split()
     return filtered
 
@@ -285,13 +288,14 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
 # GitHub helpers (для предпросмотра TG-фото)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
+    """ВАЖНО: PyGithub.create_file ожидает base64-строку."""
     try:
         with open(image_path, "rb") as img_file:
-            content = img_file.read()
+            content_b64 = base64.b64encode(img_file.read()).decode("utf-8")
         github_repo.create_file(
             f"{GITHUB_IMAGE_PATH}/{filename}",
             "upload image for post",
-            content,
+            content_b64,
             branch="main"
         )
         return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/{filename}"
@@ -593,6 +597,7 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
 
 # -----------------------------------------------------------------------------
 # Публикация в Twitter/X (текст/картинка/видео)
+# ВАЖНО: сюда уже передаём ГОТОВЫЙ текст твита (без повторной сборки).
 # -----------------------------------------------------------------------------
 def _download_to_temp_file(url: str, suffix: str = ".bin") -> Optional[str]:
     try:
@@ -605,9 +610,8 @@ def _download_to_temp_file(url: str, suffix: str = ".bin") -> Optional[str]:
         log.warning(f"Не удалось скачать медиа для Twitter: {e}")
         return None
 
-async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | None = None, ai_hashtags=None) -> bool:
+async def publish_post_to_twitter(final_text_ready: str | None, _image_url_unused: str | None = None) -> bool:
     try:
-        final_text = build_twitter_text(text_en or "", ai_hashtags or [])
         mk = post_data.get("media_kind", "none")
         msrc = post_data.get("media_src", "tg")
         mref = post_data.get("media_ref")
@@ -637,7 +641,7 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
                 )
                 media_ids = [media.media_id_string]
 
-        clean_text = (final_text or "").strip()
+        clean_text = (final_text_ready or "").strip()
 
         if not media_ids and not clean_text:
             asyncio.create_task(send_with_start_button(
@@ -999,7 +1003,8 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
 
-    twitter_text = build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
+    # формируем финальный текст для X один раз
+    twitter_final_text = build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
     telegram_text_preview = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
@@ -1021,13 +1026,13 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
                 await save_post_to_history(final_html_saved, media_hash)
 
     if publish_tw:
-        if await is_duplicate_post(twitter_text, media_hash):
+        if await is_duplicate_post(twitter_final_text, media_hash):
             await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
-            tw_status = await publish_post_to_twitter(twitter_text, None, post_data.get("ai_hashtags") or [])
+            tw_status = await publish_post_to_twitter(twitter_final_text, None)
             if tw_status:
-                await save_post_to_history(twitter_text, media_hash)
+                await save_post_to_history(twitter_final_text, media_hash)
 
     if publish_tg:
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram.")
