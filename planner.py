@@ -29,6 +29,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import BadRequest
 
 # ------------------
 # Константы / глобалы
@@ -211,6 +212,25 @@ def _parse_time(s: str) -> Optional[str]:
     hh, mm = m.groups()
     return f"{int(hh):02d}:{int(mm):02d}"
 
+# ---------------
+# Безопасное редактирование сообщения
+# ---------------
+async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
+    """Безопасно редактируем сообщение. Если «Message is not modified» — молча игнорируем."""
+    try:
+        await q.edit_message_text(text=text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # иногда хотим лишь обновить клавиатуру
+            try:
+                await q.edit_message_reply_markup(reply_markup=reply_markup)
+            except BadRequest as e2:
+                if "Message is not modified" in str(e2):
+                    return
+                raise
+            return
+        raise
+
 # -----------------------------
 # Публичный entry-point для бота
 # -----------------------------
@@ -220,7 +240,7 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = await _kb_main(uid)
     text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
     if update.callback_query:
-        await update.callback_query.edit_message_text(text=text, reply_markup=kb)
+        await edit_or_pass(update.callback_query, text, kb)
     else:
         await update.effective_message.reply_text(text=text, reply_markup=kb)
 
@@ -234,23 +254,29 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # показать список
     if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
-        await q.edit_message_text("🗓 ПЛАН НА ДЕНЬ", reply_markup=(await _kb_main(uid)))
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
-    # добавление пустой
+    # добавление пустой — сразу спросить время
     if data == "PLAN_ADD_EMPTY":
-        await _insert_item(uid, "")
-        await q.answer("Добавлено.")
-        await q.edit_message_text("🗓 ПЛАН НА ДЕНЬ", reply_markup=(await _kb_main(uid)))
+        it = await _insert_item(uid, "")
+        await q.answer("Добавлено. Укажи время.")
+        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
+        await edit_or_pass(
+            q,
+            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+        )
         return
 
-    # запрос генерации новой темы от ИИ
+    # запрос генерации новой темы от ИИ (сначала тема, потом время спросим после генерации)
     if data == "PLAN_ADD_AI":
         USER_STATE[uid] = {"mode": "waiting_new_topic"}
-        await q.edit_message_text(
+        await edit_or_pass(
+            q,
             "🧠 Введи тему/подсказку для новой задачи — сгенерирую текст.\n"
             "Примеры: «анонс AMA», «продвижение сайта», «итоги недели».",
-            reply_markup=_kb_gen_topic()
+            _kb_gen_topic()
         )
         return
 
@@ -265,7 +291,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not it:
             await q.answer("Задача не найдена")
             return
-        await q.edit_message_text(f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", reply_markup=_kb_item(it))
+        await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     # удалить
@@ -273,7 +299,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         iid = int(data.split(":", 1)[1])
         await _delete_item(uid, iid)
         await q.answer("Удалено.")
-        await q.edit_message_text("🗓 ПЛАН НА ДЕНЬ", reply_markup=(await _kb_main(uid)))
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     # клон
@@ -285,7 +311,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _clone_item(uid, src)
         await q.answer("Склонировано.")
-        await q.edit_message_text("🗓 ПЛАН НА ДЕНЬ", reply_markup=(await _kb_main(uid)))
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     # переключить статус done
@@ -297,16 +323,17 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _update_done(uid, iid, not it.done)
         it = await _get_item(uid, iid)
-        await q.edit_message_text(f"📝 Задача #{iid}\n{_fmt_item(it)}", reply_markup=_kb_item(it))
+        await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     # правка текста
     if data.startswith("EDIT_ITEM:"):
         iid = int(data.split(":", 1)[1])
         USER_STATE[uid] = {"mode": "edit_text", "item_id": iid}
-        await q.edit_message_text(
+        await edit_or_pass(
+            q,
             f"✏️ Введи новый текст для задачи #{iid}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
         )
         return
 
@@ -314,9 +341,10 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("EDIT_TIME:"):
         iid = int(data.split(":", 1)[1])
         USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
-        await q.edit_message_text(
+        await edit_or_pass(
+            q,
             f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
         )
         return
 
@@ -340,10 +368,10 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.answer("ИИ-генератор не подключен")
         it = await _get_item(uid, iid)
-        await q.edit_message_text(f"📝 Задача #{iid}\n{_fmt_item(it)}", reply_markup=_kb_item(it))
+        await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
-    # создание новой задачи сразу от ИИ
+    # создание новой задачи сразу от ИИ (если приходит извне с темой)
     if data.startswith("AI_NEW_FROM:"):
         topic = data.split(":", 1)[1].strip() or "general"
         it = await _insert_item(uid, f"(генерация: {topic})")
@@ -354,8 +382,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await _update_text(uid, it.item_id, txt)
             except Exception:
                 pass
-        await q.answer("Создано.")
-        await q.edit_message_text("🗓 ПЛАН НА ДЕНЬ", reply_markup=(await _kb_main(uid)))
+        await q.answer("Создано. Укажи время.")
+        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
+        await edit_or_pass(
+            q,
+            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+        )
         return
 
     # PLAN_DONE / GEN_DONE / BACK_MAIN_MENU — не обрабатываем (отдаст основной бот)
@@ -411,8 +444,13 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Не удалось сгенерировать, создана пустая задача.")
         else:
             await update.message.reply_text("Создана пустая задача (ИИ недоступен).")
-        USER_STATE.pop(uid, None)
-        await open_planner(update, context)
+
+        # 👉 сразу спрашиваем время
+        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
+        await update.message.reply_text(
+            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+        )
         return
 
     # на всякий
