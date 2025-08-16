@@ -2,11 +2,18 @@
 """
 twitter_bot.py — согласование/генерация/публикация в Telegram и X (Twitter).
 
-ВАЖНОЕ НОВОЕ:
-- 🔖 Кнопка «Хэштеги» доступна всегда (в предпросмотре и в главном меню).
-- Хэштеги можно вводить в любом месте: "#AiCoin #AI $Ai #crypto #DeFi".
-- В Twitter (VERBATIM_MODE=False) хвост + дедуп‑хэштеги под лимит 275.
-- В Telegram хвост гарантирован, хэштеги в текст не навязываем (по желанию).
+Обновления (этой версии):
+- ✅ Кнопка «🔖 Хэштеги» доступна ВСЕГДА (предпросмотр, «Сделай сам», главное меню).
+- ✅ Ввод/редактирование хэштегов отдельным сообщением (5 мин окно), с дедупом и фильтром по теме (AI/crypto/$Ai).
+- ✅ Telegram: хвост добавляется ВСЕГДА (и не дублируется), с учётом лимитов caption=1024 и message=4096.
+- ✅ Twitter:
+    VERBATIM_MODE=True  -> публикуем РОВНО текст пользователя (без хвостов).
+    VERBATIM_MODE=False -> добавляем хвост (🌐 site | 🐺 Telegram) + дедуп-хэштеги; лимит 275.
+- ✅ Видео: принимаем photo / video / document(video); Telegram — send_video; X — chunked upload v1.1.
+- ✅ Планировщик: события планирования идут в open_planner() и НЕ попадают в «Сделай сам».
+- ✅ FIX: Twitter video — убран run_until_complete (ошибка "event loop is already running"), публикация в X async.
+- ✅ Главный экран ВСЕГДА содержит кнопку «▶️ Старт воркера».
+- ✅ «Сделай сам» перехватывает сообщения только 5 минут после нажатия.
 """
 
 import os
@@ -40,7 +47,7 @@ except Exception:
     PLANNER_STATE = {}
 
 # -----------------------------------------------------------------------------
-# ЛОГИ
+# ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s")
@@ -133,9 +140,9 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 # -----------------------------------------------------------------------------
 post_data: Dict[str, Any] = {
     "text_en": "",
-    "ai_hashtags": [],          # <— ХЭШТЕГИ ТУТ
-    "media_kind": "none",       # "none" | "image" | "video"
-    "media_src": "tg",          # "tg" | "url"
+    "ai_hashtags": [],           # <— редактируемая пользователем коллекция
+    "media_kind": "none",        # "none" | "image" | "video"
+    "media_src": "tg",           # "tg" | "url"
     "media_ref": None,
     "media_local_path": None,
     "timestamp": None,
@@ -149,7 +156,10 @@ do_not_disturb = {"active": False}
 last_action_time: Dict[int, datetime] = {}
 last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None
-ROUTE_TO_PLANNER: set[int] = set()
+ROUTE_TO_PLANNER: set[int] = set()  # трекер «я в планировщике»
+
+# — ожидание ввода хэштегов (отдельное окно 5 минут)
+awaiting_hashtags_until: Optional[datetime] = None
 
 # -----------------------------------------------------------------------------
 # УТИЛИТЫ ДЛИНЫ / ДЕДУП ХЭШТЕГОВ (для X)
@@ -163,6 +173,13 @@ def twitter_len(s: str) -> int:
     s = normalize("NFC", s)
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
+def trim_plain_to(s: str, max_len: int) -> str:
+    if not s: return s
+    s = normalize("NFC", s).strip()
+    if len(s) <= max_len: return s
+    ell = '…'
+    return (s[: max_len - len(ell)] + ell).rstrip()
+
 def trim_to_twitter_len(s: str, max_len: int) -> str:
     if not s: return s
     s = normalize("NFC", s).strip()
@@ -172,23 +189,14 @@ def trim_to_twitter_len(s: str, max_len: int) -> str:
         s = s[:-1]
     return (s + ell).rstrip()
 
-def _parse_tags_to_list(raw: str) -> List[str]:
-    if not raw: return []
-    # допускаем "#AiCoin, ai, $ai" и т.п.
-    raw = raw.replace(",", " ").replace(";", " ")
-    out = []
-    for tok in raw.split():
-        tok = tok.strip()
-        if not tok: continue
-        if not (tok.startswith("#") or tok.startswith("$")):
-            tok = "#" + tok
-        # фильтруем пустые и слишком длинные
-        if len(tok) <= 50:
-            out.append(tok)
-    return out
-
 def _dedup_hashtags(*groups):
     seen, out = set(), []
+    def norm(t: str) -> str:
+        t = t.strip()
+        if not t: return ""
+        if not (t.startswith("#") or t.startswith("$")):
+            t = "#" + t
+        return t
     def ok(t: str) -> bool:
         tl = t.lower()
         return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
@@ -196,15 +204,22 @@ def _dedup_hashtags(*groups):
         if not g: continue
         items = g.split() if isinstance(g, str) else list(g)
         for raw in items:
-            tag = raw.strip()
-            if not tag: continue
-            if not (tag.startswith("#") or tag.startswith("$")):
-                tag = "#" + tag
-            if not ok(tag): continue
+            tag = norm(raw)
+            if not tag or not ok(tag): continue
             key = tag.lower()
             if key in seen: continue
             seen.add(key); out.append(tag)
     return " ".join(out)
+
+def _parse_hashtags_line(line: str) -> List[str]:
+    """Парсим свободный ввод: разделители — пробелы, запятые, переносы. Добавляем #, если нужно."""
+    if not line: return []
+    # заменим запятые/точки с запятой на пробел
+    tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
+    raw = [w for w in tmp.split() if w]
+    # нормализуем и фильтруем по тематике (AI/crypto/$ai)
+    filtered = _dedup_hashtags(raw).split()
+    return filtered
 
 def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
     MAX_TWEET_SAFE = 275
@@ -235,7 +250,7 @@ def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
     return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
 # -----------------------------------------------------------------------------
-# TG: гарантированный хвост
+# TG: гарантированный хвост в финале публикации
 # -----------------------------------------------------------------------------
 TG_CAPTION_MAX = 1024
 TG_TEXT_MAX = 4096
@@ -247,6 +262,7 @@ def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
     body_raw = (body_text or "").strip()
     body_html = html_escape(body_raw)
     tail_html = TG_TAIL_HTML
+
     limit = TG_CAPTION_MAX if for_photo_caption else TG_TEXT_MAX
 
     current_full = body_html
@@ -263,11 +279,10 @@ def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
     return current_full
 
 def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
-    # Хэштеги не добавляем насильно в Telegram — только если автор сам включил их в текст
     return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
-# GitHub helpers (для предпросмотра TG‑фото)
+# GitHub helpers (для предпросмотра TG-фото)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
     try:
@@ -303,6 +318,7 @@ async def download_image_async(url_or_file_id, is_telegram_file=False, bot=None,
                 await file.download_to_drive(tmp.name)
                 return tmp.name
             except Exception as e:
+                log.warning(f"download_image_async TG failed: {e}")
                 await asyncio.sleep(1)
         raise Exception("Не удалось скачать файл из Telegram")
     else:
@@ -374,6 +390,7 @@ def sha256_hex(data: bytes) -> str:
     return _h.sha256(data).hexdigest()
 
 async def compute_media_hash_from_state() -> Optional[str]:
+    """Считает хэш текущего медиа (image/video), если есть. Для TG скачиваем файл временно."""
     kind = post_data.get("media_kind")
     src  = post_data.get("media_src")
     ref  = post_data.get("media_ref")
@@ -420,7 +437,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.warning(f"save_post_to_history: возможно дубликат/ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# ИИ (стартовый предпросмотр)
+# ИИ (для стартового предпросмотра)
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
@@ -454,7 +471,8 @@ async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optio
     tags_line = _oa_chat_text(extra_tags_prompt)
     ai_tags = [t for t in tags_line.split() if t.startswith("#") and len(t) > 1][:4]
 
-    return (text_en, ai_tags, None)
+    image_url = None
+    return (text_en, ai_tags, image_url)
 
 if set_ai_generator:
     try:
@@ -477,7 +495,7 @@ def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())],
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
-        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],  # <—
+        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
         [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
@@ -490,9 +508,9 @@ def start_preview_keyboard():
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
         [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
          InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
-        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],  # <—
-        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post"),
-         InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags"),
+         InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
+        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
@@ -508,13 +526,14 @@ async def send_with_start_button(chat_id: int, text: str):
         await approval_bot.send_message(chat_id=chat_id, text=text)
 
 # -----------------------------------------------------------------------------
-# Публикация в Telegram
+# Публикация в Telegram — хвост ВСЕГДА
 # -----------------------------------------------------------------------------
 async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optional[str] = None) -> bool:
     try:
         mk = post_data.get("media_kind", "none")
         msrc = post_data.get("media_src", "tg")
         mref = post_data.get("media_ref")
+
         final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
 
         if mk == "none" or not mref:
@@ -565,13 +584,15 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
         await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"❌ Ошибка публикации в Telegram: {e}")
         lp = post_data.get("media_local_path")
         if lp:
-            try: os.remove(lp)
-            except Exception: pass
+            try:
+                os.remove(lp)
+            except Exception:
+                pass
             post_data["media_local_path"] = None
         return False
 
 # -----------------------------------------------------------------------------
-# Публикация в Twitter/X
+# Публикация в Twitter/X (текст/картинка/видео)
 # -----------------------------------------------------------------------------
 def _download_to_temp_file(url: str, suffix: str = ".bin") -> Optional[str]:
     try:
@@ -639,8 +660,10 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
                 twitter_client_v2.create_tweet(text=clean_text, media_ids=media_ids)
 
         if local_path:
-            try: os.remove(local_path)
-            except Exception: pass
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
             post_data["media_local_path"] = None
 
         return True
@@ -653,8 +676,10 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
         ))
         lp = post_data.get("media_local_path")
         if lp:
-            try: os.remove(lp)
-            except Exception: pass
+            try:
+                os.remove(lp)
+            except Exception:
+                pass
             post_data["media_local_path"] = None
         return False
     except Exception as e:
@@ -664,8 +689,10 @@ async def publish_post_to_twitter(text_en: str | None, _image_url_unused: str | 
         ))
         lp = post_data.get("media_local_path")
         if lp:
-            try: os.remove(lp)
-            except Exception: pass
+            try:
+                os.remove(lp)
+            except Exception:
+                pass
             post_data["media_local_path"] = None
         return False
 
@@ -753,7 +780,8 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
     caption_for_media = build_tg_final(text_en, for_photo_caption=True)
 
     hdr = f"<b>{html_escape(header)}</b>\n" if header else ""
-    text_message = f"{hdr}{text_for_message}".strip()
+    hashtags_line = ("<i>Хэштеги:</i> " + html_escape(" ".join(ai_hashtags or []))) if (ai_hashtags) else "<i>Хэштеги:</i> —"
+    text_message = f"{hdr}{text_for_message}\n\n{hashtags_line}".strip()
 
     preview_image_url = None
     if post_data.get("media_kind") == "image":
@@ -791,6 +819,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
                 reply_markup=start_preview_keyboard()
             )
     except Exception as e:
+        log.warning(f"send_single_preview fallback: {e}")
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
@@ -811,25 +840,10 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 # -----------------------------------------------------------------------------
-# РЕДАКТОР ХЭШТЕГОВ (любой момент)
-# -----------------------------------------------------------------------------
-async def ask_edit_hashtags(chat_id: int):
-    current = " ".join(post_data.get("ai_hashtags") or [])
-    msg = (
-        "🔖 Пришли хэштеги одной строкой (пример):\n"
-        "<code>#AiCoin #AI $Ai #crypto #DeFi</code>\n\n"
-        f"Текущие: <i>{html_escape(current) if current else '—'}</i>"
-    )
-    await approval_bot.send_message(
-        chat_id=chat_id, text=msg, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="approve")]])
-    )
-
-# -----------------------------------------------------------------------------
 # CALLBACKS / INPUT
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_button_pressed_at, last_action_time, manual_expected_until
+    global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
     q = update.callback_query
     data = q.data
     uid = update.effective_user.id
@@ -845,12 +859,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[uid] = now
 
-    # Планировщик роутинг
+    # --- Планировщик: явные команды/префиксы ---
     planner_any = data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
     planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
     if data == "show_day_plan" or planner_any or planner_exit:
         ROUTE_TO_PLANNER.add(uid)
+        awaiting_hashtags_until = None
         await _route_to_planner(update, context)
         if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
@@ -863,6 +878,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
+        awaiting_hashtags_until = None
         await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
 
@@ -877,6 +893,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "self_post":
         ROUTE_TO_PLANNER.discard(uid)
+        awaiting_hashtags_until = None
         await approval_bot.send_message(
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото/видео одним сообщением:",
@@ -892,10 +909,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], image_url=None, header="Предпросмотр")
         return
 
+    # === ХЭШТЕГИ ===
     if data == "edit_hashtags":
-        await ask_edit_hashtags(TELEGRAM_APPROVAL_CHAT_ID)
+        awaiting_hashtags_until = now + timedelta(minutes=5)
+        cur = " ".join(post_data.get("ai_hashtags") or [])
+        hint = (
+            "🔖 Отправьте строку с хэштегами (через пробел/запятую). "
+            "Я учту только AI/crypto/$Ai и удалю дубли.\n"
+            f"Сейчас: {cur if cur else '—'}"
+        )
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, hint, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Очистить хэштеги", callback_data="clear_hashtags")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="approve")]
+        ]))
         return
 
+    if data == "clear_hashtags":
+        post_data["ai_hashtags"] = []
+        awaiting_hashtags_until = None
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Хэштеги очищены.")
+        await send_single_preview(post_data.get("text_en") or "", [], image_url=None, header="Предпросмотр")
+        return
+
+    # Публикация
     if data in ("post_twitter","post_telegram","post_both"):
         await publish_flow(publish_tg=(data!="post_twitter"), publish_tw=(data!="post_telegram"))
         return
@@ -909,10 +945,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "end_day":
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}", parse_mode="HTML", reply_markup=get_start_menu())
+        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}", parse_mode="HTML", reply_markup=get_start_menu())
         return
 
-# Ручной ввод — текст + медиа И/ИЛИ ввод хэштегов строкой
+# Ручной ввод — текст + фото/видео/док-видео; предпросмотр
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     now = datetime.now(TZ)
@@ -920,25 +956,8 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    raw_text = (update.message.text or update.message.caption or "").strip()
+    text = (update.message.text or update.message.caption or "").strip()
 
-    # Если пользователь прислал строку-хэштеги в режиме редактирования:
-    if raw_text and (raw_text.startswith("#") or raw_text.lower().startswith(("tags:", "теги:", "хэштеги:"))):
-        # срежем префикс tags:
-        cleaned = raw_text
-        for pref in ("tags:", "теги:", "хэштеги:"):
-            if cleaned.lower().startswith(pref):
-                cleaned = cleaned[len(pref):].strip()
-        post_data["ai_hashtags"] = _parse_tags_to_list(cleaned)
-        await approval_bot.send_message(
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text=f"🔖 Хэштеги обновлены: {' '.join(post_data['ai_hashtags']) or '—'}",
-            reply_markup=start_preview_keyboard()
-        )
-        manual_expected_until = None
-        return
-
-    text = raw_text
     media_kind = "none"
     media_src  = "tg"
     media_ref  = None
@@ -988,6 +1007,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
         return
 
     media_hash = await compute_media_hash_from_state()
+
     tg_status = tw_status = None
 
     if publish_tg:
@@ -1020,7 +1040,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 # Роутер сообщений
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_button_pressed_at, manual_expected_until
+    global last_button_pressed_at, manual_expected_until, awaiting_hashtags_until
     uid = update.effective_user.id
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -1029,12 +1049,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
+    # если пользователь в планировщике — всё туда
     if _planner_active_for(uid):
         return await _route_to_planner(update, context)
 
+    # если ждём хэштеги — обработаем здесь
+    if awaiting_hashtags_until and now <= awaiting_hashtags_until:
+        line = (update.message.text or update.message.caption or "").strip()
+        tags = _parse_hashtags_line(line)
+        post_data["ai_hashtags"] = tags
+        awaiting_hashtags_until = None
+        cur = " ".join(tags) if tags else "—"
+        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"✅ Хэштеги обновлены: {cur}")
+        return await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], image_url=None, header="Предпросмотр")
+
+    # «Сделай сам» — только в течение 5 минут после кнопки
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
+    # иначе — главное меню
     await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
@@ -1043,10 +1076,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_start(app: Application):
     await init_db()
     try:
-        text_en, ai_tags, _ = await ai_generate_content_en("General invite and value.")
+        text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
     except Exception as e:
         log.warning(f"ai_generate_content_en failed at start: {e}")
-        text_en, ai_tags = post_data["text_en"], post_data.get("ai_hashtags") or []
+        text_en, ai_tags, img = post_data["text_en"], post_data.get("ai_hashtags") or [], None
 
     post_data["text_en"] = text_en or ""
     post_data["ai_hashtags"] = ai_tags or []
@@ -1074,6 +1107,7 @@ async def check_inactivity_shutdown():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            log.warning(f"check_inactivity_shutdown error: {e}")
             try:
                 await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"⚠️ Ошибка наблюдателя активности: {e}\nНажми «Старт воркера», чтобы перезапустить.")
             except Exception:
@@ -1099,8 +1133,10 @@ def main():
         .build()
     )
 
-    register_planner_handlers(app)  # планировщик
+    # планировщик регистрирует свои хендлеры ПЕРВЫМ
+    register_planner_handlers(app)
 
+    # наши хендлеры — в высоких группах, чтобы planner.py ловил раньше при своей логике
     app.add_handler(CallbackQueryHandler(callback_handler), group=50)
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.VIDEO | filters.Document.IMAGE, message_handler), group=50)
 
