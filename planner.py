@@ -16,7 +16,7 @@ import re
 import asyncio
 import aiosqlite
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -25,8 +25,6 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 from telegram.error import BadRequest
 
@@ -73,7 +71,8 @@ CREATE TABLE IF NOT EXISTS plan_items (
 
 async def _ensure_db() -> None:
     global _db_ready
-    if _db_ready: return
+    if _db_ready:
+        return
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(CREATE_SQL)
         await db.commit()
@@ -155,7 +154,8 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
             (uid, iid)
         )
         row = await cur.fetchone()
-    if not row: return None
+    if not row:
+        return None
     return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
 
 async def _clone_item(uid: int, src: PlanItem) -> PlanItem:
@@ -396,16 +396,20 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_planner(update, context)
 
 # --------------------------------------
-# Текстовые сообщения (ввод для режимов)
+# (опционально) Текстовые сообщения для режимов — не регистрируем глобально!
 # --------------------------------------
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Этот роутер ДОЛЖЕН вызываться только когда основной бот целенаправленно
+    перенаправил пользователя в планировщик и мы ждём конкретный ввод (USER_STATE).
+    По умолчанию НЕ регистрируется, чтобы не перехватывать чужие тексты (например, хэштеги).
+    """
     uid = update.effective_user.id
     st = USER_STATE.get(uid)
     txt = (update.message.text or "").strip()
 
     if not st:
-        # если не ждём ввода — просто показать список
-        await open_planner(update, context)
+        # Ничего не ждём — отдаём управление основному боту
         return
 
     mode = st.get("mode")
@@ -464,7 +468,6 @@ async def planner_add_from_text(uid: int, text: str) -> int:
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     """Спрашивает у пользователя время для задачи последней/созданной записи.
        user_id нужен для USER_STATE; chat_id — куда слать сообщение."""
-    # в простейшем виде — найдём последнюю задачу
     items = await _get_items(uid)
     if not items:
         return
@@ -482,8 +485,8 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 # --------------------------------------
 def register_planner_handlers(app: Application) -> None:
     """
-    Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
-    забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
+    Регистрируем ТОЛЬКО callback-и планировщика (group=0), чтобы он НЕ перехватывал обычные тексты.
+    Тексты маршрутизируются основным ботом вручную в нужные моменты.
     """
     app.add_handler(
         CallbackQueryHandler(
@@ -492,7 +495,5 @@ def register_planner_handlers(app: Application) -> None:
         ),
         group=0
     )
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router),
-        group=0
-    )
+    # ВАЖНО: НЕ регистрируем глобальный MessageHandler для текста.
+    # Если понадобится — основной бот явно вызовет _msg_router сам.
