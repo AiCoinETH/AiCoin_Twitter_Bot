@@ -9,11 +9,6 @@
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, created_at)
   - item_id — локальная последовательность на пользователя (1,2,3,...) — сохраняется
-
-Главное изменение:
-  - Планировщик НЕ перехватывает произвольные текстовые сообщения. Он реагирует на текст
-    только когда явно ждёт ввода (USER_STATE[uid] установлен). Это исключает конфликт
-    с режимом «Сделай сам».
 """
 
 from __future__ import annotations
@@ -21,7 +16,7 @@ import re
 import asyncio
 import aiosqlite
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -33,7 +28,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 # ------------------
 # Константы / глобалы
@@ -78,8 +73,7 @@ CREATE TABLE IF NOT EXISTS plan_items (
 
 async def _ensure_db() -> None:
     global _db_ready
-    if _db_ready: 
-        return
+    if _db_ready: return
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(CREATE_SQL)
         await db.commit()
@@ -161,12 +155,26 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
             (uid, iid)
         )
         row = await cur.fetchone()
-    if not row: 
-        return None
+    if not row: return None
     return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
 
 async def _clone_item(uid: int, src: PlanItem) -> PlanItem:
     return await _insert_item(uid, text=src.text, when_hhmm=src.when_hhmm)
+
+async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
+    """Найти следующую задачу по item_id."""
+    await _ensure_db()
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT user_id, item_id, text, when_hhmm, done FROM plan_items "
+            "WHERE user_id=? AND item_id>? ORDER BY item_id ASC LIMIT 1",
+            (uid, after_iid)
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
 
 # -------------------------
 # Рендеринг и клавиатуры UI
@@ -222,23 +230,31 @@ def _parse_time(s: str) -> Optional[str]:
 # Безопасное редактирование сообщения
 # ---------------
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
-    """
-    Безопасно редактируем сообщение. Если «Message is not modified» или
-    «message to edit not found/can't be edited» — молча игнорируем.
-    """
+    """Безопасно редактируем сообщение. Если «Message is not modified» — игнорируем.
+       Если включился flood control — ждём и пробуем ещё раз."""
     try:
         await q.edit_message_text(text=text, reply_markup=reply_markup)
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, "retry_after", 2))
+        try:
+            await q.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception:
+            # последний fallback — тихо
+            return
     except BadRequest as e:
-        s = str(e)
-        if (
-            "Message is not modified" in s
-            or "message to edit not found" in s
-            or "message can't be edited" in s
-        ):
+        if "Message is not modified" in str(e):
             try:
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
-            except BadRequest:
-                return
+            except RetryAfter as e2:
+                await asyncio.sleep(getattr(e2, "retry_after", 2))
+                try:
+                    await q.edit_message_reply_markup(reply_markup=reply_markup)
+                except Exception:
+                    return
+            except BadRequest as e2:
+                if "Message is not modified" in str(e2):
+                    return
+                raise
             return
         raise
 
@@ -416,15 +432,25 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = USER_STATE.get(uid)
     txt = (update.message.text or "").strip()
 
-    # ВАЖНО:
-    # Если мы НЕ ждём никакого ввода — НИЧЕГО не делаем, чтобы не мешать «Сделай сам».
     if not st:
+        # если не ждём ввода — просто показать список
+        await open_planner(update, context)
         return
 
     mode = st.get("mode")
     if mode == "edit_text":
         iid = int(st.get("item_id"))
         await _update_text(uid, iid, txt)
+        it = await _get_item(uid, iid)
+        # Если у задачи не задано время — сразу спрашиваем
+        if it and not it.when_hhmm:
+            USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
+            await update.message.reply_text(
+                f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+            )
+            return
+        # иначе — просто назад к списку
         await update.message.reply_text("✅ Текст обновлён.")
         USER_STATE.pop(uid, None)
         await open_planner(update, context)
@@ -439,6 +465,25 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _update_time(uid, iid, t)
         await update.message.reply_text(f"✅ Время установлено: {t}")
         USER_STATE.pop(uid, None)
+
+        # Переходим к следующей задаче, если есть
+        nxt = await _find_next_item(uid, iid)
+        if nxt:
+            if not nxt.when_hhmm:
+                USER_STATE[uid] = {"mode": "edit_time", "item_id": nxt.item_id}
+                await update.message.reply_text(
+                    f"➡️ Следующая: #{nxt.item_id}\n⏰ Введи время в формате HH:MM (по Киеву)",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
+                )
+                return
+            else:
+                await update.message.reply_text(
+                    f"➡️ Следующая задача #{nxt.item_id}\n{_fmt_item(nxt)}",
+                    reply_markup=_kb_item(nxt)
+                )
+                return
+
+        # Если следующей нет — вернёмся к списку
         await open_planner(update, context)
         return
 
@@ -464,7 +509,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # На всякий случай сброс
+    # на всякий
     USER_STATE.pop(uid, None)
     await open_planner(update, context)
 
@@ -477,6 +522,7 @@ async def planner_add_from_text(uid: int, text: str) -> int:
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     """Спрашивает у пользователя время для задачи последней/созданной записи.
        user_id нужен для USER_STATE; chat_id — куда слать сообщение."""
+    # в простейшем виде — найдём последнюю задачу
     items = await _get_items(uid)
     if not items:
         return
@@ -495,8 +541,7 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 def register_planner_handlers(app: Application) -> None:
     """
     Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
-    забирал только свои колбэки.
-    ВАЖНО: Текст обрабатываем только при ожидаемом вводе (см. _msg_router).
+    забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
     """
     app.add_handler(
         CallbackQueryHandler(
