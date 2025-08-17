@@ -19,6 +19,8 @@ twitter_bot.py — согласование/генерация/публикац�
 - 🛠 GitHub upload теперь через base64 (PyGithub требует base64-строку).
 - 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
 - 🆕 Режим override: «только ссылки + пользовательские хэштеги (≤275)» без хвостов и автотегов.
+- 🆕 Twitter TRIM POLICY: если тело обрезается — ВСЕГДА добавляем « … » перед блоком «ссылки и хэштеги», чтобы хвост не терялся.
+- 🆕 OpenAI SDK: переход на client.chat.completions.create (вместо .chat_completions).
 """
 
 import os
@@ -180,13 +182,6 @@ def twitter_len(s: str) -> int:
     s = normalize("NFC", s)
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
-def trim_plain_to(s: str, max_len: int) -> str:
-    if not s: return s
-    s = normalize("NFC", s).strip()
-    if len(s) <= max_len: return s
-    ell = '…'
-    return (s[: max_len - len(ell)] + ell).rstrip()
-
 def trim_to_twitter_len(s: str, max_len: int) -> str:
     if not s: return s
     s = normalize("NFC", s).strip()
@@ -219,14 +214,13 @@ def _dedup_hashtags(*groups):
     return " ".join(out)
 
 def _parse_hashtags_line(line: str) -> List[str]:
-    """Парсим свободный ввод: разделители — пробелы, запятые, переносы. Добавляем #, если нужно. (с тематическим фильтром)"""
     if not line: return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
     filtered = _dedup_hashtags(raw).split()
     return filtered
 
-# ======== НОВОЕ: пользовательские теги без тематического фильтра ========
+# ======== Пользовательские теги (без тематического фильтра) ========
 def _normalize_hashtag_any(t: str) -> str:
     t = (t or "").strip()
     if not t:
@@ -250,23 +244,17 @@ def _dedup_any_hashtags(tags: List[str]) -> List[str]:
     return out
 
 def _parse_hashtags_line_user(line: str) -> List[str]:
-    """Парсим любые хэштеги пользователя, без тематического фильтра."""
     if not line:
         return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
     return _dedup_any_hashtags(raw)
 
-# ======== НОВОЕ: трим с сохранением целых URL ========
+# ======== Трим с сохранением целых URL (в теле) ========
 def trim_preserving_urls(body: str, max_len: int) -> str:
-    """
-    Обрезает текст так, чтобы twitter_len <= max_len, не разрывая URL.
-    Нелинковые сегменты режем посимвольно, ссылки — либо целиком, либо не вставляем.
-    """
     body = (body or "").strip()
     if max_len <= 0 or not body:
         return ""
-
     parts = []
     last = 0
     for m in _URL_RE.finditer(body):
@@ -311,63 +299,101 @@ def trim_preserving_urls(body: str, max_len: int) -> str:
                 break
     return out.strip()
 
-def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
-    MAX_TWEET_SAFE = 275
-    tail_required = TW_TAIL_REQUIRED
+# ======== Сборка хвоста и твита (основной режим) ========
+def _tail_block(ai_tags: List[str] | None) -> str:
     tags_str = _dedup_hashtags(MY_HASHTAGS_STR, ai_tags or [])
-    tail_full = (tail_required + (f" {tags_str}" if tags_str else "")).strip()
+    return (TW_TAIL_REQUIRED + (f" {tags_str}" if tags_str else "")).strip()
+
+def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
+    """
+    Политика: лимит 275, если тело пришлось обрезать — добавляем ' … ' перед блоком «ссылки+хэштеги».
+    Хвост не исчезает никогда. Если комбинированный хвост длинный — деградируем до обязательных ссылок.
+    """
+    MAX_TWEET = 275
     body = (body_text or "").strip()
 
-    def compose(b, t): return f"{b} {t}".strip() if (b and t) else (b or t)
+    tail_full = _tail_block(ai_tags)
+    tail_req  = TW_TAIL_REQUIRED
 
-    allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail_full) else 0) - twitter_len(tail_full)
-    if allowed_for_body < 0:
-        tail = tail_required
-        allowed_for_body = MAX_TWEET_SAFE - (1 if (body and tail) else 0) - twitter_len(tail)
+    # если "полный" хвост сам по себе > лимита — возьмём только обязательные ссылки
+    tail = tail_full if twitter_len(tail_full) <= MAX_TWEET else tail_req
+
+    # первая попытка: без учёта ' … '
+    sep = 1 if (body and tail) else 0
+    allowed = MAX_TWEET - twitter_len(tail) - sep
+    allowed = max(0, allowed)
+
+    # трим по twitter_len
+    body_trimmed = trim_to_twitter_len(body, allowed)
+    was_trimmed_initial = twitter_len(body) > twitter_len(body_trimmed)
+
+    # если пришлось резать — выделим 2 символа под " …"
+    if was_trimmed_initial and tail:
+        allowed2 = MAX_TWEET - twitter_len(tail) - sep - 2  # пробел + '…'
+        allowed2 = max(0, allowed2)
+        body_trimmed = trim_to_twitter_len(body, allowed2)
+        # финальная сборка с " … "
+        tweet = f"{body_trimmed} … {tail}".strip() if body_trimmed else tail
     else:
-        tail = tail_full
+        # сборка без " … "
+        tweet = f"{body_trimmed} {tail}".strip() if (body_trimmed and tail) else (body_trimmed or tail)
 
-    body_trimmed = trim_to_twitter_len(body, allowed_for_body)
-    tweet = compose(body_trimmed, tail)
-    while twitter_len(tweet) > MAX_TWEET_SAFE and body_trimmed:
-        body_trimmed = trim_to_twitter_len(body_trimmed[:-1], allowed_for_body)
-        tweet = compose(body_trimmed, tail)
-    if twitter_len(tweet) > MAX_TWEET_SAFE:
-        tweet = tail_required
+    # страховка по длине
+    if twitter_len(tweet) > MAX_TWEET:
+        # попробуем деградировать до минимального хвоста
+        if tail != tail_req:
+            tail = tail_req
+            was_trimmed = twitter_len(body) > allowed
+            if was_trimmed:
+                allowed2 = MAX_TWEET - twitter_len(tail) - (1 if body else 0) - 2
+                allowed2 = max(0, allowed2)
+                body_trimmed = trim_to_twitter_len(body, allowed2)
+                tweet = f"{body_trimmed} … {tail}".strip() if body_trimmed else tail
+            else:
+                allowed = MAX_TWEET - twitter_len(tail) - (1 if body else 0)
+                allowed = max(0, allowed)
+                body_trimmed = trim_to_twitter_len(body, allowed)
+                tweet = f"{body_trimmed} {tail}".strip() if (body_trimmed and tail) else (body_trimmed or tail)
+
+    if twitter_len(tweet) > MAX_TWEET:
+        tweet = tail_req  # крайний случай — только обязательные ссылки
+
     return tweet
 
-# ======== НОВОЕ: сборка «только ссылки + пользовательские теги» ========
+# ======== Режим «только ссылки + пользовательские теги» ========
 def build_tweet_user_hashtags_275(body_text: str, user_tags: List[str] | None) -> str:
     """
-    ТОЧНО по ТЗ:
-      - сохраняем ссылки из body_text
-      - добавляем ТОЛЬКО пользовательские хэштеги (без хвостов и автотегов)
-      - общий лимит 275 (учитывая t.co=23)
+    - сохраняем ссылки и текст из body_text
+    - добавляем ТОЛЬКО пользовательские хэштеги (без хвостов/автотегов)
+    - общий лимит 275 (учёт t.co=23)
+    - если тело урезали — ставим ' … ' перед тегами
     """
     MAX_TWEET = 275
     body = (body_text or "").strip()
     tags_str = " ".join(user_tags or []).strip()
 
-    tail_len = twitter_len(tags_str)
+    if not tags_str:
+        # нет тегов — просто урежем тело
+        return trim_preserving_urls(body, MAX_TWEET)
+
+    # сначала считаем без " … "
     sep = 1 if (body and tags_str) else 0
-    allowed_for_body = MAX_TWEET - tail_len - sep
-    if allowed_for_body < 0:
-        allowed_for_body = 0
+    allowed = MAX_TWEET - twitter_len(tags_str) - sep
+    allowed = max(0, allowed)
+    body_trimmed = trim_preserving_urls(body, allowed)
+    was_trimmed = twitter_len(body) > twitter_len(body_trimmed)
 
-    body_trimmed = trim_preserving_urls(body, allowed_for_body)
+    if was_trimmed:
+        # добавляем место под ' … '
+        allowed2 = MAX_TWEET - twitter_len(tags_str) - sep - 2
+        allowed2 = max(0, allowed2)
+        body_trimmed = trim_preserving_urls(body, allowed2)
+        tweet = f"{body_trimmed} … {tags_str}".strip() if body_trimmed else tags_str
+    else:
+        tweet = f"{body_trimmed} {tags_str}".strip() if (body_trimmed and tags_str) else (body_trimmed or tags_str)
 
-    def compose(b, t):
-        return f"{b} {t}".strip() if (b and t) else (b or t)
-
-    tweet = compose(body_trimmed, tags_str)
-
-    # страховка
-    while twitter_len(tweet) > MAX_TWEET and body_trimmed:
-        body_trimmed = trim_preserving_urls(body_trimmed[:-1], allowed_for_body)
-        tweet = compose(body_trimmed, tags_str)
-
+    # страховка: если всё ещё длинно — режем теги слева-направо
     if twitter_len(tweet) > MAX_TWEET:
-        # если даже без текста не влезли — ужимаем теги по одному слева-направо
         acc = []
         for t in (user_tags or []):
             test = " ".join(acc + [t]).strip()
@@ -376,6 +402,11 @@ def build_tweet_user_hashtags_275(body_text: str, user_tags: List[str] | None) -
             else:
                 break
         tweet = " ".join(acc).strip()
+
+    if twitter_len(tweet) > MAX_TWEET:
+        # крайний случай — только обрезанное тело
+        tweet = trim_preserving_urls(body, MAX_TWEET)
+
     return tweet
 
 def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
@@ -478,7 +509,6 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
 
 async def save_image_and_get_github_url(image_path):
     filename = f"{uuid.uuid4().hex}.jpg"
-    # небольшой фикс имени
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
@@ -525,7 +555,6 @@ def sha256_hex(data: bytes) -> str:
     return _h.sha256(data).hexdigest()
 
 async def compute_media_hash_from_state() -> Optional[str]:
-    """Считает хэш текущего медиа (image/video), если есть. Для TG скачиваем файл временно."""
     kind = post_data.get("media_kind")
     src  = post_data.get("media_src")
     ref  = post_data.get("media_ref")
@@ -576,7 +605,8 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
 # -----------------------------------------------------------------------------
 def _oa_chat_text(prompt: str) -> str:
     try:
-        resp = client_oa.chat_completions.create(
+        # FIX: новый путь в SDK — chat.completions
+        resp = client_oa.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
@@ -971,6 +1001,15 @@ def _planner_active_for(uid: int) -> bool:
 async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
         return await open_planner(update, context)
+    # мягкое уведомление, если модуль не подключён
+    try:
+        await approval_bot.send_message(
+            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="⚠️ Планировщик не подключён (planner.py). Работаем в ручном режиме.",
+            reply_markup=get_start_menu()
+        )
+    except Exception:
+        pass
     return
 
 # -----------------------------------------------------------------------------
@@ -1060,7 +1099,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "clear_hashtags":
         post_data["ai_hashtags"] = []
-        post_data["user_tags_override"] = False  # сбрасываем режим override
+        post_data["user_tags_override"] = False
         awaiting_hashtags_until = None
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Хэштеги очищены. Режим Twitter вернулся к стандартному (хвост + автотеги).")
         await send_single_preview(post_data.get("text_en") or "", [], image_url=None, header="Предпросмотр")
@@ -1195,10 +1234,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # если ждём хэштеги — обработаем здесь
     if awaiting_hashtags_until and now <= awaiting_hashtags_until:
         line = (update.message.text or update.message.caption or "").strip()
-        # пользователь вводит ЛЮБЫЕ теги — без тематического фильтра
         tags = _parse_hashtags_line_user(line)
         post_data["ai_hashtags"] = tags
-        post_data["user_tags_override"] = True  # включаем режим «только ссылки + мои теги» для X
+        post_data["user_tags_override"] = True
         awaiting_hashtags_until = None
         cur = " ".join(tags) if tags else "—"
         await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: только ссылки + твои теги (≤275).")
