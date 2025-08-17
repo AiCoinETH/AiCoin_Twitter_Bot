@@ -19,7 +19,7 @@ twitter_bot.py — согласование/генерация/публикац�
 - ✅ «Сделай сам» перехватывает сообщения только 5 минут после нажатия.
 
 Доп. фиксы в этой правке:
-- 🛠 GitHub upload через base64 (PyGithub требует base64-строку).
+- 🛠 Github upload: передаём СЫРОЙ контент (без ручного base64).
 - 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
 """
 
@@ -338,14 +338,14 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
 # GitHub helpers (для предпросмотра TG-фото)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
-    """ВАЖНО: PyGithub.create_file ожидает base64-строку."""
+    """Загружает файл в репозиторий. PyGithub САМ кодирует контент в base64 — передаём сырой контент."""
     try:
         with open(image_path, "rb") as img_file:
-            content_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+            content_raw = img_file.read()
         github_repo.create_file(
             f"{GITHUB_IMAGE_PATH}/{filename}",
             "upload image for post",
-            content_b64,
+            content_raw,
             branch="main"
         )
         return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_IMAGE_PATH}/{filename}"
