@@ -9,6 +9,11 @@
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, created_at)
   - item_id — локальная последовательность на пользователя (1,2,3,...) — сохраняется
+
+Главное изменение:
+  - Планировщик НЕ перехватывает произвольные текстовые сообщения. Он реагирует на текст
+    только когда явно ждёт ввода (USER_STATE[uid] установлен). Это исключает конфликт
+    с режимом «Сделай сам».
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import re
 import asyncio
 import aiosqlite
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -25,6 +30,8 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from telegram.error import BadRequest
 
@@ -71,7 +78,7 @@ CREATE TABLE IF NOT EXISTS plan_items (
 
 async def _ensure_db() -> None:
     global _db_ready
-    if _db_ready:
+    if _db_ready: 
         return
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(CREATE_SQL)
@@ -154,7 +161,7 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
             (uid, iid)
         )
         row = await cur.fetchone()
-    if not row:
+    if not row: 
         return None
     return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
 
@@ -215,17 +222,23 @@ def _parse_time(s: str) -> Optional[str]:
 # Безопасное редактирование сообщения
 # ---------------
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
-    """Безопасно редактируем сообщение. Если «Message is not modified» — молча игнорируем."""
+    """
+    Безопасно редактируем сообщение. Если «Message is not modified» или
+    «message to edit not found/can't be edited» — молча игнорируем.
+    """
     try:
         await q.edit_message_text(text=text, reply_markup=reply_markup)
     except BadRequest as e:
-        if "Message is not modified" in str(e):
+        s = str(e)
+        if (
+            "Message is not modified" in s
+            or "message to edit not found" in s
+            or "message can't be edited" in s
+        ):
             try:
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
-            except BadRequest as e2:
-                if "Message is not modified" in str(e2):
-                    return
-                raise
+            except BadRequest:
+                return
             return
         raise
 
@@ -396,20 +409,16 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_planner(update, context)
 
 # --------------------------------------
-# (опционально) Текстовые сообщения для режимов — не регистрируем глобально!
+# Текстовые сообщения (ввод для режимов)
 # --------------------------------------
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Этот роутер ДОЛЖЕН вызываться только когда основной бот целенаправленно
-    перенаправил пользователя в планировщик и мы ждём конкретный ввод (USER_STATE).
-    По умолчанию НЕ регистрируется, чтобы не перехватывать чужие тексты (например, хэштеги).
-    """
     uid = update.effective_user.id
     st = USER_STATE.get(uid)
     txt = (update.message.text or "").strip()
 
+    # ВАЖНО:
+    # Если мы НЕ ждём никакого ввода — НИЧЕГО не делаем, чтобы не мешать «Сделай сам».
     if not st:
-        # Ничего не ждём — отдаём управление основному боту
         return
 
     mode = st.get("mode")
@@ -455,7 +464,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # на всякий
+    # На всякий случай сброс
     USER_STATE.pop(uid, None)
     await open_planner(update, context)
 
@@ -485,8 +494,9 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 # --------------------------------------
 def register_planner_handlers(app: Application) -> None:
     """
-    Регистрируем ТОЛЬКО callback-и планировщика (group=0), чтобы он НЕ перехватывал обычные тексты.
-    Тексты маршрутизируются основным ботом вручную в нужные моменты.
+    Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
+    забирал только свои колбэки.
+    ВАЖНО: Текст обрабатываем только при ожидаемом вводе (см. _msg_router).
     """
     app.add_handler(
         CallbackQueryHandler(
@@ -495,5 +505,7 @@ def register_planner_handlers(app: Application) -> None:
         ),
         group=0
     )
-    # ВАЖНО: НЕ регистрируем глобальный MessageHandler для текста.
-    # Если понадобится — основной бот явно вызовет _msg_router сам.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router),
+        group=0
+    )
