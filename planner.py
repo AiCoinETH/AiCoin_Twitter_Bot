@@ -14,6 +14,7 @@
 from __future__ import annotations
 import re
 import asyncio
+import logging
 import aiosqlite
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
@@ -31,8 +32,9 @@ from telegram.ext import (
 from telegram.error import BadRequest, RetryAfter
 
 # ------------------
-# Константы / глобалы
+# Логи / Константы / глобалы
 # ------------------
+log = logging.getLogger("planner")
 TZ = ZoneInfo("Europe/Kyiv")
 DB_FILE = "planner.db"
 
@@ -40,10 +42,13 @@ USER_STATE: Dict[int, dict] = {}   # ожидания ввода (правка �
 _ai_generator: Optional[Callable[[str], "asyncio.Future"]] = None
 _db_ready = False  # ленивый init
 
+
 def set_ai_generator(fn: Callable[[str], "asyncio.Future"]) -> None:
     """Бот отдаёт сюда свой AI-генератор (async)."""
     global _ai_generator
     _ai_generator = fn
+    log.info("AI generator set: %s", bool(fn))
+
 
 # ------------
 # Модель данных
@@ -55,6 +60,7 @@ class PlanItem:
     text: str
     when_hhmm: Optional[str]  # "HH:MM" | None
     done: bool
+
 
 # ------------
 # База (SQLite)
@@ -73,14 +79,18 @@ CREATE TABLE IF NOT EXISTS plan_items (
 
 async def _ensure_db() -> None:
     global _db_ready
-    if _db_ready: return
+    if _db_ready:
+        return
+    log.info("DB init start: %s", DB_FILE)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(CREATE_SQL)
         await db.commit()
     _db_ready = True
+    log.info("DB init complete")
 
 async def _get_items(uid: int) -> List[PlanItem]:
     await _ensure_db()
+    log.debug("DB: get items for uid=%s", uid)
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -88,23 +98,29 @@ async def _get_items(uid: int) -> List[PlanItem]:
             (uid,)
         )
         rows = await cur.fetchall()
-    return [
+    items = [
         PlanItem(user_id=r["user_id"], item_id=r["item_id"], text=r["text"],
                  when_hhmm=r["when_hhmm"], done=bool(r["done"]))
         for r in rows
     ]
+    log.debug("DB: get items -> %d rows", len(items))
+    return items
 
 async def _next_item_id(uid: int) -> int:
     await _ensure_db()
+    log.debug("DB: get next item_id for uid=%s", uid)
     async with aiosqlite.connect(DB_FILE) as db:
         cur = await db.execute("SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?", (uid,))
         (mx,) = await cur.fetchone()
-    return int(mx) + 1
+    nxt = int(mx) + 1
+    log.debug("DB: next item_id=%s", nxt)
+    return nxt
 
 async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None) -> PlanItem:
     iid = await _next_item_id(uid)
     now = datetime.now(TZ).isoformat()
     await _ensure_db()
+    log.info("DB: insert item uid=%s iid=%s time=%s", uid, iid, when_hhmm)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, created_at) VALUES (?,?,?,?,?,?)",
@@ -115,6 +131,7 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
 
 async def _update_text(uid: int, iid: int, text: str) -> None:
     await _ensure_db()
+    log.info("DB: update text uid=%s iid=%s len=%s", uid, iid, len(text or ""))
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?",
@@ -124,6 +141,7 @@ async def _update_text(uid: int, iid: int, text: str) -> None:
 
 async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
     await _ensure_db()
+    log.info("DB: update time uid=%s iid=%s time=%s", uid, iid, when_hhmm)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?",
@@ -133,6 +151,7 @@ async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
 
 async def _update_done(uid: int, iid: int, done: bool) -> None:
     await _ensure_db()
+    log.info("DB: update done uid=%s iid=%s -> %s", uid, iid, done)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?",
@@ -142,12 +161,14 @@ async def _update_done(uid: int, iid: int, done: bool) -> None:
 
 async def _delete_item(uid: int, iid: int) -> None:
     await _ensure_db()
+    log.info("DB: delete item uid=%s iid=%s", uid, iid)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("DELETE FROM plan_items WHERE user_id=? AND item_id=?", (uid, iid))
         await db.commit()
 
 async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     await _ensure_db()
+    log.debug("DB: get item uid=%s iid=%s", uid, iid)
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -155,15 +176,21 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
             (uid, iid)
         )
         row = await cur.fetchone()
-    if not row: return None
-    return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
+    if not row:
+        log.debug("DB: get item -> None")
+        return None
+    item = PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
+    log.debug("DB: get item -> %s", item)
+    return item
 
 async def _clone_item(uid: int, src: PlanItem) -> PlanItem:
+    log.info("DB: clone item uid=%s src_iid=%s", uid, src.item_id)
     return await _insert_item(uid, text=src.text, when_hhmm=src.when_hhmm)
 
 async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
     """Найти следующую задачу по item_id."""
     await _ensure_db()
+    log.debug("DB: find next item uid=%s after_iid=%s", uid, after_iid)
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -173,8 +200,12 @@ async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
         )
         row = await cur.fetchone()
     if not row:
+        log.debug("DB: find next item -> None")
         return None
-    return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
+    nxt = PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
+    log.debug("DB: find next item -> iid=%s", nxt.item_id)
+    return nxt
+
 
 # -------------------------
 # Рендеринг и клавиатуры UI
@@ -187,6 +218,7 @@ def _fmt_item(i: PlanItem) -> str:
 
 async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     items = await _get_items(uid)
+    log.debug("UI: build main keyboard for uid=%s, items=%d", uid, len(items))
     rows: List[List[InlineKeyboardButton]] = []
     for it in items:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
@@ -199,6 +231,7 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
+    log.debug("UI: build item keyboard iid=%s", it.item_id)
     rows = [
         [InlineKeyboardButton("✏️ Текст", callback_data=f"EDIT_ITEM:{it.item_id}"),
          InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{it.item_id}")],
@@ -211,7 +244,9 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def _kb_gen_topic() -> InlineKeyboardMarkup:
+    log.debug("UI: build topic keyboard")
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
+
 
 # ---------------
 # Парсеры/хелперы
@@ -222,41 +257,75 @@ def _parse_time(s: str) -> Optional[str]:
     s = (s or "").strip()
     m = _TIME_RE.match(s)
     if not m:
+        log.debug("Time parse failed: %r", s)
         return None
     hh, mm = m.groups()
-    return f"{int(hh):02d}:{int(mm):02d}"
+    res = f"{int(hh):02d}:{int(mm):02d}"
+    log.debug("Time parsed: %r -> %s", s, res)
+    return res
+
 
 # ---------------
-# Безопасное редактирование сообщения
+# Безопасные действия TG
 # ---------------
+async def _safe_q_answer(q) -> bool:
+    try:
+        await q.answer()
+        return True
+    except BadRequest as e:
+        if "query is too old" in str(e).lower():
+            log.warning("TG: callback too old; ignore.")
+            return False
+        raise
+    except RetryAfter as e:
+        delay = getattr(e, "retry_after", 2) + 1
+        log.warning("TG: answerCallbackQuery flood, sleep=%s", delay)
+        await asyncio.sleep(delay)
+        try:
+            await q.answer()
+            return True
+        except Exception:
+            return False
+
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
     """Безопасно редактируем сообщение. Если «Message is not modified» — игнорируем.
        Если включился flood control — ждём и пробуем ещё раз."""
     try:
+        log.debug("TG: edit_message_text")
         await q.edit_message_text(text=text, reply_markup=reply_markup)
     except RetryAfter as e:
-        await asyncio.sleep(getattr(e, "retry_after", 2))
+        delay = getattr(e, "retry_after", 2) + 1
+        log.warning("TG: edit_message_text flood, sleep=%s", delay)
+        await asyncio.sleep(delay)
         try:
             await q.edit_message_text(text=text, reply_markup=reply_markup)
-        except Exception:
-            # последний fallback — тихо
+        except Exception as e2:
+            log.error("TG: edit_message_text retry failed: %s", e2)
             return
     except BadRequest as e:
         if "Message is not modified" in str(e):
             try:
+                log.debug("TG: edit_message_reply_markup only")
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
             except RetryAfter as e2:
-                await asyncio.sleep(getattr(e2, "retry_after", 2))
+                delay = getattr(e2, "retry_after", 2) + 1
+                log.warning("TG: edit_message_reply_markup flood, sleep=%s", delay)
+                await asyncio.sleep(delay)
                 try:
                     await q.edit_message_reply_markup(reply_markup=reply_markup)
-                except Exception:
+                except Exception as e3:
+                    log.error("TG: edit_message_reply_markup retry failed: %s", e3)
                     return
             except BadRequest as e2:
                 if "Message is not modified" in str(e2):
+                    log.debug("TG: nothing to modify; pass")
                     return
+                log.error("TG: edit_message_reply_markup bad request: %s", e2)
                 raise
             return
+        log.error("TG: edit_message_text bad request: %s", e)
         raise
+
 
 # -----------------------------
 # Публичный entry-point для бота
@@ -264,12 +333,15 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Открыть/обновить экран планировщика."""
     uid = update.effective_user.id
+    log.info("Planner: open for uid=%s (cb=%s)", uid, bool(update.callback_query))
     kb = await _kb_main(uid)
     text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
     if update.callback_query:
         await edit_or_pass(update.callback_query, text, kb)
     else:
         await update.effective_message.reply_text(text=text, reply_markup=kb)
+    log.debug("Planner: open done for uid=%s", uid)
+
 
 # --------------------------------------
 # Внутренний роутер callback-кнопок (group=0)
@@ -277,17 +349,21 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = update.effective_user.id
-    data = q.data or ""
+    data = (q.data or "").strip()
+    log.info("CB router: uid=%s data=%r", uid, data)
+
+    await _safe_q_answer(q)
 
     # показать список
     if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
+        log.debug("CB: open list")
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     # добавление пустой — сразу спросить время
     if data == "PLAN_ADD_EMPTY":
+        log.debug("CB: add empty")
         it = await _insert_item(uid, "")
-        await q.answer("Добавлено. Укажи время.")
         USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
         await edit_or_pass(
             q,
@@ -298,6 +374,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # запрос генерации новой темы от ИИ (сначала тема, потом время)
     if data == "PLAN_ADD_AI":
+        log.debug("CB: add via AI (request topic)")
         USER_STATE[uid] = {"mode": "waiting_new_topic"}
         await edit_or_pass(
             q,
@@ -312,51 +389,73 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             iid = int(data.split(":", 1)[1])
         except Exception:
+            log.warning("CB: ITEM_MENU parse error: %r", data)
             await q.answer("Некорректный ID")
             return
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Задача не найдена")
             return
+        log.debug("CB: open item menu iid=%s", iid)
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     # удалить
     if data.startswith("DEL_ITEM:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         await _delete_item(uid, iid)
         await q.answer("Удалено.")
+        log.info("CB: deleted iid=%s", iid)
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     # клон
     if data.startswith("CLONE_ITEM:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         src = await _get_item(uid, iid)
         if not src:
             await q.answer("Нет такой задачи")
             return
         await _clone_item(uid, src)
         await q.answer("Склонировано.")
+        log.info("CB: cloned iid=%s", iid)
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     # переключить статус done
     if data.startswith("TOGGLE_DONE:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Нет такой задачи")
             return
         await _update_done(uid, iid, not it.done)
         it = await _get_item(uid, iid)
+        log.info("CB: toggle done iid=%s -> %s", iid, it.done if it else None)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     # правка текста
     if data.startswith("EDIT_ITEM:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         USER_STATE[uid] = {"mode": "edit_text", "item_id": iid}
+        log.debug("CB: edit text iid=%s", iid)
         await edit_or_pass(
             q,
             f"✏️ Введи новый текст для задачи #{iid}",
@@ -366,8 +465,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # правка времени
     if data.startswith("EDIT_TIME:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
+        log.debug("CB: edit time iid=%s", iid)
         await edit_or_pass(
             q,
             f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
@@ -377,7 +481,11 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # автозаполнение текста ИИ
     if data.startswith("AI_FILL_TEXT:"):
-        iid = int(data.split(":", 1)[1])
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID")
+            return
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Нет такой задачи")
@@ -385,14 +493,17 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = it.text or "daily task for Ai Coin"
         if _ai_generator:
             try:
+                log.info("AI: fill text for iid=%s hint=%r", iid, hint[:80])
                 txt, tags, img = await _ai_generator(hint)
                 txt = (txt or "").strip()
                 if txt:
                     await _update_text(uid, iid, txt)
                 await q.answer("Текст обновлён ИИ.")
-            except Exception:
+            except Exception as e:
+                log.error("AI: generation error: %s", e)
                 await q.answer("Ошибка генерации")
         else:
+            log.warning("AI: generator not set")
             await q.answer("ИИ-генератор не подключен")
         it = await _get_item(uid, iid)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
@@ -401,14 +512,15 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # создание новой задачи сразу от ИИ
     if data.startswith("AI_NEW_FROM:"):
         topic = data.split(":", 1)[1].strip() or "general"
+        log.info("AI: new from topic=%r", topic)
         it = await _insert_item(uid, f"(генерация: {topic})")
         if _ai_generator:
             try:
                 txt, tags, img = await _ai_generator(topic)
                 if txt:
-                    await _update_text(uid, it.item_id, txt)
-            except Exception:
-                pass
+                    await _update_text(uid, it.item_id, (txt or "").strip())
+            except Exception as e:
+                log.error("AI: generation error on create: %s", e)
         await q.answer("Создано. Укажи время.")
         USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
         await edit_or_pass(
@@ -422,22 +534,27 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # fallback: любые остальные PLAN_*
     if data.startswith("PLAN_"):
+        log.debug("CB: fallback open planner for %r", data)
         await open_planner(update, context)
+
 
 # --------------------------------------
 # Текстовые сообщения (ввод для режимов)
 # --------------------------------------
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    st = USER_STATE.get(uid)
     txt = (update.message.text or "").strip()
+    st = USER_STATE.get(uid)
 
+    # Главное исправление: если не ждём ввода — НЕ перехватываем сообщение,
+    # даём пройти основному боту.
     if not st:
-        # если не ждём ввода — просто показать список
-        await open_planner(update, context)
+        log.debug("MSG: skip (no pending state) uid=%s text=%r", uid, txt[:80])
         return
 
     mode = st.get("mode")
+    log.info("MSG: uid=%s mode=%s text=%r", uid, mode, txt[:120])
+
     if mode == "edit_text":
         iid = int(st.get("item_id"))
         await _update_text(uid, iid, txt)
@@ -450,7 +567,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
             )
             return
-        # иначе — просто назад к списку
+        # иначе — в список
         await update.message.reply_text("✅ Текст обновлён.")
         USER_STATE.pop(uid, None)
         await open_planner(update, context)
@@ -489,6 +606,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "waiting_new_topic":
         topic = txt or "general"
+        log.info("AI: create new from topic via message: %r", topic)
         it = await _insert_item(uid, f"(генерация: {topic})")
         if _ai_generator:
             try:
@@ -496,7 +614,8 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if gen_text:
                     await _update_text(uid, it.item_id, gen_text)
                 await update.message.reply_text("✨ Создано с помощью ИИ.")
-            except Exception:
+            except Exception as e:
+                log.error("AI: generation error on message: %s", e)
                 await update.message.reply_text("⚠️ Не удалось сгенерировать, создана пустая задача.")
         else:
             await update.message.reply_text("Создана пустая задача (ИИ недоступен).")
@@ -510,21 +629,24 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # на всякий
+    log.debug("MSG: unknown state, clearing")
     USER_STATE.pop(uid, None)
     await open_planner(update, context)
+
 
 # ==== Экспорт для twitter_bot.py ====
 async def planner_add_from_text(uid: int, text: str) -> int:
     """Создаёт новую задачу с текстом и возвращает item_id."""
     it = await _insert_item(uid, text or "")
+    log.info("API: planner_add_from_text uid=%s -> iid=%s", uid, it.item_id)
     return it.item_id
 
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     """Спрашивает у пользователя время для задачи последней/созданной записи.
        user_id нужен для USER_STATE; chat_id — куда слать сообщение."""
-    # в простейшем виде — найдём последнюю задачу
     items = await _get_items(uid)
     if not items:
+        log.warning("API: planner_prompt_time — no items for uid=%s", uid)
         return
     iid = items[-1].item_id
     USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
@@ -534,6 +656,8 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
         text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
         reply_markup=kb
     )
+    log.info("API: planner_prompt_time uid=%s iid=%s", uid, iid)
+
 
 # --------------------------------------
 # Регистрация хендлеров в PTB (group=0)
@@ -542,7 +666,11 @@ def register_planner_handlers(app: Application) -> None:
     """
     Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
     забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
+
+    ВАЖНО: текстовый хендлер теперь обрабатывает сообщения ТОЛЬКО,
+    когда у пользователя есть ожидаемый ввод (USER_STATE).
     """
+    log.info("Planner: registering handlers (group=0)")
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
@@ -550,7 +678,10 @@ def register_planner_handlers(app: Application) -> None:
         ),
         group=0
     )
+    # Текст: оставляем общий фильтр, но в _msg_router пропускаем всё,
+    # если не ждём ввода (см. USER_STATE).
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router),
         group=0
     )
+    log.info("Planner: handlers registered")
