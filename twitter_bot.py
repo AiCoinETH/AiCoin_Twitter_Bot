@@ -18,9 +18,10 @@ twitter_bot.py — согласование/генерация/публикац�
 Доп. фиксы в этой правке:
 - 🛠 GitHub upload теперь через base64 (PyGithub требует base64-строку).
 - 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
-- 🆕 Режим override: «только ссылки + пользовательские хэштеги (≤275)» без хвостов и автотегов.
+- 🆕 Режим override: «обязательные ссылки + пользовательские хэштеги (≤275)» (без автотегов).
 - 🆕 Twitter TRIM POLICY: если тело обрезается — ВСЕГДА добавляем « … » перед блоком «ссылки и хэштеги», чтобы хвост не терялся.
 - 🆕 OpenAI SDK: переход на client.chat.completions.create (вместо .chat_completions).
+- 🆕 Анти-флуд в Telegram: безопасные обёртки для answerCallbackQuery/sendMessage, обработчик ошибок, сниженный polling.
 """
 
 import os
@@ -41,6 +42,7 @@ import requests
 import tweepy
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError  # NEW
 import aiosqlite
 from github import Github
 from openai import OpenAI  # openai>=1.35.0
@@ -156,7 +158,7 @@ post_data: Dict[str, Any] = {
     "timestamp": None,
     "post_id": 0,
     "is_manual": False,
-    "user_tags_override": False  # <— если True, X собирается только из ссылок+твоих хэштегов, без хвостов/автотегов
+    "user_tags_override": False  # <— если True, X собирается из обязательных ссылок + твоих хэштегов (без автотегов)
 }
 prev_data = post_data.copy()
 
@@ -360,52 +362,66 @@ def build_tweet_with_tail_275(body_text: str, ai_tags: List[str] | None) -> str:
 
     return tweet
 
-# ======== Режим «только ссылки + пользовательские теги» ========
+# ======== Режим «обязательные ссылки + пользовательские теги» (override) ========
 def build_tweet_user_hashtags_275(body_text: str, user_tags: List[str] | None) -> str:
     """
-    - сохраняем ссылки и текст из body_text
-    - добавляем ТОЛЬКО пользовательские хэштеги (без хвостов/автотегов)
+    - сохраняем URLs и текст из body_text (URL не рвём)
+    - добавляем ОБЯЗАТЕЛЬНЫЕ ССЫЛКИ (TW_TAIL_REQUIRED) + ТОЛЬКО пользовательские хэштеги
     - общий лимит 275 (учёт t.co=23)
-    - если тело урезали — ставим ' … ' перед тегами
+    - если тело урезали — ставим ' … ' перед хвостом (ссылки+теги)
     """
     MAX_TWEET = 275
     body = (body_text or "").strip()
-    tags_str = " ".join(user_tags or []).strip()
 
-    if not tags_str:
-        # нет тегов — просто урежем тело
-        return trim_preserving_urls(body, MAX_TWEET)
+    # пользовательские теги, без тематического фильтра + дедуп
+    tags = _dedup_any_hashtags(user_tags or [])
+    tags_str = " ".join(tags).strip()
 
-    # сначала считаем без " … "
-    sep = 1 if (body and tags_str) else 0
-    allowed = MAX_TWEET - twitter_len(tags_str) - sep
+    tail_links = TW_TAIL_REQUIRED.strip()
+    tail_full = (tail_links + (f" {tags_str}" if tags_str else "")).strip()
+
+    # первая попытка (без учёта ' … ')
+    sep = 1 if (body and tail_full) else 0
+    allowed = MAX_TWEET - twitter_len(tail_full) - sep
     allowed = max(0, allowed)
+
     body_trimmed = trim_preserving_urls(body, allowed)
     was_trimmed = twitter_len(body) > twitter_len(body_trimmed)
 
     if was_trimmed:
-        # добавляем место под ' … '
-        allowed2 = MAX_TWEET - twitter_len(tags_str) - sep - 2
+        # учитываем место под ' … '
+        allowed2 = MAX_TWEET - twitter_len(tail_full) - sep - 2
         allowed2 = max(0, allowed2)
         body_trimmed = trim_preserving_urls(body, allowed2)
-        tweet = f"{body_trimmed} … {tags_str}".strip() if body_trimmed else tags_str
+        tweet = f"{body_trimmed} … {tail_full}".strip() if body_trimmed else tail_full
     else:
-        tweet = f"{body_trimmed} {tags_str}".strip() if (body_trimmed and tags_str) else (body_trimmed or tags_str)
+        tweet = f"{body_trimmed} {tail_full}".strip() if (body_trimmed and tail_full) else (body_trimmed or tail_full)
 
-    # страховка: если всё ещё длинно — режем теги слева-направо
+    # если не влезли — урезаем теги, ссылки неприкасаемы
     if twitter_len(tweet) > MAX_TWEET:
-        acc = []
-        for t in (user_tags or []):
-            test = " ".join(acc + [t]).strip()
-            if twitter_len(test) <= MAX_TWEET:
-                acc.append(t)
+        kept = []
+        for t in tags:
+            test_tail = (tail_links + (" " + " ".join(kept + [t]) if kept or t else "")).strip()
+            test_sep = " … " if was_trimmed and body_trimmed else (" " if body_trimmed else "")
+            test_tweet = (f"{body_trimmed}{test_sep}{test_tail}").strip() if body_trimmed else test_tail
+            if twitter_len(test_tweet) <= MAX_TWEET:
+                kept.append(t)
             else:
                 break
-        tweet = " ".join(acc).strip()
+        tail_full = (tail_links + (" " + " ".join(kept) if kept else "")).strip()
+        tweet = (f"{body_trimmed} … {tail_full}".strip() if (was_trimmed and body_trimmed)
+                 else (f"{body_trimmed} {tail_full}".strip() if (body_trimmed and tail_full) else (body_trimmed or tail_full)))
 
+    # крайний случай — только ссылки (и сколько влезло тегов)
     if twitter_len(tweet) > MAX_TWEET:
-        # крайний случай — только обрезанное тело
-        tweet = trim_preserving_urls(body, MAX_TWEET)
+        kept = []
+        for t in tags:
+            test_tail = (tail_links + (" " + " ".join(kept + [t]) if kept or t else "")).strip()
+            if twitter_len(test_tail) <= MAX_TWEET:
+                kept.append(t)
+            else:
+                break
+        tweet = (tail_links + (" " + " ".join(kept) if kept else "")).strip()
 
     return tweet
 
@@ -684,11 +700,43 @@ def start_preview_keyboard():
 def start_worker_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=_worker_url_with_secret())]])
 
+# ---- Безопасные обёртки от флуд-контроля/старых callback'ов ----
+async def safe_q_answer(q) -> bool:
+    try:
+        await q.answer()
+        return True
+    except BadRequest as e:
+        if "Query is too old" in str(e):
+            log.warning("Callback too old; ignored.")
+            return False
+        raise
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await q.answer()
+            return True
+        except Exception:
+            return False
+
+async def safe_send_message(bot: Bot, **kwargs):
+    for _ in range(3):
+        try:
+            return await bot.send_message(**kwargs)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(1)
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return None
+            raise
+    return None
+
 async def send_with_start_button(chat_id: int, text: str):
     try:
-        await approval_bot.send_message(chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
+        await safe_send_message(approval_bot, chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
     except Exception:
-        await approval_bot.send_message(chat_id=chat_id, text=text)
+        await safe_send_message(approval_bot, chat_id=chat_id, text=text)
 
 # -----------------------------------------------------------------------------
 # Публикация в Telegram — хвост ВСЕГДА
@@ -975,7 +1023,8 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
                 reply_markup=start_preview_keyboard()
             )
         else:
-            await approval_bot.send_message(
+            await safe_send_message(
+                approval_bot,
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
                 parse_mode="HTML",
@@ -984,7 +1033,8 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
             )
     except Exception as e:
         log.warning(f"send_single_preview fallback: {e}")
-        await approval_bot.send_message(
+        await safe_send_message(
+            approval_bot,
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
             parse_mode="HTML",
@@ -1003,7 +1053,8 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await open_planner(update, context)
     # мягкое уведомление, если модуль не подключён
     try:
-        await approval_bot.send_message(
+        await safe_send_message(
+            approval_bot,
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="⚠️ Планировщик не подключён (planner.py). Работаем в ручном режиме.",
             reply_markup=get_start_menu()
@@ -1020,7 +1071,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
     uid = update.effective_user.id
-    await q.answer()
+    await safe_q_answer(q)  # NEW: безопасный ответ на callback
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -1042,7 +1093,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _route_to_planner(update, context)
         if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
-            await approval_bot.send_message(
+            await safe_send_message(
+                approval_bot,
                 chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                 text="Главное меню:",
                 reply_markup=get_start_menu()
@@ -1052,14 +1104,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
         awaiting_hashtags_until = None
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+        await safe_send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", bot=approval_bot, reply_markup=get_start_menu())
         return
 
     if data == "shutdown_bot":
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         msg = f"🔴 Бот выключен.\nСледующий пост: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}"
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=start_worker_keyboard())
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=start_worker_keyboard())
         await asyncio.sleep(1)
         shutdown_bot_and_exit()
         return
@@ -1067,7 +1119,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "self_post":
         ROUTE_TO_PLANNER.discard(uid)
         awaiting_hashtags_until = None
-        await approval_bot.send_message(
+        await safe_send_message(
+            approval_bot,
             chat_id=TELEGRAM_APPROVAL_CHAT_ID,
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото/видео одним сообщением:",
             reply_markup=InlineKeyboardMarkup([
@@ -1088,10 +1141,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = " ".join(post_data.get("ai_hashtags") or [])
         hint = (
             "🔖 Отправьте строку с хэштегами (через пробел/запятую).\n"
-            "Я учту любые теги, удалю дубли. В Twitter можно включить режим «только ссылки + твои теги».\n"
+            "Я учту любые теги, удалю дубли. В Twitter можно включить режим «обязательные ссылки + твои теги».\n"
             f"Сейчас: {cur if cur else '—'}"
         )
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, hint, reply_markup=InlineKeyboardMarkup([
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=hint, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🧹 Очистить хэштеги", callback_data="clear_hashtags")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="approve")]
         ]))
@@ -1101,7 +1154,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["ai_hashtags"] = []
         post_data["user_tags_override"] = False
         awaiting_hashtags_until = None
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Хэштеги очищены. Режим Twitter вернулся к стандартному (хвост + автотеги).")
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="✅ Хэштеги очищены. Режим Twitter вернулся к стандартному (хвост + автотеги).")
         await send_single_preview(post_data.get("text_en") or "", [], image_url=None, header="Предпросмотр")
         return
 
@@ -1113,13 +1166,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "do_not_disturb":
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🌙 Режим «Не беспокоить» {status}.", reply_markup=get_start_menu())
         return
 
     if data == "end_day":
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
-        await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}", parse_mode="HTML", reply_markup=get_start_menu())
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}", parse_mode="HTML", reply_markup=get_start_menu())
         return
 
 # Ручной ввод — текст + фото/видео/док-видео; предпросмотр
@@ -1181,7 +1234,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     telegram_text_preview = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "🌙 Режим «Не беспокоить» активен. Публикация отменена.")
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим «Не беспокоить» активен. Публикация отменена.")
         return
 
     media_hash = await compute_media_hash_from_state()
@@ -1190,7 +1243,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     if publish_tg:
         if await is_duplicate_post(telegram_text_preview, media_hash):
-            await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Telegram. Публикация пропущена.")
+            await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Дубликат для Telegram. Публикация пропущена.")
             tg_status = False
         else:
             tg_status = await publish_post_to_telegram(text=base_text_en)
@@ -1200,7 +1253,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     if publish_tw:
         if await is_duplicate_post(twitter_final_text, media_hash):
-            await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Дубликат для Twitter. Публикация пропущена.")
+            await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
             tw_status = await publish_post_to_twitter(twitter_final_text, None)
@@ -1208,11 +1261,11 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
                 await save_post_to_history(twitter_final_text, media_hash)
 
     if publish_tg:
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram.")
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=("✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram."))
     if publish_tw:
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter.")
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=("✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."))
 
-    await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, "Главное меню:", reply_markup=get_start_menu())
+    await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
 # Роутер сообщений
@@ -1239,7 +1292,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["user_tags_override"] = True
         awaiting_hashtags_until = None
         cur = " ".join(tags) if tags else "—"
-        await approval_bot.send_message(TELEGRAM_APPROVAL_CHAT_ID, f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: только ссылки + твои теги (≤275).")
+        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: обязательные ссылки + твои теги (≤275).")
         return await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], image_url=None, header="Предпросмотр")
 
     # «Сделай сам» — только в течение 5 минут после кнопки
@@ -1247,7 +1300,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_manual_input(update, context)
 
     # иначе — главное меню
-    await approval_bot.send_message(chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+    await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
@@ -1303,6 +1356,10 @@ def shutdown_bot_and_exit():
     import time; time.sleep(2)
     os._exit(0)
 
+# ---- Глобальный обработчик ошибок Telegram ----
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error(f"TG error: {context.error}")
+
 def main():
     app = (
         Application.builder()
@@ -1319,8 +1376,13 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler), group=50)
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.VIDEO | filters.Document.IMAGE, message_handler), group=50)
 
+    # обработчик ошибок
+    app.add_error_handler(on_error)
+
     asyncio.get_event_loop().create_task(check_inactivity_shutdown())
-    app.run_polling(poll_interval=0.12, timeout=1)
+
+    # снизили частоту polling, чтобы не ловить Flood control
+    app.run_polling(poll_interval=0.6, timeout=2)
 
 if __name__ == "__main__":
     main()
