@@ -17,7 +17,7 @@ import asyncio
 import logging
 import aiosqlite
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -251,10 +251,10 @@ def _kb_gen_topic() -> InlineKeyboardMarkup:
 # ---------------
 # Парсеры/хелперы
 # ---------------
-_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):?([0-5]\d)$")  # допускаем '930' -> '09:30'
 
 def _parse_time(s: str) -> Optional[str]:
-    s = (s or "").strip()
+    s = (s or "").strip().replace(" ", "")
     m = _TIME_RE.match(s)
     if not m:
         log.debug("Time parse failed: %r", s)
@@ -273,10 +273,12 @@ async def _safe_q_answer(q) -> bool:
         await q.answer()
         return True
     except BadRequest as e:
+        # Частый кейс в логах: "callback query is too old"
         if "query is too old" in str(e).lower():
             log.warning("TG: callback too old; ignore.")
             return False
-        raise
+        log.error("TG: answerCallbackQuery bad request: %s", e)
+        return False
     except RetryAfter as e:
         delay = getattr(e, "retry_after", 2) + 1
         log.warning("TG: answerCallbackQuery flood, sleep=%s", delay)
@@ -284,47 +286,90 @@ async def _safe_q_answer(q) -> bool:
         try:
             await q.answer()
             return True
-        except Exception:
+        except Exception as e2:
+            log.error("TG: answerCallbackQuery retry failed: %s", e2)
             return False
+    except Exception as e:
+        log.error("TG: answerCallbackQuery unknown error: %s", e)
+        return False
+
+async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
+    """Фоллбэк: если редактировать нельзя — шлём новое сообщение туда же."""
+    try:
+        chat_id = q.message.chat_id if q and q.message else None
+        if chat_id is None:
+            log.warning("TG: no message/chat in callback for fallback send")
+            return
+        await q.message.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        log.debug("TG: fallback message sent")
+    except RetryAfter as e:
+        delay = getattr(e, "retry_after", 2) + 1
+        log.warning("TG: send_message flood, sleep=%s", delay)
+        await asyncio.sleep(delay)
+        try:
+            await q.message.bot.send_message(chat_id=q.message.chat_id, text=text, reply_markup=reply_markup)
+        except Exception as e2:
+            log.error("TG: fallback send retry failed: %s", e2)
+    except Exception as e:
+        log.error("TG: fallback send error: %s", e)
 
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
-    """Безопасно редактируем сообщение. Если «Message is not modified» — игнорируем.
-       Если включился flood control — ждём и пробуем ещё раз."""
+    """
+    Безопасно редактируем сообщение.
+    - Если «Message is not modified» — пробуем изменить только разметку.
+    - Если флад-контроль — ждём и пробуем ещё раз.
+    - Если всё равно не удаётся (или BadRequest иное) — отправляем НОВОЕ сообщение (фоллбэк).
+    """
     try:
         log.debug("TG: edit_message_text")
         await q.edit_message_text(text=text, reply_markup=reply_markup)
+        return
     except RetryAfter as e:
         delay = getattr(e, "retry_after", 2) + 1
         log.warning("TG: edit_message_text flood, sleep=%s", delay)
         await asyncio.sleep(delay)
         try:
             await q.edit_message_text(text=text, reply_markup=reply_markup)
+            return
         except Exception as e2:
             log.error("TG: edit_message_text retry failed: %s", e2)
+            # фоллбэк — новое сообщение
+            await _send_new_message_fallback(q, text, reply_markup)
             return
     except BadRequest as e:
-        if "Message is not modified" in str(e):
+        s = str(e)
+        if "Message is not modified" in s:
+            # Пробуем поменять только клавиатуру
             try:
                 log.debug("TG: edit_message_reply_markup only")
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
+                return
             except RetryAfter as e2:
                 delay = getattr(e2, "retry_after", 2) + 1
                 log.warning("TG: edit_message_reply_markup flood, sleep=%s", delay)
                 await asyncio.sleep(delay)
                 try:
                     await q.edit_message_reply_markup(reply_markup=reply_markup)
+                    return
                 except Exception as e3:
                     log.error("TG: edit_message_reply_markup retry failed: %s", e3)
+                    await _send_new_message_fallback(q, text, reply_markup)
                     return
             except BadRequest as e2:
                 if "Message is not modified" in str(e2):
                     log.debug("TG: nothing to modify; pass")
                     return
                 log.error("TG: edit_message_reply_markup bad request: %s", e2)
-                raise
-            return
-        log.error("TG: edit_message_text bad request: %s", e)
-        raise
+                await _send_new_message_fallback(q, text, reply_markup)
+                return
+        # Любая другая ошибка — шлём новое сообщение, чтобы не застревать
+        log.warning("TG: edit_message_text bad request -> fallback, err=%s", e)
+        await _send_new_message_fallback(q, text, reply_markup)
+        return
+    except Exception as e:
+        log.error("TG: edit_message_text unknown error -> fallback: %s", e)
+        await _send_new_message_fallback(q, text, reply_markup)
+        return
 
 
 # -----------------------------
@@ -546,8 +591,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     st = USER_STATE.get(uid)
 
-    # Главное исправление: если не ждём ввода — НЕ перехватываем сообщение,
-    # даём пройти основному боту.
+    # Если не ждём ввода — НЕ перехватываем сообщение (пусть обработает основной бот).
     if not st:
         log.debug("MSG: skip (no pending state) uid=%s text=%r", uid, txt[:80])
         return
