@@ -525,7 +525,6 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
 
 async def save_image_and_get_github_url(image_path):
     filename = f"{uuid.uuid4().hex}.jpg"
-    filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
 
@@ -1088,7 +1087,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
-        if planner_exit или data == "BACK_MAIN_MENU":
+        if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
                 approval_bot,
@@ -1138,7 +1137,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = " ".join(post_data.get("ai_hashtags") or [])
         hint = (
             "🔖 Отправьте строку с хэштегами (через пробел/запятую).\n"
-            "Я учту любые теги, удалю дубли. В Twitter можно включить режим «обязательные ссылки + твои теги».\n"
+            "Я учту любые теги, удалю дубли. В Twitter можно включить режим «обязательные ссылки + твои теги». \n"
             f"Сейчас: {cur if cur else '—'}"
         )
         await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=hint, reply_markup=InlineKeyboardMarkup([
