@@ -461,7 +461,7 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
     return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
-# GitHub helpers (для предпросмотра TG-фото)
+# GitHub helpers (для предпросмотра TG-фото) — больше не используются в предпросмотре, но оставлены
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
     """ВАЖНО: PyGithub.create_file ожидает base64-строку."""
@@ -913,25 +913,24 @@ async def publish_post_to_twitter(final_text_ready: str | None, _image_url_unuse
 # -----------------------------------------------------------------------------
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     try:
-        if not str(url_or_file_id).startswith("http"):
-            url = await process_telegram_photo(url_or_file_id, bot)
-            return await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode="HTML", reply_markup=reply_markup), url.split('/')[-1]
-        else:
-            try:
-                response = requests.get(url_or_file_id, timeout=10)
-                response.raise_for_status()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                tmp.write(response.content); tmp.close()
-                with open(tmp.name, "rb") as img:
-                    msg = await bot.send_photo(chat_id=chat_id, photo=img, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
-                os.remove(tmp.name)
-                return msg, None
-            except Exception:
-                msg = await bot.send_message(chat_id=chat_id, text=caption or "", parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
-                return msg, None
+        # NEW: отправляем напрямую — Telegram file_id или внешний URL
+        msg = await bot.send_photo(
+            chat_id=chat_id,
+            photo=url_or_file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        return msg, None
     except Exception as e:
         log.error(f"Ошибка в send_photo_with_download: {e}")
-        msg = await bot.send_message(chat_id=chat_id, text=caption or " ", parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=caption or " ",
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=False
+        )
         return msg, None
 
 async def send_video_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
@@ -995,15 +994,13 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
     hashtags_line = ("<i>Хэштеги:</i> " + html_escape(" ".join(ai_hashtags or []))) if (ai_hashtags) else "<i>Хэштеги:</i> —"
     text_message = f"{hdr}{text_for_message}\n\n{hashtags_line}".strip()
 
-    preview_image_url = None
+    # NEW: не прокачиваем изображение через GitHub — используем file_id/URL напрямую
+    preview_media_ref = None
     if post_data.get("media_kind") == "image":
         if post_data.get("media_src") == "url":
-            preview_image_url = post_data.get("media_ref")
+            preview_media_ref = post_data.get("media_ref")   # внешний URL
         elif post_data.get("media_src") == "tg":
-            try:
-                preview_image_url = await process_telegram_photo(post_data.get("media_ref"), approval_bot)
-            except Exception:
-                preview_image_url = None
+            preview_media_ref = post_data.get("media_ref")   # Telegram file_id
 
     try:
         if post_data.get("media_kind") == "video" and post_data.get("media_ref"):
@@ -1014,11 +1011,11 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
                 caption=(caption_for_media if caption_for_media.strip() else None),
                 reply_markup=start_preview_keyboard()
             )
-        elif preview_image_url:
+        elif preview_media_ref:
             await send_photo_with_download(
                 approval_bot,
                 TELEGRAM_APPROVAL_CHAT_ID,
-                preview_image_url,
+                preview_media_ref,
                 caption=(caption_for_media if caption_for_media.strip() else None),
                 reply_markup=start_preview_keyboard()
             )
@@ -1091,7 +1088,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
-        if planner_exit or data == "BACK_MAIN_MENU":
+        if planner_exit или data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
                 approval_bot,
