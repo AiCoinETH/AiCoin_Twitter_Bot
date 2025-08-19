@@ -36,6 +36,15 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, RetryAfter
 
+__all__ = [
+    "register_planner_handlers",
+    "open_planner",
+    "planner_add_from_text",
+    "planner_prompt_time",
+    # экспортируем состояние для внешнего безопасного чтения/сброса
+    "USER_STATE",
+]
+
 # ------------------
 # Логи / Константы / глобалы
 # ------------------
@@ -48,6 +57,9 @@ DB_FILE = "planner.db"
 
 # Состояние ожиданий ввода (правка текста/времени/новая тема)
 STATE: Dict[Tuple[int, int], dict] = {}
+
+# Экспортируемое имя для совместимости с импортом в twitter_bot.py
+USER_STATE = STATE  # alias
 
 # Для анти-дубликатов правок сообщений (защита от 400 "Message is not modified")
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
