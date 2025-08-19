@@ -525,7 +525,7 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         return tmp.name
 
 async def save_image_and_get_github_url(image_path):
-    filename = f"{uuid.uuid4().hex}.jpg}"
+    filename = f"{uuid.uuid4().hex}.jpg"
     # исправим случайную скобку если вдруг — но правильный вариант ниже:
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
