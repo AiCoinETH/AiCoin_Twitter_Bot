@@ -9,10 +9,14 @@
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, created_at)
   - item_id — локальная последовательность на пользователя (1,2,3,...) — сохраняется
+
+Состояние ввода:
+  - Привязка по (chat_id, user_id) с общечатовым fallback (chat_id, 0)
 """
 
 from __future__ import annotations
 import re
+import json
 import asyncio
 import logging
 import aiosqlite
@@ -43,9 +47,24 @@ if log.level == logging.NOTSET:
 TZ = ZoneInfo("Europe/Kyiv")
 DB_FILE = "planner.db"
 
-USER_STATE: Dict[int, dict] = {}   # ожидания ввода (правка текста/времени/новая тема); ключ: user_id
+# Состояние ожиданий ввода (правка текста/времени/новая тема)
+# Ключуем по (chat_id, user_id) + дублируем (chat_id, 0) — для случаев,
+# когда callback/сообщение приходят "от имени канала/бота".
+STATE: Dict[Tuple[int, int], dict] = {}
+
+# Для анти-дубликатов правок сообщений (защита от 400 "Message is not modified")
+LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
+
 _ai_generator: Optional[Callable[[str], "asyncio.Future"]] = None
 _db_ready = False  # ленивый init
+
+# --- AI fallback (для 429/исчерпания квоты) ---
+QUOTA_MSG = "⚠️ OpenAI квота исчерпана. Работаю в режиме заглушек."
+STUB_AI_TEXT = "🧪 (Заглушка) Тестовый ИИ-текст: запланируй пост, напоминание и дедлайн."
+
+def _is_quota_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return "429" in s or "insufficient_quota" in s or "quota" in s
 
 
 # ------------
@@ -109,6 +128,38 @@ def set_ai_generator(fn: Callable[[str], "asyncio.Future"]) -> None:
     global _ai_generator
     _ai_generator = fn
     log.info("AI generator set: %s", bool(fn))
+
+
+# ------------
+# Helpers для STATE
+# ------------
+def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    user_id = update.effective_user.id if update.effective_user else 0
+    return (chat_id, user_id), (chat_id, 0)
+
+def set_state_for_update(update: Update, st: dict) -> None:
+    k_personal, k_chat = _state_keys_from_update(update)
+    STATE[k_personal] = st
+    STATE[k_chat] = st
+    log.debug("STATE set for %s and %s -> %s", k_personal, k_chat, st)
+
+def get_state_for_update(update: Update) -> Optional[dict]:
+    k_personal, k_chat = _state_keys_from_update(update)
+    st = STATE.get(k_personal) or STATE.get(k_chat)
+    log.debug("STATE get %s or %s -> %s", k_personal, k_chat, st)
+    return st
+
+def clear_state_for_update(update: Update) -> None:
+    k_personal, k_chat = _state_keys_from_update(update)
+    STATE.pop(k_personal, None)
+    STATE.pop(k_chat, None)
+    log.debug("STATE cleared for %s and %s", k_personal, k_chat)
+
+def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
+    STATE[(chat_id, user_id)] = st
+    STATE[(chat_id, 0)] = st
+    log.debug("STATE set for ids (%s,%s) and (%s,0) -> %s", chat_id, user_id, chat_id, st)
 
 
 # ------------
@@ -421,12 +472,26 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
     Безопасно редактируем сообщение.
     - Если «Message is not modified» — пробуем изменить только разметку.
     - Если флад-контроль — ждём и пробуем ещё раз.
-    - Если всё равно не удаётся (или BadRequest иное) — отправляем НОВОЕ сообщение (фоллбэк).
+    - Если ничего не поменялось (anti-dup) — тихо пропускаем.
+    - Если всё равно не удаётся — отправляем НОВОЕ сообщение (фоллбэк).
     """
     try:
+        # Anti-dup: проверим сигнатуру
+        msg = getattr(q, "message", None)
+        if msg:
+            key = (msg.chat_id, msg.message_id)
+            markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+            new_sig = (text or "", markup_json)
+            if LAST_SIG.get(key) == new_sig:
+                log.debug("TG: nothing to modify; pass (anti-dup)")
+                return
+
         log.debug("TG: edit_message_text try")
         await q.edit_message_text(text=text, reply_markup=reply_markup)
         log.debug("TG: edit_message_text OK")
+
+        if msg:
+            LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
         return
     except RetryAfter as e:
         delay = getattr(e, "retry_after", 2) + 1
@@ -435,6 +500,10 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
         try:
             await q.edit_message_text(text=text, reply_markup=reply_markup)
             log.debug("TG: edit_message_text retry OK")
+            msg = getattr(q, "message", None)
+            if msg:
+                markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
             return
         except Exception as e2:
             log.error("TG: edit_message_text retry failed: %s", e2)
@@ -447,6 +516,10 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 log.debug("TG: edit_message_reply_markup only")
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
                 log.debug("TG: edit_message_reply_markup OK")
+                msg = getattr(q, "message", None)
+                if msg:
+                    markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                    LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), markup_json)
                 return
             except RetryAfter as e2:
                 delay = getattr(e2, "retry_after", 2) + 1
@@ -455,6 +528,10 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 try:
                     await q.edit_message_reply_markup(reply_markup=reply_markup)
                     log.debug("TG: edit_message_reply_markup retry OK")
+                    msg = getattr(q, "message", None)
+                    if msg:
+                        markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                        LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), markup_json)
                     return
                 except Exception as e3:
                     log.error("TG: edit_message_reply_markup retry failed: %s", e3)
@@ -462,7 +539,7 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                     return
             except BadRequest as e2:
                 if "Message is not modified" in str(e2):
-                    log.debug("TG: nothing to modify; pass")
+                    log.debug("TG: nothing to modify; pass (branch)")
                     return
                 log.error("TG: edit_message_reply_markup bad request: %s", e2)
                 await _send_new_message_fallback(q, text, reply_markup)
@@ -513,8 +590,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PLAN_ADD_EMPTY":
         log.debug("CB: add empty")
         it = await _insert_item(uid, "")
-        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
         await edit_or_pass(
             q,
             f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
@@ -524,8 +600,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PLAN_ADD_AI":
         log.debug("CB: add via AI (request topic)")
-        USER_STATE[uid] = {"mode": "waiting_new_topic"}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "waiting_new_topic"})
         await edit_or_pass(
             q,
             "🧠 Введи тему/подсказку для новой задачи — сгенерирую текст.\n"
@@ -599,8 +674,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await q.answer("Некорректный ID")
             return
-        USER_STATE[uid] = {"mode": "edit_text", "item_id": iid}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "edit_text", "item_id": iid})
         await edit_or_pass(
             q,
             f"✏️ Введи новый текст для задачи #{iid}",
@@ -614,8 +688,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await q.answer("Некорректный ID")
             return
-        USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
         await edit_or_pass(
             q,
             f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
@@ -623,49 +696,67 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте в AI_FILL_TEXT ----------
     if data.startswith("AI_FILL_TEXT:"):
         try:
             iid = int(data.split(":", 1)[1])
         except Exception:
             await q.answer("Некорректный ID")
             return
+
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Нет такой задачи")
             return
+
         hint = it.text or "daily task for Ai Coin"
         log.debug("AI_FILL_TEXT for iid=%s hint=%r", iid, _short(hint))
+
         if _ai_generator:
             try:
                 txt, tags, img = await _ai_generator(hint)
                 txt = (txt or "").strip()
-                if txt:
-                    await _update_text(uid, iid, txt)
-                await q.answer("Текст обновлён ИИ.")
+                if not txt:
+                    txt = STUB_AI_TEXT
+                await _update_text(uid, iid, txt)
+                await q.answer("Текст обновлён.")
             except Exception as e:
-                log.exception("AI: generation error")
-                await q.answer("Ошибка генерации")
+                if _is_quota_error(e):
+                    await _update_text(uid, iid, STUB_AI_TEXT)
+                    await q.answer(QUOTA_MSG)
+                else:
+                    log.exception("AI: generation error")
+                    await q.answer("Ошибка генерации")
         else:
             log.warning("AI: generator not set")
-            await q.answer("ИИ-генератор не подключен")
+            await _update_text(uid, iid, STUB_AI_TEXT)
+            await q.answer("ИИ недоступен — подставил заглушку.")
+
         it = await _get_item(uid, iid)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
+    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте в AI_NEW_FROM ----------
     if data.startswith("AI_NEW_FROM:"):
         topic = data.split(":", 1)[1].strip() or "general"
         log.info("AI: new from topic=%r", topic)
+
         it = await _insert_item(uid, f"(генерация: {topic})")
         if _ai_generator:
             try:
                 txt, tags, img = await _ai_generator(topic)
-                if txt:
-                    await _update_text(uid, it.item_id, (txt or "").strip())
-            except Exception:
-                log.exception("AI: generation error on create")
+                await _update_text(uid, it.item_id, (txt or "").strip() or STUB_AI_TEXT)
+            except Exception as e:
+                if _is_quota_error(e):
+                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
+                    await q.answer(QUOTA_MSG)
+                else:
+                    log.exception("AI: generation error on create")
+        else:
+            await _update_text(uid, it.item_id, STUB_AI_TEXT)
+
         await q.answer("Создано. Укажи время.")
-        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
         await edit_or_pass(
             q,
             f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
@@ -685,7 +776,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = (update.message.text or "").strip()
-    st = USER_STATE.get(uid)
+    st = get_state_for_update(update)
     log.debug("MSG router: uid=%s has_state=%s text=%r", uid, bool(st), _short(txt))
 
     if not st:
@@ -700,16 +791,14 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _update_text(uid, iid, txt)
         it = await _get_item(uid, iid)
         if it and not it.when_hhmm:
-            USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
-            log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+            set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
             await update.message.reply_text(
                 f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
             )
             return
         await update.message.reply_text("✅ Текст обновлён.")
-        USER_STATE.pop(uid, None)
-        log.debug("State cleared for uid=%s", uid)
+        clear_state_for_update(update)
         await open_planner(update, context)
         return
 
@@ -721,14 +810,12 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _update_time(uid, iid, t)
         await update.message.reply_text(f"✅ Время установлено: {t}")
-        USER_STATE.pop(uid, None)
-        log.debug("State cleared for uid=%s", uid)
+        clear_state_for_update(update)
 
         nxt = await _find_next_item(uid, iid)
         if nxt:
             if not nxt.when_hhmm:
-                USER_STATE[uid] = {"mode": "edit_time", "item_id": nxt.item_id}
-                log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+                set_state_for_update(update, {"mode": "edit_time", "item_id": nxt.item_id})
                 await update.message.reply_text(
                     f"➡️ Следующая: #{nxt.item_id}\n⏰ Введи время в формате HH:MM (по Киеву)",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
@@ -744,24 +831,31 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_planner(update, context)
         return
 
+    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте при создании из темы ---------
     if mode == "waiting_new_topic":
         topic = txt or "general"
         log.info("AI: create new from topic via message: %r", topic)
         it = await _insert_item(uid, f"(генерация: {topic})")
+
         if _ai_generator:
             try:
                 gen_text, tags, img = await _ai_generator(topic)
-                if gen_text:
-                    await _update_text(uid, it.item_id, gen_text)
-                await update.message.reply_text("✨ Создано с помощью ИИ.")
-            except Exception:
-                log.exception("AI: generation error on message")
-                await update.message.reply_text("⚠️ Не удалось сгенерировать, создана пустая задача.")
+                out = (gen_text or "").strip() or STUB_AI_TEXT
+                await _update_text(uid, it.item_id, out)
+                await update.message.reply_text("✨ Создано.")
+            except Exception as e:
+                if _is_quota_error(e):
+                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
+                    await update.message.reply_text(QUOTA_MSG)
+                else:
+                    log.exception("AI: generation error on message")
+                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
+                    await update.message.reply_text("⚠️ Не удалось сгенерировать — поставил заглушку.")
         else:
-            await update.message.reply_text("Создана пустая задача (ИИ недоступен).")
+            await _update_text(uid, it.item_id, STUB_AI_TEXT)
+            await update.message.reply_text("ИИ недоступен — поставил заглушку.")
 
-        USER_STATE[uid] = {"mode": "edit_time", "item_id": it.item_id}
-        log.debug("State set: uid=%s -> %s", uid, USER_STATE[uid])
+        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
         await update.message.reply_text(
             f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
@@ -769,7 +863,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.debug("MSG: unknown state -> clearing")
-    USER_STATE.pop(uid, None)
+    clear_state_for_update(update)
     await open_planner(update, context)
 
 
@@ -784,13 +878,13 @@ async def planner_add_from_text(uid: int, text: str) -> int:
 @_trace_async
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     """Спрашивает у пользователя время для задачи последней/созданной записи.
-       user_id нужен для USER_STATE; chat_id — куда слать сообщение."""
+       user_id нужен для STATE; chat_id — куда слать сообщение."""
     items = await _get_items(uid)
     if not items:
         log.warning("API: planner_prompt_time — no items for uid=%s", uid)
         return
     iid = items[-1].item_id
-    USER_STATE[uid] = {"mode": "edit_time", "item_id": iid}
+    set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid})
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
     await bot.send_message(
         chat_id=chat_id,
@@ -810,7 +904,7 @@ def register_planner_handlers(app: Application) -> None:
     забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
 
     ВАЖНО: текстовый хендлер теперь обрабатывает сообщения ТОЛЬКО,
-    когда у пользователя есть ожидаемый ввод (USER_STATE).
+    когда у пользователя есть ожидаемый ввод (STATE).
     """
     log.info("Planner: registering handlers (group=0)")
     app.add_handler(
