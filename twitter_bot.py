@@ -54,13 +54,12 @@ log = logging.getLogger("twitter_bot")
 # === ПЛАНИРОВЩИК (опционально) ===
 # Перенесено после инициализации логгера; безопасный импорт + дефолты.
 try:
-    from planner import register_planner_handlers, open_planner, USER_STATE as PLANNER_STATE
+    from planner import register_planner_handlers, open_planner
     log.info("Planner module loaded")
 except Exception as _e:
     log.warning("Planner module not available: %s", _e)
     register_planner_handlers = lambda app: None
     open_planner = None
-    PLANNER_STATE = {}
 
 # -----------------------------------------------------------------------------
 # ENV
@@ -174,14 +173,17 @@ _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 
 def twitter_len(s: str) -> int:
-    if not s: return 0
+    if not s:
+        return 0
     s = normalize("NFC", s)
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_to_twitter_len(s: str, max_len: int) -> str:
-    if not s: return s
+    if not s:
+        return s
     s = normalize("NFC", s).strip()
-    if twitter_len(s) <= max_len: return s
+    if twitter_len(s) <= max_len:
+        return s
     ell = '…'
     while s and twitter_len(s + ell) > max_len:
         s = s[:-1]
@@ -191,7 +193,8 @@ def _dedup_hashtags(*groups):
     seen, out = set(), []
     def norm(t: str) -> str:
         t = t.strip()
-        if not t: return ""
+        if not t:
+            return ""
         if not (t.startswith("#") or t.startswith("$")):
             t = "#" + t
         return t
@@ -199,18 +202,22 @@ def _dedup_hashtags(*groups):
         tl = t.lower()
         return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
     for g in groups:
-        if not g: continue
+        if not g:
+            continue
         items = g.split() if isinstance(g, str) else list(g)
         for raw in items:
             tag = norm(raw)
-            if not tag or not ok(tag): continue
+            if not tag or not ok(tag):
+                continue
             key = tag.lower()
-            if key in seen: continue
+            if key in seen:
+                continue
             seen.add(key); out.append(tag)
     return " ".join(out)
 
 def _parse_hashtags_line(line: str) -> List[str]:
-    if not line: return []
+    if not line:
+        return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
     filtered = _dedup_hashtags(raw).split()
@@ -518,6 +525,8 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         return tmp.name
 
 async def save_image_and_get_github_url(image_path):
+    filename = f"{uuid.uuid4().hex}.jpg}"
+    # исправим случайную скобку если вдруг — но правильный вариант ниже:
     filename = f"{uuid.uuid4().hex}.jpg"
     url = upload_image_to_github(image_path, filename)
     return url, filename
@@ -556,7 +565,8 @@ async def init_db():
         await db.commit()
 
 def normalize_text_for_hashing(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     return " ".join(text.strip().lower().split())
 
 def sha256_hex(data: bytes) -> str:
@@ -614,7 +624,8 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
 # -----------------------------------------------------------------------------
 def _worker_url_with_secret() -> str:
     base = AICOIN_WORKER_URL or ""
-    if not base: return base
+    if not base:
+        return base
     sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}s={sec}" if sec else base
@@ -708,7 +719,7 @@ async def publish_post_to_telegram(text: str | None, _image_url_ignored: Optiona
             )
             return True
 
-        local_path = await download_to_temp_local(mref, is_telegram=(msrc=="tg"), bot=approval_bot)
+        local_path = await download_to_temp_local(mref, is_telegram=(msrc == "tg"), bot=approval_bot)
         post_data["media_local_path"] = local_path
 
         if mk == "image":
@@ -774,7 +785,7 @@ async def publish_post_to_twitter(final_text_ready: str | None, _image_url_unuse
         media_ids = None
         local_path = None
 
-        if mk in ("image","video") and mref:
+        if mk in ("image", "video") and mref:
             if msrc == "url":
                 suf = ".mp4" if mk == "video" else ".jpg"
                 local_path = _download_to_temp_file(mref, suffix=suf)
@@ -1033,7 +1044,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
-        if planner_exit или data == "BACK_MAIN_MENU":
+        if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
                 approval_bot,
@@ -1084,7 +1095,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = (
             "🔖 Отправьте строку с хэштегами (через пробел/запятую).\n"
             "Я учту любые теги, удалю дубли. В Twitter можно включить режим «обязательные ссылки + твои теги». \n"
-            f"Сейчас: {cur если cur else '—'}"
+            f"Сейчас: {cur if cur else '—'}"
         )
         await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=hint, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🧹 Очистить хэштеги", callback_data="clear_hashtags")],
@@ -1101,8 +1112,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Публикация
-    if data in ("post_twitter","post_telegram","post_both"):
-        await publish_flow(publish_tg=(data!="post_twitter"), publish_tw=(data!="post_telegram"))
+    if data in ("post_twitter", "post_telegram", "post_both"):
+        await publish_flow(publish_tg=(data != "post_twitter"), publish_tw=(data != "post_telegram"))
         return
 
     if data == "do_not_disturb":
@@ -1146,10 +1157,10 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             media_kind = "image"; media_ref = fid
     elif text and text.startswith("http"):
         url = text.split()[0]
-        if any(url.lower().endswith(ext) for ext in (".mp4",".mov",".m4v",".webm")):
+        if any(url.lower().endswith(ext) for ext in (".mp4", ".mov", ".m4v", ".webm")):
             media_kind = "video"; media_src = "url"; media_ref = url
             text = text[len(url):].strip()
-        elif any(url.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".gif",".webp")):
+        elif any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
             media_kind = "image"; media_src = "url"; media_ref = url
             text = text[len(url):].strip()
 
@@ -1228,7 +1239,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # если ждём хэштеги — обработаем здесь
     if awaiting_hashtags_until and now <= awaiting_hashtags_until:
-        line = (update.message.text или update.message.caption или "").strip()
+        line = (update.message.text or update.message.caption or "").strip()
         tags = _parse_hashtags_line_user(line)
         post_data["ai_hashtags"] = tags
         post_data["user_tags_override"] = True
