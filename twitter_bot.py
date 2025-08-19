@@ -3,24 +3,22 @@
 twitter_bot.py — согласование/генерация/публикация в Telegram и X (Twitter).
 
 Обновления (этой версии):
+- 🗓 Планировщик: события планирования идут в open_planner() и НЕ попадают в «Сделай сам».
+- 🧹 Полностью убран OpenAI и все зависимости от ИИ.
 - ✅ Кнопка «🔖 Хэштеги» доступна ВСЕГДА (предпросмотр, «Сделай сам», главное меню).
-- ✅ Ввод/редактирование хэштегов отдельным сообщением (5 мин окно), с дедупом и фильтром по теме (AI/crypto/$Ai).
+- ✅ Ввод/редактирование хэштегов отдельным сообщением (5 мин окно), с дедупом; в X есть режим override.
 - ✅ Telegram: хвост добавляется ВСЕГДА (и не дублируется), с учётом лимитов caption=1024 и message=4096.
 - ✅ Twitter:
     VERBATIM_MODE=True  -> публикуем РОВНО текст пользователя (без хвостов).
     VERBATIM_MODE=False -> добавляем хвост (🌐 site | 🐺 Telegram) + дедуп-хэштеги; лимит 275.
 - ✅ Видео: принимаем photo / video / document(video); Telegram — send_video; X — chunked upload v1.1.
-- ✅ Планировщик: события планирования идут в open_planner() и НЕ попадают в «Сделай сам».
 - ✅ FIX: Twitter video — убран run_until_complete (ошибка "event loop is already running"), публикация в X async.
 - ✅ Главный экран ВСЕГДА содержит кнопку «▶️ Старт воркера».
 - ✅ «Сделай сам» перехватывает сообщения только 5 минут после нажатия.
-
-Доп. фиксы в этой правке:
-- 🛠 GitHub upload теперь через base64 (PyGithub требует base64-строку).
+- 🛠 GitHub upload — через base64 (PyGithub требует base64-строку).
 - 🛠 Убрана повторная сборка твита: финальный текст X формируется 1 раз и не модифицируется в publish_post_to_twitter().
 - 🆕 Режим override: «обязательные ссылки + пользовательские хэштеги (≤275)» (без автотегов).
 - 🆕 Twitter TRIM POLICY: если тело обрезается — ВСЕГДА добавляем « … » перед блоком «ссылки и хэштеги», чтобы хвост не терялся.
-- 🆕 OpenAI SDK: переход на client.chat.completions.create (вместо .chat_completions).
 - 🆕 Анти-флуд в Telegram: безопасные обёртки для answerCallbackQuery/sendMessage, обработчик ошибок, сниженный polling.
 """
 
@@ -42,19 +40,16 @@ import requests
 import tweepy
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError  # NEW
+from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 import aiosqlite
 from github import Github
-from openai import OpenAI  # openai>=1.35.0
 
 # === ПЛАНИРОВЩИК (опционально) ===
 try:
-    from planner import register_planner_handlers, open_planner, set_ai_generator, USER_STATE as PLANNER_STATE
+    from planner import register_planner_handlers, open_planner
 except Exception:
     register_planner_handlers = lambda app: None
     open_planner = None
-    set_ai_generator = None
-    PLANNER_STATE = {}
 
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -80,8 +75,6 @@ GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
 GITHUB_IMAGE_PATH = "images_for_posts"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
 PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
 AICOIN_WORKER_SECRET = os.getenv("AICOIN_WORKER_SECRET") or TELEGRAM_BOT_TOKEN_APPROVAL
@@ -91,7 +84,7 @@ need_env = [
     "TELEGRAM_BOT_TOKEN_APPROVAL", "TELEGRAM_APPROVAL_CHAT_ID",
     "TELEGRAM_BOT_TOKEN_CHANNEL", "TELEGRAM_CHANNEL_USERNAME_ID",
     "TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET",
-    "ACTION_PAT_GITHUB", "ACTION_REPO_GITHUB", "OPENAI_API_KEY"
+    "ACTION_PAT_GITHUB", "ACTION_REPO_GITHUB"
 ]
 missing = [k for k in need_env if not os.getenv(k)]
 if missing:
@@ -106,9 +99,6 @@ TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID_STR)
 TZ = ZoneInfo("Europe/Kyiv")
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
-
-client_oa = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=10)
-OPENAI_QUOTA_WARNED = False
 
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 600
@@ -150,7 +140,7 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 # -----------------------------------------------------------------------------
 post_data: Dict[str, Any] = {
     "text_en": "",
-    "ai_hashtags": [],           # <— редактируемая пользователем коллекция
+    "ai_hashtags": [],           # редактируемая пользователем коллекция
     "media_kind": "none",        # "none" | "image" | "video"
     "media_src": "tg",           # "tg" | "url"
     "media_ref": None,
@@ -158,7 +148,7 @@ post_data: Dict[str, Any] = {
     "timestamp": None,
     "post_id": 0,
     "is_manual": False,
-    "user_tags_override": False  # <— если True, X собирается из обязательных ссылок + твоих хэштегов (без автотегов)
+    "user_tags_override": False  # если True, X собирается из обязательных ссылок + твоих хэштегов (без автотегов)
 }
 prev_data = post_data.copy()
 
@@ -461,7 +451,7 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
     return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
-# GitHub helpers (для предпросмотра TG-фото) — больше не используются в предпросмотре, но оставлены
+# GitHub helpers (для предпросмотра TG-фото)
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
     """ВАЖНО: PyGithub.create_file ожидает base64-строку."""
@@ -616,52 +606,6 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.warning(f"save_post_to_history: возможно дубликат/ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# ИИ (для стартового предпросмотра)
-# -----------------------------------------------------------------------------
-def _oa_chat_text(prompt: str) -> str:
-    try:
-        # FIX: новый путь в SDK — chat.completions
-        resp = client_oa.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"You write concise, inspiring social promos for a crypto+AI project called Ai Coin. Avoid the words 'google' or 'trends'. Keep it 1–3 short sentences, energetic, non-technical, in English."},
-                {"role":"user","content":prompt}
-            ],
-            temperature=0.9,
-            max_tokens=220,
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        return txt.strip('"\n` ')
-    except Exception as e:
-        log.warning(f"_oa_chat_text error: {e}")
-        return "Ai Coin fuses AI with blockchain to turn community ideas into real actions. Join builders shaping the next wave of crypto utility."
-
-async def ai_generate_content_en(topic_hint: str) -> Tuple[str, List[str], Optional[str]]:
-    text_prompt = (
-        "Create a short social promo (1–3 sentences) about Ai Coin: an AI-integrated crypto project where holders can propose ideas, "
-        "AI analyzes them, and the community votes on-chain. Tone: inspiring, community-first, no jargon. "
-        f"Emphasize: {topic_hint}."
-    )
-    text_en = _oa_chat_text(text_prompt)
-
-    extra_tags_prompt = (
-        "Give me 3 short, relevant crypto+AI hashtags for a social post about Ai Coin (no duplicates of #AiCoin, #AI, #crypto, $Ai), "
-        "single line, space-separated, each begins with #, only AI/crypto topics."
-    )
-    tags_line = _oa_chat_text(extra_tags_prompt)
-    ai_tags = [t for t in tags_line.split() if t.startswith("#") and len(t) > 1][:4]
-
-    image_url = None
-    return (text_en, ai_tags, image_url)
-
-if set_ai_generator:
-    try:
-        set_ai_generator(ai_generate_content_en)
-        log.info("Planner AI generator registered.")
-    except Exception as e:
-        log.warning(f"Cannot register planner AI generator: {e}")
-
-# -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
 def _worker_url_with_secret() -> str:
@@ -677,7 +621,7 @@ def get_start_menu():
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🗓 План на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
@@ -690,7 +634,7 @@ def start_preview_keyboard():
          InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags"),
          InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 ИИ план на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🗓 План на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
@@ -912,7 +856,6 @@ async def publish_post_to_twitter(final_text_ready: str | None, _image_url_unuse
 # -----------------------------------------------------------------------------
 async def send_photo_with_download(bot, chat_id, url_or_file_id, caption=None, reply_markup=None):
     try:
-        # NEW: отправляем напрямую — Telegram file_id или внешний URL
         msg = await bot.send_photo(
             chat_id=chat_id,
             photo=url_or_file_id,
@@ -993,7 +936,6 @@ async def send_single_preview(text_en: str, ai_hashtags=None, image_url=None, he
     hashtags_line = ("<i>Хэштеги:</i> " + html_escape(" ".join(ai_hashtags or []))) if (ai_hashtags) else "<i>Хэштеги:</i> —"
     text_message = f"{hdr}{text_for_message}\n\n{hashtags_line}".strip()
 
-    # NEW: не прокачиваем изображение через GitHub — используем file_id/URL напрямую
     preview_media_ref = None
     if post_data.get("media_kind") == "image":
         if post_data.get("media_src") == "url":
@@ -1067,7 +1009,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
     uid = update.effective_user.id
-    await safe_q_answer(q)  # NEW: безопасный ответ на callback
+    await safe_q_answer(q)
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -1080,7 +1022,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_action_time[uid] = now
 
     # --- Планировщик: явные команды/префиксы ---
-    planner_any = data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "AI_FILL_TEXT:", "CLONE_ITEM:", "AI_NEW_FROM:"))
+    planner_any = data.startswith(("PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:", "EDIT_FIELD:", "CLONE_ITEM:", "TOGGLE_DONE:", "show_day_plan"))
     planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
     if data == "show_day_plan" or planner_any or planner_exit:
@@ -1303,19 +1245,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
-    try:
-        text_en, ai_tags, img = await ai_generate_content_en("General invite and value.")
-    except Exception as e:
-        log.warning(f"ai_generate_content_en failed at start: {e}")
-        text_en, ai_tags, img = post_data["text_en"], post_data.get("ai_hashtags") or [], None
-
-    post_data["text_en"] = text_en or ""
-    post_data["ai_hashtags"] = ai_tags or []
+    # Режим без ИИ: стартуем с пустыми полями и сразу показываем предпросмотр/меню
+    post_data["text_en"] = post_data.get("text_en") or ""
+    post_data["ai_hashtags"] = post_data.get("ai_hashtags") or []
     post_data["media_kind"] = "none"
     post_data["media_src"] = "tg"
     post_data["media_ref"] = None
 
-    await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=None, header="Предпросмотр")
+    await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], image_url=None, header="Предпросмотр (ручной режим)")
+    await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
     log.info("Бот запущен. Отправлен предпросмотр. Планирование — в planner.py (если подключено).")
 
 async def check_inactivity_shutdown():
@@ -1382,4 +1320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
