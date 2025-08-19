@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Планировщик с персистентностью в SQLite для twitter_bot.py.
+Планировщик с персистентностью в SQLite для twitter_bot.py (БЕЗ ИИ).
 
-Совместим с ожиданиями бота:
+Поддерживаемые действия:
   PLAN_* , ITEM_MENU:, DEL_ITEM:, EDIT_TIME:, EDIT_ITEM:, EDIT_FIELD: (резерв),
-  AI_FILL_TEXT:, CLONE_ITEM:, AI_NEW_FROM:, а также PLAN_DONE / GEN_DONE / BACK_MAIN_MENU.
+  CLONE_ITEM:, а также BACK_MAIN_MENU для возврата в основной бот.
 
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, created_at)
@@ -21,7 +21,7 @@ import asyncio
 import logging
 import aiosqlite
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -40,7 +40,6 @@ from telegram.error import BadRequest, RetryAfter
 # Логи / Константы / глобалы
 # ------------------
 log = logging.getLogger("planner")
-# Не переопределяю root-конфиг, но сделаю локальный уровень повышенным:
 if log.level == logging.NOTSET:
     log.setLevel(logging.DEBUG)
 
@@ -48,24 +47,12 @@ TZ = ZoneInfo("Europe/Kyiv")
 DB_FILE = "planner.db"
 
 # Состояние ожиданий ввода (правка текста/времени/новая тема)
-# Ключуем по (chat_id, user_id) + дублируем (chat_id, 0) — для случаев,
-# когда callback/сообщение приходят "от имени канала/бота".
 STATE: Dict[Tuple[int, int], dict] = {}
 
 # Для анти-дубликатов правок сообщений (защита от 400 "Message is not modified")
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
 
-_ai_generator: Optional[Callable[[str], "asyncio.Future"]] = None
 _db_ready = False  # ленивый init
-
-# --- AI fallback (для 429/исчерпания квоты) ---
-QUOTA_MSG = "⚠️ OpenAI квота исчерпана. Работаю в режиме заглушек."
-STUB_AI_TEXT = "🧪 (Заглушка) Тестовый ИИ-текст: запланируй пост, напоминание и дедлайн."
-
-def _is_quota_error(e: Exception) -> bool:
-    s = str(e).lower()
-    return "429" in s or "insufficient_quota" in s or "quota" in s
-
 
 # ------------
 # Утилиты логирования
@@ -76,9 +63,9 @@ def _short(val: Any, n: int = 120) -> str:
 
 def _fmt_arg(v: Any) -> str:
     try:
-        from telegram import Update, Bot
+        from telegram import Update as TGUpdate, Bot
         from telegram.ext import CallbackContext
-        if isinstance(v, Update):
+        if isinstance(v, TGUpdate):
             return f"<Update chat={getattr(getattr(v, 'effective_chat', None), 'id', None)} cb={bool(v.callback_query)}>"
         if v.__class__.__name__ in {"Bot", "Application", "CallbackContext"}:
             return f"<{v.__class__.__name__}>"
@@ -121,13 +108,6 @@ def _trace_async(fn):
             log.exception("✖ %s failed", fn.__name__)
             raise
     return wrap
-
-
-def set_ai_generator(fn: Callable[[str], "asyncio.Future"]) -> None:
-    """Бот отдаёт сюда свой AI-генератор (async)."""
-    global _ai_generator
-    _ai_generator = fn
-    log.info("AI generator set: %s", bool(fn))
 
 
 # ------------
@@ -344,8 +324,7 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     for it in items:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
     rows += [
-        [InlineKeyboardButton("➕ Новая (пустая)", callback_data="PLAN_ADD_EMPTY"),
-         InlineKeyboardButton("✨ Новая от ИИ", callback_data="PLAN_ADD_AI")],
+        [InlineKeyboardButton("➕ Новая (пустая)", callback_data="PLAN_ADD_EMPTY")],
         [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU"),
          InlineKeyboardButton("✅ Готово", callback_data="PLAN_DONE")],
     ]
@@ -358,8 +337,7 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✏️ Текст", callback_data=f"EDIT_ITEM:{it.item_id}"),
          InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{it.item_id}")],
-        [InlineKeyboardButton("🤖 ИИ-текст", callback_data=f"AI_FILL_TEXT:{it.item_id}"),
-         InlineKeyboardButton("🧬 Клонировать", callback_data=f"CLONE_ITEM:{it.item_id}")],
+        [InlineKeyboardButton("🧬 Клонировать", callback_data=f"CLONE_ITEM:{it.item_id}")],
         [InlineKeyboardButton("✅/🟡 Переключить статус", callback_data=f"TOGGLE_DONE:{it.item_id}")],
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"DEL_ITEM:{it.item_id}")],
         [InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")],
@@ -369,10 +347,8 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
     return kb
 
 @_trace_sync
-def _kb_gen_topic() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
-    log.debug("Topic keyboard built")
-    return kb
+def _kb_cancel_to_list() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
 
 
 # ---------------
@@ -476,7 +452,6 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
     - Если всё равно не удаётся — отправляем НОВОЕ сообщение (фоллбэк).
     """
     try:
-        # Anti-dup: проверим сигнатуру
         msg = getattr(q, "message", None)
         if msg:
             key = (msg.chat_id, msg.message_id)
@@ -590,22 +565,11 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PLAN_ADD_EMPTY":
         log.debug("CB: add empty")
         it = await _insert_item(uid, "")
-        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
+        set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id})
         await edit_or_pass(
             q,
-            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
-        )
-        return
-
-    if data == "PLAN_ADD_AI":
-        log.debug("CB: add via AI (request topic)")
-        set_state_for_update(update, {"mode": "waiting_new_topic"})
-        await edit_or_pass(
-            q,
-            "🧠 Введи тему/подсказку для новой задачи — сгенерирую текст.\n"
-            "Примеры: «анонс AMA», «продвижение сайта», «итоги недели».",
-            _kb_gen_topic()
+            f"✏️ Введи текст для задачи #{it.item_id}",
+            _kb_cancel_to_list()
         )
         return
 
@@ -678,7 +642,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(
             q,
             f"✏️ Введи новый текст для задачи #{iid}",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+            _kb_cancel_to_list()
         )
         return
 
@@ -692,75 +656,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(
             q,
             f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
-        )
-        return
-
-    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте в AI_FILL_TEXT ----------
-    if data.startswith("AI_FILL_TEXT:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Некорректный ID")
-            return
-
-        it = await _get_item(uid, iid)
-        if not it:
-            await q.answer("Нет такой задачи")
-            return
-
-        hint = it.text or "daily task for Ai Coin"
-        log.debug("AI_FILL_TEXT for iid=%s hint=%r", iid, _short(hint))
-
-        if _ai_generator:
-            try:
-                txt, tags, img = await _ai_generator(hint)
-                txt = (txt or "").strip()
-                if not txt:
-                    txt = STUB_AI_TEXT
-                await _update_text(uid, iid, txt)
-                await q.answer("Текст обновлён.")
-            except Exception as e:
-                if _is_quota_error(e):
-                    await _update_text(uid, iid, STUB_AI_TEXT)
-                    await q.answer(QUOTA_MSG)
-                else:
-                    log.exception("AI: generation error")
-                    await q.answer("Ошибка генерации")
-        else:
-            log.warning("AI: generator not set")
-            await _update_text(uid, iid, STUB_AI_TEXT)
-            await q.answer("ИИ недоступен — подставил заглушку.")
-
-        it = await _get_item(uid, iid)
-        await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
-        return
-
-    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте в AI_NEW_FROM ----------
-    if data.startswith("AI_NEW_FROM:"):
-        topic = data.split(":", 1)[1].strip() or "general"
-        log.info("AI: new from topic=%r", topic)
-
-        it = await _insert_item(uid, f"(генерация: {topic})")
-        if _ai_generator:
-            try:
-                txt, tags, img = await _ai_generator(topic)
-                await _update_text(uid, it.item_id, (txt or "").strip() or STUB_AI_TEXT)
-            except Exception as e:
-                if _is_quota_error(e):
-                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
-                    await q.answer(QUOTA_MSG)
-                else:
-                    log.exception("AI: generation error on create")
-        else:
-            await _update_text(uid, it.item_id, STUB_AI_TEXT)
-
-        await q.answer("Создано. Укажи время.")
-        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
-        await edit_or_pass(
-            q,
-            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+            _kb_cancel_to_list()
         )
         return
 
@@ -794,7 +690,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
             await update.message.reply_text(
                 f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+                reply_markup=_kb_cancel_to_list()
             )
             return
         await update.message.reply_text("✅ Текст обновлён.")
@@ -829,37 +725,6 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         await open_planner(update, context)
-        return
-
-    # --------- ИСПРАВЛЕНО: устойчивость к 429/квоте при создании из темы ---------
-    if mode == "waiting_new_topic":
-        topic = txt or "general"
-        log.info("AI: create new from topic via message: %r", topic)
-        it = await _insert_item(uid, f"(генерация: {topic})")
-
-        if _ai_generator:
-            try:
-                gen_text, tags, img = await _ai_generator(topic)
-                out = (gen_text or "").strip() or STUB_AI_TEXT
-                await _update_text(uid, it.item_id, out)
-                await update.message.reply_text("✨ Создано.")
-            except Exception as e:
-                if _is_quota_error(e):
-                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
-                    await update.message.reply_text(QUOTA_MSG)
-                else:
-                    log.exception("AI: generation error on message")
-                    await _update_text(uid, it.item_id, STUB_AI_TEXT)
-                    await update.message.reply_text("⚠️ Не удалось сгенерировать — поставил заглушку.")
-        else:
-            await _update_text(uid, it.item_id, STUB_AI_TEXT)
-            await update.message.reply_text("ИИ недоступен — поставил заглушку.")
-
-        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id})
-        await update.message.reply_text(
-            f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
-        )
         return
 
     log.debug("MSG: unknown state -> clearing")
@@ -903,14 +768,14 @@ def register_planner_handlers(app: Application) -> None:
     Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
     забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
 
-    ВАЖНО: текстовый хендлер теперь обрабатывает сообщения ТОЛЬКО,
+    Текстовый хендлер обрабатывает сообщения ТОЛЬКО,
     когда у пользователя есть ожидаемый ввод (STATE).
     """
     log.info("Planner: registering handlers (group=0)")
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
-            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|EDIT_FIELD:.*|AI_FILL_TEXT:.*|CLONE_ITEM:.*|AI_NEW_FROM:.*|TOGGLE_DONE:.*|show_day_plan)$"
+            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|EDIT_FIELD:.*|CLONE_ITEM:.*|TOGGLE_DONE:.*|show_day_plan)$"
         ),
         group=0
     )
