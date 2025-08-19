@@ -44,19 +44,23 @@ from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 import aiosqlite
 from github import Github
 
-# === ПЛАНИРОВЩИК (опционально) ===
-try:
-    from planner import register_planner_handlers, open_planner
-except Exception:
-    register_planner_handlers = lambda app: None
-    open_planner = None
-
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s")
 log = logging.getLogger("twitter_bot")
+
+# === ПЛАНИРОВЩИК (опционально) ===
+# Перенесено после инициализации логгера; безопасный импорт + дефолты.
+try:
+    from planner import register_planner_handlers, open_planner, USER_STATE as PLANNER_STATE
+    log.info("Planner module loaded")
+except Exception as _e:
+    log.warning("Planner module not available: %s", _e)
+    register_planner_handlers = lambda app: None
+    open_planner = None
+    PLANNER_STATE = {}
 
 # -----------------------------------------------------------------------------
 # ENV
@@ -1029,7 +1033,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
-        if planner_exit or data == "BACK_MAIN_MENU":
+        if planner_exit или data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
                 approval_bot,
@@ -1080,7 +1084,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = (
             "🔖 Отправьте строку с хэштегами (через пробел/запятую).\n"
             "Я учту любые теги, удалю дубли. В Twitter можно включить режим «обязательные ссылки + твои теги». \n"
-            f"Сейчас: {cur if cur else '—'}"
+            f"Сейчас: {cur если cur else '—'}"
         )
         await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=hint, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🧹 Очистить хэштеги", callback_data="clear_hashtags")],
@@ -1224,7 +1228,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # если ждём хэштеги — обработаем здесь
     if awaiting_hashtags_until and now <= awaiting_hashtags_until:
-        line = (update.message.text or update.message.caption or "").strip()
+        line = (update.message.text или update.message.caption или "").strip()
         tags = _parse_hashtags_line_user(line)
         post_data["ai_hashtags"] = tags
         post_data["user_tags_override"] = True
