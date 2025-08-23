@@ -341,6 +341,14 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
 def _kb_cancel_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
 
+@_trace_sync
+def _kb_add_more() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора: добавить еще или закончить"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Еще одна задача", callback_data="PLAN_ADD_EMPTY")],
+        [InlineKeyboardButton("✅ Готово", callback_data="PLAN_OPEN")]
+    ])
+
 # ---------------
 # Парсеры/хелперы
 # ---------------
@@ -663,22 +671,13 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "edit_text":
         await _update_text(uid, iid, txt)
-        it = await _get_item(uid, iid)
         
-        # Всегда очищаем состояние ввода текста
-        clear_state_for_update(update)
-        
-        if it and not it.when_hhmm:
-            # Если время не установлено, переходим в режим ввода времени
-            set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
-            await update.message.reply_text(
-                f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-                reply_markup=_kb_cancel_to_list()
-            )
-        else:
-            # Если время уже было установлено, просто возвращаемся в планировщик
-            await update.message.reply_text("✅ Текст обновлён.")
-            await open_planner(update, context)
+        # Переходим к вводу времени (НЕ очищаем состояние здесь!)
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
+        await update.message.reply_text(
+            f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            reply_markup=_kb_cancel_to_list()
+        )
         return
 
     if mode == "edit_time":
@@ -688,19 +687,13 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         await _update_time(uid, iid, t)
-        await update.message.reply_text(f"✅ Время установлено: {t}")
         clear_state_for_update(update)
-
-        nxt = await _find_next_item(uid, iid)
-        if nxt and not nxt.when_hhmm:
-            set_state_for_update(update, {"mode": "edit_time", "item_id": nxt.item_id})
-            await update.message.reply_text(
-                f"➡️ Следующая: #{nxt.item_id}\n⏰ Введи время в формате HH:MM (по Киеву)",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
-            )
-            return
-
-        await open_planner(update, context)
+        
+        # Спрашиваем, добавить еще или закончить
+        await update.message.reply_text(
+            f"✅ Время установлено: {t}\n\nДобавить еще одну задачу или закончить?",
+            reply_markup=_kb_add_more()
+        )
         return
 
     log.debug("MSG: unknown state -> clearing")
@@ -717,11 +710,10 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
     # Если переданы chat_id и bot, сразу запрашиваем время
     if chat_id is not None and bot is not None:
         set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id})
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
-            reply_markup=kb
+            text=f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            reply_markup=_kb_cancel_to_list()
         )
         log.info("API: immediately prompted for time uid=%s iid=%s", uid, it.item_id)
     
@@ -729,19 +721,17 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
 
 @_trace_async
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
-    """Спрашивает у пользователя время для задачи последней/созданной записи.
-       user_id нужен для STATE; chat_id — куда слать сообщение."""
+    """Спрашивает у пользователя время для задачи последней/созданной записи."""
     items = await _get_items(uid)
     if not items:
         log.warning("API: planner_prompt_time — no items for uid=%s", uid)
         return
     iid = items[-1].item_id
     set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid})
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
     await bot.send_message(
         chat_id=chat_id,
         text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-        reply_markup=kb
+        reply_markup=_kb_cancel_to_list()
     )
     log.info("API: planner_prompt_time uid=%s iid=%s (prompt sent)", uid, iid)
 
@@ -770,4 +760,3 @@ def register_planner_handlers(app: Application) -> None:
         group=0
     )
     log.info("Planner: handlers registered")
-    
