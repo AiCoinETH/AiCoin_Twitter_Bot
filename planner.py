@@ -664,16 +664,20 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "edit_text":
         await _update_text(uid, iid, txt)
         it = await _get_item(uid, iid)
+        
+        # Всегда очищаем состояние ввода текста
+        clear_state_for_update(update)
+        
         if it and not it.when_hhmm:
+            # Если время не установлено, переходим в режим ввода времени
             set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
             await update.message.reply_text(
                 f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
                 reply_markup=_kb_cancel_to_list()
             )
-            return  # <--- Добавлен return
         else:
+            # Если время уже было установлено, просто возвращаемся в планировщик
             await update.message.reply_text("✅ Текст обновлён.")
-            clear_state_for_update(update)
             await open_planner(update, context)
         return
 
@@ -705,10 +709,22 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== Экспорт для twitter_bot.py ====
 @_trace_async
-async def planner_add_from_text(uid: int, text: str) -> int:
-    """Создаёт новую задачу с текстом и возвращает item_id."""
+async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = None) -> int:
+    """Создаёт новую задачу с текстом и возвращает item_id. Если передан chat_id и bot, сразу запрашивает время."""
     it = await _insert_item(uid, text or "")
     log.info("API: planner_add_from_text uid=%s -> iid=%s", uid, it.item_id)
+    
+    # Если переданы chat_id и bot, сразу запрашиваем время
+    if chat_id is not None and bot is not None:
+        set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id})
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ Введи время для задачи #{it.item_id} в формате HH:MM (по Киеву)",
+            reply_markup=kb
+        )
+        log.info("API: immediately prompted for time uid=%s iid=%s", uid, it.item_id)
+    
     return it.item_id
 
 @_trace_async
@@ -745,7 +761,7 @@ def register_planner_handlers(app: Application) -> None:
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
-            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|TOGGLE_DONE:.*|show_day_plan|PLAN_ADD_FROM_TEXT)$" # <-- Обновлено
+            pattern=r"^(PLAN_|ITEM_MENU:|DEL_ITEM:|EDIT_TIME:|EDIT_ITEM:|TOGGLE_DONE:|show_day_plan$)"
         ),
         group=0
     )
