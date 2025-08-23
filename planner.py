@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Планировщик с персистентностью в SQLite для twitter_bot.py (БЕЗ ИИ).
+Планировщик с персистентностью в SQLite для twitter_bot.py.
 
 Поддерживаемые действия:
-  PLAN_* , ITEM_MENU:, DEL_ITEM:, EDIT_TIME:, EDIT_ITEM:, EDIT_FIELD: (резерв),
-  CLONE_ITEM:, а также BACK_MAIN_MENU для возврата в основной бот.
+  PLAN_* , ITEM_MENU:, DEL_ITEM:, EDIT_TIME:, EDIT_ITEM:,
+  TOGGLE_DONE:, а также BACK_MAIN_MENU для возврата в основной бот.
 
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, created_at)
@@ -41,7 +41,6 @@ __all__ = [
     "open_planner",
     "planner_add_from_text",
     "planner_prompt_time",
-    # экспортируем состояние для внешнего безопасного чтения/сброса
     "USER_STATE",
 ]
 
@@ -50,7 +49,7 @@ __all__ = [
 # ------------------
 log = logging.getLogger("planner")
 if log.level == logging.NOTSET:
-    log.setLevel(logging.DEBUG)
+    log.setLevel(logging.INFO)
 
 TZ = ZoneInfo("Europe/Kyiv")
 DB_FILE = "planner.db"
@@ -75,8 +74,7 @@ def _short(val: Any, n: int = 120) -> str:
 
 def _fmt_arg(v: Any) -> str:
     try:
-        from telegram import Update as TGUpdate, Bot
-        from telegram.ext import CallbackContext
+        from telegram import Update as TGUpdate
         if isinstance(v, TGUpdate):
             return f"<Update chat={getattr(getattr(v, 'effective_chat', None), 'id', None)} cb={bool(v.callback_query)}>"
         if v.__class__.__name__ in {"Bot", "Application", "CallbackContext"}:
@@ -94,33 +92,24 @@ def _fmt_arg(v: Any) -> str:
 def _trace_sync(fn):
     @wraps(fn)
     def wrap(*args, **kwargs):
-        try:
-            log.debug("→ %s(%s%s)", fn.__name__,
-                      ", ".join(_fmt_arg(a) for a in args),
-                      (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
-            res = fn(*args, **kwargs)
-            log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
-            return res
-        except Exception:
-            log.exception("✖ %s failed", fn.__name__)
-            raise
+        log.debug("→ %s(%s%s)", fn.__name__,
+                  ", ".join(_fmt_arg(a) for a in args),
+                  (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
+        res = fn(*args, **kwargs)
+        log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
+        return res
     return wrap
 
 def _trace_async(fn):
     @wraps(fn)
     async def wrap(*args, **kwargs):
-        try:
-            log.debug("→ %s(%s%s)", fn.__name__,
-                      ", ".join(_fmt_arg(a) for a in args),
-                      (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
-            res = await fn(*args, **kwargs)
-            log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
-            return res
-        except Exception:
-            log.exception("✖ %s failed", fn.__name__)
-            raise
+        log.debug("→ %s(%s%s)", fn.__name__,
+                  ", ".join(_fmt_arg(a) for a in args),
+                  (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
+        res = await fn(*args, **kwargs)
+        log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
+        return res
     return wrap
-
 
 # ------------
 # Helpers для STATE
@@ -153,7 +142,6 @@ def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
     STATE[(chat_id, 0)] = st
     log.debug("STATE set for ids (%s,%s) and (%s,0) -> %s", chat_id, user_id, chat_id, st)
 
-
 # ------------
 # Модель данных
 # ------------
@@ -164,7 +152,6 @@ class PlanItem:
     text: str
     when_hhmm: Optional[str]  # "HH:MM" | None
     done: bool
-
 
 # ------------
 # База (SQLite)
@@ -296,11 +283,6 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     return item
 
 @_trace_async
-async def _clone_item(uid: int, src: PlanItem) -> PlanItem:
-    log.info("Clone request uid=%s src_iid=%s", uid, src.item_id)
-    return await _insert_item(uid, text=src.text, when_hhmm=src.when_hhmm)
-
-@_trace_async
 async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
     """Найти следующую задачу по item_id."""
     await _ensure_db()
@@ -317,7 +299,6 @@ async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
     nxt = PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
     log.debug("Next item: %s", _fmt_arg(nxt))
     return nxt
-
 
 # -------------------------
 # Рендеринг и клавиатуры UI
@@ -337,8 +318,7 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
     rows += [
         [InlineKeyboardButton("➕ Новая (пустая)", callback_data="PLAN_ADD_EMPTY")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU"),
-         InlineKeyboardButton("✅ Готово", callback_data="PLAN_DONE")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU")],
     ]
     kb = InlineKeyboardMarkup(rows)
     log.debug("Main keyboard built: rows=%d", len(rows))
@@ -349,7 +329,6 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✏️ Текст", callback_data=f"EDIT_ITEM:{it.item_id}"),
          InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{it.item_id}")],
-        [InlineKeyboardButton("🧬 Клонировать", callback_data=f"CLONE_ITEM:{it.item_id}")],
         [InlineKeyboardButton("✅/🟡 Переключить статус", callback_data=f"TOGGLE_DONE:{it.item_id}")],
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"DEL_ITEM:{it.item_id}")],
         [InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")],
@@ -361,7 +340,6 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
 @_trace_sync
 def _kb_cancel_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
-
 
 # ---------------
 # Парсеры/хелперы
@@ -400,7 +378,6 @@ def _parse_time(s: str) -> Optional[str]:
             pass
     log.debug("Time parse failed: %r", original)
     return None
-
 
 # ---------------
 # Безопасные действия TG
@@ -539,7 +516,6 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
         await _send_new_message_fallback(q, text, reply_markup)
         return
 
-
 # -----------------------------
 # Публичный entry-point для бота
 # -----------------------------
@@ -555,7 +531,6 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.effective_message.reply_text(text=text, reply_markup=kb)
     log.debug("Planner: open done for uid=%s", uid)
-
 
 # --------------------------------------
 # Внутренний роутер callback-кнопок (group=0)
@@ -588,7 +563,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ITEM_MENU:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             log.warning("CB: ITEM_MENU parse error: %r", data)
             await q.answer("Некорректный ID")
             return
@@ -603,7 +578,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("DEL_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
         await _delete_item(uid, iid)
@@ -612,26 +587,10 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
-    if data.startswith("CLONE_ITEM:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Некорректный ID")
-            return
-        src = await _get_item(uid, iid)
-        if not src:
-            await q.answer("Нет такой задачи")
-            return
-        await _clone_item(uid, src)
-        await q.answer("Склонировано.")
-        log.info("CB: cloned iid=%s", iid)
-        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
-        return
-
     if data.startswith("TOGGLE_DONE:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
         it = await _get_item(uid, iid)
@@ -639,7 +598,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Нет такой задачи")
             return
         await _update_done(uid, iid, not it.done)
-        it = await _get_item(uid, iid)
+        it = await _get_item(uid, iid) # Обновляем объект, т.к. состояние поменялось
         log.info("CB: toggle done iid=%s -> %s", iid, it.done if it else None)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
@@ -647,7 +606,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("EDIT_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
         set_state_for_update(update, {"mode": "edit_text", "item_id": iid})
@@ -661,7 +620,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("EDIT_TIME:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
@@ -675,7 +634,6 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("PLAN_"):
         log.debug("CB: fallback open planner for %r", data)
         await open_planner(update, context)
-
 
 # --------------------------------------
 # Текстовые сообщения (ввод для режимов)
@@ -692,10 +650,18 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mode = st.get("mode")
+    iid = int(st.get("item_id", 0))
+    
+    # Защита от некорректного iid
+    if iid == 0:
+        log.warning("MSG router: invalid item_id in state, clearing state for uid=%s", uid)
+        clear_state_for_update(update)
+        await update.message.reply_text("Что-то пошло не так. Пожалуйста, попробуй ещё раз.")
+        return
+
     log.info("MSG: uid=%s mode=%s text=%r", uid, mode, _short(txt, 200))
 
     if mode == "edit_text":
-        iid = int(st.get("item_id"))
         await _update_text(uid, iid, txt)
         it = await _get_item(uid, iid)
         if it and not it.when_hhmm:
@@ -704,37 +670,30 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
                 reply_markup=_kb_cancel_to_list()
             )
-            return
-        await update.message.reply_text("✅ Текст обновлён.")
-        clear_state_for_update(update)
-        await open_planner(update, context)
+        else:
+            await update.message.reply_text("✅ Текст обновлён.")
+            clear_state_for_update(update)
+            await open_planner(update, context)
         return
 
     if mode == "edit_time":
-        iid = int(st.get("item_id"))
         t = _parse_time(txt)
         if not t:
             await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
             return
+        
         await _update_time(uid, iid, t)
         await update.message.reply_text(f"✅ Время установлено: {t}")
         clear_state_for_update(update)
 
         nxt = await _find_next_item(uid, iid)
-        if nxt:
-            if not nxt.when_hhmm:
-                set_state_for_update(update, {"mode": "edit_time", "item_id": nxt.item_id})
-                await update.message.reply_text(
-                    f"➡️ Следующая: #{nxt.item_id}\n⏰ Введи время в формате HH:MM (по Киеву)",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
-                )
-                return
-            else:
-                await update.message.reply_text(
-                    f"➡️ Следующая задача #{nxt.item_id}\n{_fmt_item(nxt)}",
-                    reply_markup=_kb_item(nxt)
-                )
-                return
+        if nxt and not nxt.when_hhmm:
+            set_state_for_update(update, {"mode": "edit_time", "item_id": nxt.item_id})
+            await update.message.reply_text(
+                f"➡️ Следующая: #{nxt.item_id}\n⏰ Введи время в формате HH:MM (по Киеву)",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")]])
+            )
+            return
 
         await open_planner(update, context)
         return
@@ -742,7 +701,6 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.debug("MSG: unknown state -> clearing")
     clear_state_for_update(update)
     await open_planner(update, context)
-
 
 # ==== Экспорт для twitter_bot.py ====
 @_trace_async
@@ -770,7 +728,6 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     )
     log.info("API: planner_prompt_time uid=%s iid=%s (prompt sent)", uid, iid)
 
-
 # --------------------------------------
 # Регистрация хендлеров в PTB (group=0)
 # --------------------------------------
@@ -778,7 +735,7 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 def register_planner_handlers(app: Application) -> None:
     """
     Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
-    забирал только свои колбэки. BACK_MAIN_MENU/PLAN_DONE/GEN_DONE не ловим.
+    забирал только свои колбэки. BACK_MAIN_MENU не ловим, т.к. это возврат в основной бот.
 
     Текстовый хендлер обрабатывает сообщения ТОЛЬКО,
     когда у пользователя есть ожидаемый ввод (STATE).
@@ -787,7 +744,7 @@ def register_planner_handlers(app: Application) -> None:
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
-            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|EDIT_FIELD:.*|CLONE_ITEM:.*|TOGGLE_DONE:.*|show_day_plan)$"
+            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|TOGGLE_DONE:.*|show_day_plan)$"
         ),
         group=0
     )
