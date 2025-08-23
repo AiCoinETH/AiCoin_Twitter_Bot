@@ -670,6 +670,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✏️ Текст обновлён.\n⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
                 reply_markup=_kb_cancel_to_list()
             )
+            return  # <--- Добавлен return
         else:
             await update.message.reply_text("✅ Текст обновлён.")
             clear_state_for_update(update)
@@ -744,7 +745,7 @@ def register_planner_handlers(app: Application) -> None:
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
-            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|TOGGLE_DONE:.*|show_day_plan)$"
+            pattern=r"^(PLAN_(?!DONE$).+|ITEM_MENU:.*|DEL_ITEM:.*|EDIT_TIME:.*|EDIT_ITEM:.*|TOGGLE_DONE:.*|show_day_plan|PLAN_ADD_FROM_TEXT)$" # <-- Обновлено
         ),
         group=0
     )
