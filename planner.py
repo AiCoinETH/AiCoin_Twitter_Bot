@@ -770,3 +770,4 @@ def register_planner_handlers(app: Application) -> None:
         group=0
     )
     log.info("Planner: handlers registered")
+    
