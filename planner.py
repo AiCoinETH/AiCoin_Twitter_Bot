@@ -629,8 +629,6 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 return
         print(f"❌ BadRequest: {e}, sending fallback")
         log.warning("TG: edit_message_text bad request -> fallback, err=%s", e)
-        await _send_new
-log.warning("TG: edit_message_text bad request -> fallback, err=%s", e)
         await _send_new_message_fallback(q, text, reply_markup)
         return
     except Exception as e:
