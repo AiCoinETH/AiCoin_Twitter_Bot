@@ -1,6 +1,3 @@
-Извините за прерванные попытки. Вот полный исправленный код файла:
-
-```python
 # -*- coding: utf-8 -*-
 """
 Планировщик с персистентностью в SQLite для twitter_bot.py.
@@ -87,23 +84,23 @@ def _fmt_arg(v: Any) -> str:
         if isinstance(v, TGUpdate):
             return f"<Update chat={getattr(getattr(v, 'effective_chat', None), 'id', None)} cb={bool(v.callback_query)}>"
         if v.__class__.__name__ in {"Bot", "Application"}:
-            return f"<极简风，但保持专业性。直接回答问题，避免不必要的信息。>{v.__class__.__name__}>"
+            return f"<{v.__class__.__name__}>"
     except Exception:
         pass
     if isinstance(v, PlanItem):
         return f"PlanItem(iid={v.item_id}, time={v.when_hhmm}, done={v.done}, text={_short(v.text, 60)!r})"
     if isinstance(v, list) and v and isinstance(v[0], PlanItem):
-        return f"[极简风，但保持专业性。直接回答问题，避免不必要的信息。PlanItem×{len(v)}: {', '.join('#'+str(i.item_id) for i in v[:5])}{'…' if len(v)>5 else ''}]"
+        return f"[PlanItem×{len(v)}: {', '.join('#'+str(i.item_id) for i in v[:5])}{'…' if len(v)>5 else ''}]"
     if isinstance(v, str):
         return repr(_short(v, 120))
     return _short(v, 120)
 
 def _trace_sync(fn):
     @wraps(fn)
-    def wrap(*极简风，但保持专业性。直接回答问题，避免不必要的信息。args, **kwargs):
+    def wrap(*args, **kwargs):
         log.debug("→ %s(%s%s)", fn.__name__,
                   ", ".join(_fmt_arg(a) for a in args),
-                  (", " + ", ".join(f"{k}={_fmt_arg(v)}" for极简风，但保持专业性。直接回答问题，避免不必要的信息。 k, v in kwargs.items())) if kwargs else "")
+                  (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
         res = fn(*args, **kwargs)
         log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
         return res
@@ -116,7 +113,7 @@ def _trace_async(fn):
                   ", ".join(_fmt_arg(a) for a in args),
                   ((", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else ""))
         res = await fn(*args, **kwargs)
-        log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
+        log.debug("← %极简风，但保持专业性。直接回答问题，避免不必要的信息。s = %s", fn.__name__, _fmt_arg(res))
         return res
     return wrap
 
@@ -125,17 +122,17 @@ def _trace_async(fn):
 # ------------
 def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    user_id极简风，但保持专业性。直接回答问题，避免不必要的信息。 = update.effective_user.id if update.effective_user else 0
+    user_id = update.effective_user.id if update.effective_user else 0
     return (chat_id, user_id), (chat_id, 0)
 
 def set_state_for_update(update: Update, st: dict) -> None:
     k_personal, k_chat = _state_keys_from_update(update)
     STATE[k_personal] = st
-    STATE[k_chat] = st
+    STATE[k_chat极简风，但保持专业性。直接回答问题，避免不必要的信息。] = st
     log.debug("STATE set for %s and %s -> %s", k_personal, k_chat, st)
 
 def get_state_for_update(update: Update) -> Optional[dict]:
-    k_personal, k_chat = _state_keys极简风，但保持专业性。直接回答问题，避免不必要的信息。_from_update(update)
+    k_personal, k_chat = _state_keys_from_update(update)
     st = STATE.get(k_personal) or STATE.get(k_chat)
     log.debug("STATE get %s or %s -> %s", k_personal, k_chat, st)
     return st
@@ -173,14 +170,14 @@ CREATE TABLE IF NOT EXISTS plan_items (
   when_hhmm   TEXT,
   done        INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT    NOT NULL,
-  PRIMARY KEY (user_id,极简风，但保持专业性。直接回答问题，避免不必要的信息。 item_id)
+  PRIMARY KEY (user_id, item_id)
 );
 """
 
 @_trace_async
 async def _ensure_db() -> None:
     global _db_ready
-    if _db_ready:
+    if _db极简风，但保持专业性。直接回答问题，避免不必要的信息。_ready:
         log.debug("DB already ready")
         return
     
@@ -224,35 +221,35 @@ async def _ensure_db() -> None:
 async def _get_items(uid: int) -> List[PlanItem]:
     print(f"📥 Getting items for user {uid}")
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE)极简风，但保持专业性。直接回答问题，避免不必要的信息。 as db:
-        db.row_factory = aiosqlite极简风，但保持专业性。直接回答问题，避免不必要的信息。.Row
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
         sql = "SELECT user_id, item_id, text, when_hhmm, done FROM plan_items WHERE user_id=? ORDER BY item_id ASC"
         log.debug("SQL: %s | args=(%s,)", sql, uid)
         print(f"🔍 Executing SQL: {sql} with uid={uid}")
         cur = await db.execute(sql, (uid,))
         rows = await cur.fetchall()
         print(f"📋 Found {len(rows)} items for user {uid}")
-    items = [PlanItem(r["user_id"], r["item_id"], r["极简风，但保持专业性。直接回答问题，避免不必要的信息。text"], r["when_hhmm"], bool(r["done"])) for r in rows]
+    items = [PlanItem(r["user_id"], r["item_id"], r["text"], r["when_hhmm"], bool(r["done"])) for r in rows]
     log.debug("Loaded %d items for uid=%s", len(items), uid)
     return items
 
 @_trace_async
-async def _next_item_id(uid: int) ->极简风，但保持专业性。直接回答问题，避免不必要的信息。 int:
+async def _next_item_id(uid: int) -> int:
     print(f"🔢 Getting next item ID for user {uid}")
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        sql = "SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
+        sql = "SELECT COALES极简风，但保持专业性。直接回答问题，避免不必要的信息。CE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
         log.debug("SQL: %s | args=(%s,)", sql, uid)
         print(f"🔍 Executing SQL: {sql} with uid={uid}")
         cur = await db.execute(sql, (uid,))
         (mx,) = await cur.fetchone()
     nxt = int(mx) + 1
     print(f"✅ Next item ID for user {uid}: {nxt}")
-    log.debug("Next item_id=%s for uid=%s", nxt, uid)
+    log.debug("Next item_id=%s for uid=%极简风，但保持专业性。直接回答问题，避免不必要的信息。s", nxt, uid)
     return nxt
 
 @_trace_async
-async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None) -> PlanItem:
+async def _insert_item(uid: int, text: str = "", when_hhmm极简风，但保持专业性。直接回答问题，避免不必要的信息。: Optional[str] = None) -> PlanItem:
     print(f"📝 Inserting item for user {uid}: text='{text}', time={when_hhmm}")
     iid = await _next_item_id(uid)
     now = datetime.now(TZ).isoformat()
@@ -260,7 +257,7 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
     async with aiosqlite.connect(DB_FILE) as db:
         sql = "INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, created_at) VALUES (?,?,?,?,?,?)"
         args = (uid, iid, text or "", when_hhmm, 0, now)
-        log.debug("SQL: %极简风，但保持专业性。直接回答问题，避免不必要的信息。s | args=%s", sql, args)
+        log.debug("SQL: %s | args=%s", sql, args)
         print(f"💾 Executing INSERT: {sql}")
         print(f"💾 Values: {args}")
         await db.execute(sql, args)
@@ -288,7 +285,7 @@ async def _update_text(uid: int, iid: int, text: str) -> None:
 
 @_trace_async
 async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
-    print(f"⏰ Updating time for user {uid}, item {极简风，但保持专业性。直接回答问题，避免不必要的信息。iid}: {when_hhmm}")
+    print(f"⏰ Updating time for user {uid}, item {iid}: {when_hhmm}")
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
         sql = "UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?"
@@ -299,7 +296,7 @@ async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
         await db.execute(sql, args)
         await db.commit()
         print(f"✅ Time updated successfully")
-    log.info("Time updated for uid=%s iid=%s -> %s", uid, i极简风，但保持专业性。直接回答问题，避免不必要的信息。id, when_hhmm)
+    log.info("Time updated for uid=%s iid=%s -> %s", uid, iid, when_hhmm)
 
 @_trace_async
 async def _update_done(uid: int, iid: int, done: bool) -> None:
@@ -324,11 +321,11 @@ async def _delete_item(uid: int, iid: int) -> None:
         sql = "DELETE FROM plan_items WHERE user_id=? AND item_id=?"
         args = (uid, iid)
         log.debug("SQL: %s | args=%s", sql, args)
-        print(f"🗑️ Executing DELETE: {sql}")
+        print(f"🗑️ Executing DELETE极简风，但保持专业性。直接回答问题，避免不必要的信息。: {sql}")
         print(f"🗑️ Values: {args}")
         await db.execute(sql, args)
         await db.commit()
-        print(f"✅ Item deleted successfully")
+       极简风，但保持专业性。直接回答问题，避免不必要的信息。 print(f"✅ Item deleted successfully")
     log.info("Deleted uid=%s iid=%s", uid, iid)
 
 @_trace_async
@@ -338,7 +335,7 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         sql = "SELECT user_id, item_id, text, when_hhmm, done FROM plan_items WHERE user_id=? AND item_id=?"
-        log.debug("SQL: %s | args=(%s,%s)", sql, uid, iid)
+        log.debug("SQL: %s | args=(%s,%s)", sql, uid极简风，但保持专业性。直接回答问题，避免不必要的信息。, iid)
         print(f"🔍 Executing SELECT: {sql} with uid={uid}, iid={iid}")
         cur = await db.execute(sql, (uid, iid))
         row = await cur.fetchone()
@@ -357,12 +354,12 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
 async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
     """Найти следующую задачу по item_id."""
     print(f"🔍 Finding next item after {after_iid} for user {uid}")
-    await _极简风，但保持专业性。直接回答问题，避免不必要的信息。ensure_db()
+    await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         sql = ("SELECT user_id, item_id, text, when_hhmm, done FROM plan_items "
-               "WHERE user_id=? AND item_id>? ORDER BY item_id ASC LIMIT 1")
-        log.debug("SQL: %s | args=(%s,%s)", sql, uid, after_iid)
+               "WHERE user_id=? AND item_id>? ORDER BY item_id ASC LIM极简风，但保持专业性。直接回答问题，避免不必要的信息。IT 1")
+        log.debug("SQL: %s | args=(极简风，但保持专业性。直接回答问题，避免不必要的信息。%s,%s)", sql, uid, after_iid)
         print(f"🔍 Executing SQL: {sql} with uid={uid}, after_iid={after_iid}")
         cur = await db.execute(sql, (uid, after_iid))
         row = await cur.fetchone()
@@ -371,7 +368,7 @@ async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
         else:
             print(f"❌ No next item found")
     if not row:
-        log.debug("No next item after iid=%s for uid=%s", after_iid, uid)
+        log.debug("No next item after iid=%s for uid=%s", after极简风，但保持专业性。直接回答问题，避免不必要的信息。_iid, uid)
         return None
     nxt = PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
     log.debug("Next item: %s", _fmt_arg(nxt))
@@ -385,10 +382,10 @@ def _fmt_item(i: PlanItem) -> str:
     t = f"[{i.when_hhmm}]" if i.when_hhmm else "[—]"
     d = "✅" if i.done else "🟡"
     txt = (i.text or "").strip() or "(пусто)"
-    return f"{d} {t} {txt}"
+    return f"{d} {极简风，但保持专业性。直接回答问题，避免不必要的信息。t} {txt}"
 
 @_trace_async
-async def _kb_main(uid: int) -> InlineKeyboardMarkup:
+async def _kb_main(uid: int极简风，但保持专业性。直接回答问题，避免不必要的信息。) -> InlineKeyboardMarkup:
     print(f"⌨️ Building main keyboard for user {uid}")
     items = await _get_items(uid)
     rows: List[List[InlineKeyboardButton]] = []
@@ -399,7 +396,7 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU")],
     ]
     kb = InlineKeyboardMarkup(rows)
-    print(f"✅ Main keyboard built with {极简风，但保持专业性。直接回答问题，避免不必要的信息。len(rows)} rows")
+    print(f"✅ Main keyboard built with {len(rows)} rows")
     log.debug("Main keyboard built: rows=%d", len(rows))
     return kb
 
@@ -409,7 +406,7 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✏️ Текст", callback_data=f"EDIT_ITEM:{it.item_id}"),
          InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{it.item_id}")],
-        [InlineKeyboardButton("✅/🟡 Переключить статус", callback_data=f"TOGGLE_DONE:{it.item极简风，但保持专业性。直接回答问题，避免不必要的信息。_id}")],
+        [InlineKeyboardButton("✅/🟡 Переключить статус", callback_data=f"TOGGLE_DONE:{it.item_id}")],
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"DEL_ITEM:{it.item_id}")],
         [InlineKeyboardButton("⬅️ К списку", callback_data="PLAN_OPEN")],
     ]
@@ -424,7 +421,7 @@ def _kb_cancel_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
 
 @_trace_sync
-def _kb_add_more() -> InlineKeyboardMarkup:
+def _kb_add_more() -> In极简风，但保持专业性。直接回答问题，避免不必要的信息。lineKeyboardMarkup:
     """Клавиатура для выбора: добавить еще или закончить"""
     print("⌨️ Building 'add more' keyboard")
     return InlineKeyboardMarkup([
@@ -452,9 +449,9 @@ def _parse_time(s: str) -> Optional[str]:
     m = _TIME_RE_COLON.match(s)
     if m:
         hh, mm = m.groups()
-        res = f"{int(hh):02d}:{int(mm):极简风，但保持专业性。直接回答问题，避免不必要的信息。02d}"
+        res = f"{int(hh):02d}:{int(mm):02d}"
         print(f"✅ Time parsed (colon): '{original}' -> '{res}'")
-        log.debug("Time parsed (colon) %r -> %极简风，但保持专业性。直接回答问题，避免不必要的信息。s", original, res)
+        log.debug("Time parsed (colon) %r -> %s", original, res)
         return res
     if s.isdigit() and len(s) in (3, 4):
         if len(s) == 3:
@@ -492,7 +489,7 @@ async def _safe_q_answer(q) -> bool:
             return False
         print(f"❌ BadRequest in callback answer: {e}")
         log.error("TG: answerCallbackQuery bad request: %s", e)
-        return极简风，但保持专业性。直接回答问题，避免不必要的信息。 False
+        return False
     except RetryAfter as e:
         delay = getattr(e, "retry_after", 2) + 1
         print(f"⚠️ Flood control, sleeping {delay}s")
@@ -500,21 +497,438 @@ async def _safe_q_answer(q) -> bool:
         await asyncio.sleep(delay)
         try:
             await q.answer()
-            print(f极简风，但保持专业性。直接回答问题，避免不必要的信息。
-def _fmt_arg(v: Any) -> str:
+            print(f"✅ Callback query answered after retry")
+            log.debug("answerCallbackQuery retry OK")
+            return True
+        except Exception as e2:
+            print(f"❌ Callback query retry failed: {e2}")
+            log.error("TG: answerCallbackQuery retry failed: %s", e2)
+            return False
+    except Exception as e:
+        print(f"❌ Unknown error in callback answer: {e}")
+        log.error("TG: answerCallbackQuery unknown error: %s", e)
+        return False
+
+@_trace_async
+async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
+    """Фоллбэк: если редактировать нельзя — шлём новое сообщение туда же."""
+    print(f"📨 Sending fallback message")
     try:
-        from telegram import Update as TGUpdate
-        if isinstance(v, TGUpdate):
-            return f"<Update chat={getattr(getattr(v, 'effective_chat', None), 'id', None)} cb={bool(v.callback_query)}>"
-        if v.__class__.__name__ in {"Bot", "Application"}:
-            return f"<{v.__class__.__name__}>"
-    except Exception:
-        pass
-    if isinstance(v, PlanItem):
-        return f"PlanItem(iid={v.item_id}, time={v.when_hhmm}, done={v.done}, text={_short(v.text, 60)!r})"
-    if isinstance(v, list) and v and isinstance(v[0], PlanItem):
-        return f"[PlanItem×{len(v)}: {', '.join('#'+str(i.item_id) for i in v[:5])}{'…' if len(v)>5 else ''}]"
-    if isinstance(v, str):
-        return repr(_short(v, 120))
-    return _short(v, 120)
+        chat_id = q.message.chat_id if q and q.message else None
+        if chat_id is None:
+            print(f"❌ No chat_id for fallback")
+            log.warning("TG: no message/chat in callback for fallback send")
+            return
+        await q.message.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        print(f"✅ Fallback message sent")
+        log.debug("TG: fallback message sent")
+    except RetryAfter as e:
+        delay = getattr(e, "retry_after", 2)极简风，但保持专业性。直接回答问题，避免不必要的信息。 + 1
+        print(f"⚠️ Flood control in fallback, sleeping {delay}s")
+        log.warning("TG: send_message flood, sleep=%s", delay)
+        await asyncio.sleep(delay)
+        try:
+            await q.message.bot.send_message(chat_id=q.message.chat_id, text=text, reply_markup=reply_markup)
+            print(f"✅ Fallback message sent after retry")
+            log.debug("TG: fallback message retry sent")
+        except Exception as e2:
+            print(f"❌ Fallback send retry failed: {e极简风，但保持专业性。直接回答问题，避免不必要的信息。2}")
+            log.error("TG: fallback send retry failed: %s", e2)
+    except Exception as e:
+        print(f"❌ Fallback send error: {e}")
+        log.error("TG: fallback send error: %s", e)
+
+@_trace_async
+async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
+    """
+    Безопасно редактируем сообщение.
+    - Если «Message is not modified» — пробуем изменить только разметку.
+    - Если флад-контроль — ждём и пробуем ещё раз.
+    - Если ничего не поменялось (anti-dup) — тихо пропускаем.
+    - Если всё равно не удаётся — отправляем НОВОЕ сообщение (фоллбэк).
+    """
+    print(f"✏️ Editing message with text: '{_short(text, 50)}'")
+    try:
+        msg = getattr(q, "message", None)
+        if msg:
+            key = (msg.chat_id, msg.message_id)
+            markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+            new_sig = (text or "", markup_json)
+            if LAST_SIG.get(key) == new_s极简风，但保持专业性。直接回答问题，避免不必要的信息。ig:
+                print(f"⚠️ Nothing to modify (anti-dup), passing")
+                log.debug("TG: nothing to modify; pass (anti-dup)")
+                return
+
+        print(f"🔧 Trying to edit message text")
+        await q.edit_message_text(text=text, reply_markup=reply_markup)
+        print(f"✅ Message edited successfully")
+        log.debug("TG: edit_message_text OK")
+
+        if msg:
+            LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
+        return
+    except RetryAfter as e:
+        delay = getattr(e, "retry_after", 2) + 1
+        print(f"⚠️ Flood control, sleeping {delay}s")
+        log.warning("TG: edit_message_text flood, sleep=%s", delay)
+        await asyn极简风，但保持专业性。直接回答问题，避免不必要的信息。cio.sleep(delay)
+        try:
+            await q.edit_message_text(text=text, reply_markup=reply_markup)
+            print(f"✅ Message edited after retry")
+            log.debug("TG: edit_message_text retry OK")
+            msg = getattr(q, "message", None)
+            if msg:
+                markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
+            return
+        except Exception as e2:
+            print(f"❌ Edit retry failed: {e2}, sending fallback")
+            log.error("TG: edit_message_text retry failed: %s", e2)
+            await _send_new_message_fallback(q, text, reply_markup)
+            return
+    except BadRequest as e:
+        s = str(e)
+        if "Message is not modified" in s:
+            try:
+                print(f"🔧 Trying to edit only reply markup")
+                await q.edit_message_reply_markup(reply_markup=reply_markup)
+                print(f"✅ Reply markup edited successfully")
+                log.debug("TG: edit_message_reply_markup OK")
+                msg = getattr(q, "message", None)
+                if msg:
+                    markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                    LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), markup_json)
+                return
+            except RetryAfter as e2:
+                delay = getattr(e2, "retry_after", 2) + 1
+                print(f"⚠️ Flood control in markup edit, sleeping {delay}s")
+                log.warning("TG: edit_message_reply_markup flood, sleep=%s", delay)
+                await asyncio.sleep(delay)
+                try:
+                    await q.edit_message_reply_markup(reply_markup极简风，但保持专业性。直接回答问题，避免不必要的信息。=reply_markup)
+                    print(f"✅ Reply markup edited after retry")
+                    log.debug("TG: edit_message_reply_markup retry OK")
+                    msg = getattr(q, "message", None)
+                    if msg:
+                        markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
+                        LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), markup_json)
+                    return
+                except Exception as e3:
+                    print(f"❌ Markup edit retry failed: {e3}, sending fallback")
+                    log.error("TG: edit_message_reply_markup retry failed: %s", e3)
+                    await _send_new_message_fallback(q, text, reply_markup)
+                    return
+            except BadRequest as e2:
+                if "Message is not modified" in str(e2):
+                    print(f"⚠️ Nothing to modify in markup, passing")
+                    log.debug("TG: nothing to modify; pass (branch)")
+                    return
+                print(f"❌ BadRequest in markup edit: {e2}, sending fallback")
+                log.error("TG: edit_message_reply_markup bad request: %s", e2)
+        await _send_new_message_fallback(q, text, reply_markup)
+        return
+        print(f"❌ BadRequest: {e}, sending fallback")
+        log.warning("TG: edit_message_text bad request -> fallback, err=%s", e)
+        await _send_new_message_fallback(q, text, reply_markup)
+        return
+    except Exception as e:
+        print(f"❌ Unknown error in edit: {e}, sending fallback")
+        log.error("TG: edit_message_text unknown error -> fallback: %s", e)
+        await _send_new_message_fallback(q, text, reply_markup)
+        return
+
+# -----------------------------
+# Публичный entry-point для бота
+# -----------------------------
+@_trace_async
+async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть/обновить экран планировщика."""
+    uid = update.effective_user.id
+    print(f"📋 Opening planner for user {uid}, callback={bool(update.callback_query)}")
+    log.info("Planner: open for uid=%s (cb=%s)", uid, bool(update.callback_query))
     
+    try:
+        kb = await _kb_main(uid)
+        text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
+        
+        if update.callback_query:
+            print(f"✏️ Editing message for callback")
+            await edit_or_pass(update.callback_query, text, kb)
+        else:
+            print(f"📨 Sending new message")
+            await update.effective_message.reply_text(text=text, reply_markup=kb)
+            
+        print(f"✅ Planner opened successfully for user {uid}")
+        log.debug("Planner: open done for uid=%s", uid)
+        
+    except Exception as e:
+        print(f"❌ Error opening planner: {e}")
+        log.error("Error opening planner: %s", e)
+        raise
+
+# --------------------------------------
+# Внутренний роутер callback-кнопок (group=0)
+# --------------------------------------
+@_trace_async
+async def _cb_plan_router(update: Update, context: ContextTypes极简风，但保持专业性。直接回答问题，避免不必要的信息。.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    data = (q.data or "").strip()
+    print(f"🔄 Callback router: user {uid}, data='极简风，但保持专业性。直接回答问题，避免不必要的信息。{data}'")
+    log.info("CB router: uid=%s data=%r", uid, data)
+
+    await _safe_q_answer(q)
+
+    if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
+        print(f"📋 Opening plan list")
+        log.debug("CB: open list")
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
+        return
+
+    if data == "PLAN_ADD_EMPTY":
+        print(f"➕ Adding empty item")
+        log.debug("CB极简风，但保持专业性。直接回答问题，避免不必要的信息。: add empty")
+        it = await _insert_item(uid, "")
+        set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id})
+        await edit_or_pass(
+            q,
+            f"✏️ Введи текст для задачи #{it.item_id}",
+            _kb_cancel_to_list()
+        )
+        return
+
+    if data.startswith("ITEM_MENU:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+            print(f"📝 Opening item menu: {iid}")
+        except (ValueError, IndexError):
+            print(f"❌ Invalid ITEM_MENU data: {data}")
+            log.warning("CB: ITEM_MENU parse error: %r", data)
+            await q.answer("Некорректный ID")
+            return
+            
+        it = await _get_item(uid, iid)
+        if not it:
+            print(f"❌ Item not found: {iid}")
+            await q.answer("Задача не найдена")
+            return
+            
+        log.debug("CB: open item menu iid=%s", iid)
+        await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
+        return
+
+    if data.startswith("DEL_ITEM:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+            print(f"🗑️ Deleting item: {iid}")
+        except (ValueError, IndexError):
+            await q.answer("Некорректный ID")
+            return
+            
+        await _delete_item(uid, iid)
+        await q.answer("Удалено.")
+        log.info("CB: deleted iid=%s", iid)
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
+        return
+
+    if data.startswith("TOGGLE_DONE:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+            print(f"✅ Toggling done status: {iid}")
+        except (ValueError, IndexError):
+            await q极简风，但保持专业性。直接回答问题，避免不必要的信息。.answer("Некорректный ID")
+            return
+            
+        it = await _get_item(uid, iid)
+        if not it:
+            await q.answer("Нет такой задачи")
+            return
+            
+        await _update_done(uid, iid, not it.done)
+        it = await _get_item(uid, iid) # Обновляем объект, т.к. состояние поменялось
+        print(f"✅ Done status toggled: {it.done}")
+        log.info("CB: toggle done iid=%s -> %s", iid, it.done if it else None)
+        await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
+        return
+
+    if data.startswith("EDIT_ITEM:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+            print(f"✏️ Editing item text: {iid}")
+        except (ValueError, IndexError):
+            await q.answer("Некорректный ID")
+            return
+            
+        set_state_for_update(update, {"mode": "edit_text", "极简风，但保持专业性。直接回答问题，避免不必要的信息。item_id": iid})
+        await edit极简风，但保持专业性。直接回答问题，避免不必要的信息。_or_pass(
+            q,
+            f"✏️ Введи новый текст для задачи #{iid}",
+            _kb_cancel_to_list()
+        )
+        return
+
+    if data.startswith("EDIT_TIME:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+            print(f"⏰ Editing item time: {iid}")
+        except (ValueError, IndexError):
+            await q.answer("Некорректный ID")
+            return
+            
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
+        await edit_or_pass(
+            q,
+            f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
+            _kb_cancel_to_list()
+        )
+        return
+
+    if data.startswith("PLAN_"):
+        print(f"📋 Fallback to open planner for: {data}")
+        log.debug("CB: fallback open planner for %r", data)
+        await open_planner(update, context)
+
+# --------------------------------------
+# Текстовые сообщения (ввод для режимов)
+# --------------------------------------
+@_trace_async
+async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    txt = (update.message.text or "").strip()
+    st = get_state_for_update(update)
+    print(f"📨 Message router: user {uid}, has_state={bool(st)}, text='{_short(txt)}'")
+    log.debug("MSG router: uid=%s has_state=%s text=%r", uid, bool(st), _short(txt))
+
+    if not st:
+        print(f"⚠️ No state, skipping message")
+        log.debug("MSG: skip (no pending state) uid=%s", uid)
+        return
+
+    mode = st.get("mode")
+    iid = int(st.get("item_id", 0))
+    
+    print(f"🔍 Processing mode='{mode}', item_id={iid}")
+    
+    # Защита от некорректного iid
+    if iid == 0:
+        print(f"❌ Invalid item_id in state, clearing")
+        log.warning("MSG router: invalid item_id in state, clearing state for uid=%s", uid)
+        clear_state_for_update(update)
+        await update.message.reply_text("Что-то пошло не так. Пожалуйста, попробуй ещё раз.")
+        return
+
+    log.info("MSG: uid=%s mode=%s text=%r", uid, mode, _short(txt, 200))
+
+    if mode == "edit_text":
+        print(f"📝 Processing text input for item {iid}")
+        await _update_text(uid, iid, txt)
+        
+        # Переходим к вводу времени (НЕ очищаем состояние здесь!)
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
+        print(f"⏰ Transitioning to time input for item {iid}")
+        await update.message.reply_text(
+            f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            reply_markup=_kb_cancel_to_list()
+        )
+        return
+
+    if mode == "edit_time":
+        print(f"⏰ Processing time input for item {iid}")
+        t = _parse_time(txt)
+        if not t:
+            print(f"❌ Invalid time format: '{txt}'")
+            await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
+            return
+        
+        await _update_time(uid, iid, t)
+        clear_state_for_update(update)
+        print(f"✅ Time updated successfully: {t}")
+        
+        # Спрашиваем, добавить еще или закончить
+        print(f"❓ Asking if user wants to add more")
+        await update.message.reply_text(
+            f"✅ Время установлено: {t}\n\nДобавить еще одну задачу или закончить?",
+            reply_markup=_kb_add_more()
+        )
+        return
+
+    print(f"⚠️ Unknown state mode: {mode}, clearing")
+    log.debug("MSG: unknown state -> clearing")
+    clear_state_for_update(update)
+    await open_planner(update, context)
+
+# ==== Экспорт для twitter_bot.py ====
+@_trace_async
+async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = None) -> int:
+    """Создаёт новую задачу с текстом и возвращает item_id. Если передан chat_id и bot, сразу запрашивает время."""
+    print(f"🚀 planner_add_from_text: uid={uid}, text='{text}', chat_id={chat_id}")
+    it = await _insert_item(uid, text or "")
+    log.info("API: planner_add_from_text uid=%s -> iid=%s", uid, it.item_id)
+    
+    # Если переданы chat_id и bot, сразу запрашиваем время
+    if chat_id is not None and bot is not None:
+        print(f"⏰ Immediately prompting for time: iid={it.item_id}")
+        set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id})
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            reply_markup=_kb_cancel_to_list()
+        )
+        log.info("API: immediately prompted for time uid=%s iid=%s", uid, it.item_id)
+    
+    return it.item_id
+
+@_trace_async
+async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
+    """Спрашивает у пользователя время для задачи последней/созданной записи."""
+    print(f"⏰ planner_prompt_time: uid={uid}, chat_id={chat_id}")
+    items = await _get_items(uid)
+    if not items:
+        print(f"❌ No items found for user {uid}")
+        log.warning("API: planner_prompt_time — no items for uid=%s", uid)
+        return
+        
+    iid = items[-1].item_id
+    print(f"🔍 Prompting for last item: {iid}")
+    set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid})
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
+        reply_markup=_kb_cancel_to_list()
+    )
+    log.info("API: planner_prompt_time uid=%s iid=%s (prompt sent)", uid, iid)
+
+# --------------------------------------
+# Регистрация хендлеров в PTB (group=0)
+# --------------------------------------
+@_trace_sync
+def register_planner_handlers(app: Application) -> None:
+    """
+    Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
+    забирал только свои колбэки. BACK_MAIN_MENU не ловим, т.к. это возврат в основной бот.
+
+    Текстовый хендлер обрабатывает сообщения ТОЛЬКО,
+    когда у пользователя есть ожидаемый ввод (STATE).
+    """
+    print("📝 Registering planner handlers (group=0)")
+    log.info("Planner: registering handlers (group=0)")
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            _cb_plan_router,
+            pattern=r"^(PLAN_|ITEM_MENU:|DEL_ITEM:|EDIT_TIME:|EDIT_ITEM:|TOGGLE_DONE:|show_day_plan$)"
+        ),
+        group=0
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router),
+        group=0
+    )
+    
+    print("✅ Planner handlers registered successfully")
+    log.info("Planner: handlers registered")
+
+# Добавляем вывод информации при импорте модуля
+print(f"✅ Planner module loaded successfully!")
+print(f"📁 Database will be created at: {DB_FILE}")
+print(f"📂 Current working directory: {os.getcwd()}")
