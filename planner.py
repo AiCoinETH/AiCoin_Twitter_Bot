@@ -4,7 +4,10 @@
 
 Поддерживаемые действия:
   PLAN_OPEN, PLAN_ADD_EMPTY, ITEM_MENU:<id>, DEL_ITEM:<id>, EDIT_TIME:<id>, EDIT_ITEM:<id>,
-  TOGGLE_DONE:<id>, SHOW_ITEM:<id>. BACK_MAIN_MENU (кнопка «Назад») обрабатывает основной бот.
+  TOGGLE_DONE:<id>, SHOW_ITEM:<id>.
+  + Кнопка "🧠 План ИИ на день": PLAN_AI_OPEN и дальнейшие колбэки:
+    PLAN_AI_APPROVE_TEXT, PLAN_AI_RETRY_TEXT, PLAN_AI_GEN_IMAGE, PLAN_AI_SKIP_IMAGE,
+    PLAN_AI_ATTACH:<iid>, PLAN_AI_CANCEL
 
 Хранение:
   - Таблица plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at)
@@ -12,6 +15,10 @@
 
 Состояние ввода:
   - Привязка по (chat_id, user_id) с общечатовым fallback (chat_id, 0)
+
+ИИ:
+  - Текст: Google Gemini (env GEMINI_API_KEY). Если ключа нет — шаг текста будет недоступен.
+  - Картинка (опционально): OpenAI DALL·E (env OPENAI_API_KEY). Если ключа нет — просто предложим пропустить.
 """
 
 from __future__ import annotations
@@ -21,6 +28,8 @@ import asyncio
 import logging
 import aiosqlite
 import os
+import base64
+from io import BytesIO
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
@@ -64,6 +73,37 @@ USER_STATE = STATE  # alias
 
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
 _db_ready = False
+
+# ------------------
+# ИНИЦИАЛИЗАЦИЯ ИИ
+# ------------------
+# Gemini (Google Generative AI) для текста
+try:
+    import google.generativeai as genai
+    _GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+    if _GEMINI_API_KEY:
+        genai.configure(api_key=_GEMINI_API_KEY)
+        _gemini_model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        _gemini_model = genai.GenerativeModel(_gemini_model_name)
+    else:
+        _gemini_model = None
+        log.warning("GEMINI_API_KEY не задан — текстовая генерация ИИ будет недоступна.")
+except Exception as _e:
+    _gemini_model = None
+    log.warning("google-generativeai не доступен: %s", _e)
+
+# OpenAI (DALL·E) — опционально для генерации изображения
+_IMAGE_BACKEND = os.getenv("IMAGE_BACKEND", "openai").strip().lower() or "openai"
+_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+try:
+    if _IMAGE_BACKEND == "openai" and _OPENAI_KEY:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=_OPENAI_KEY)
+    else:
+        _openai_client = None
+except Exception as _e:
+    _openai_client = None
+    log.warning("OpenAI клиент для изображений не инициализирован: %s", _e)
 
 # ------------
 # Утилиты логирования
@@ -309,6 +349,8 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for it in items:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
+    # кнопка ИИ
+    rows.append([InlineKeyboardButton("🧠 План ИИ на день", callback_data="PLAN_AI_OPEN")])
     rows += [
         [InlineKeyboardButton("➕ Новая (пустая)", callback_data="PLAN_ADD_EMPTY")],
         [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU")],
@@ -341,6 +383,33 @@ def _kb_add_more() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Готово", callback_data="PLAN_OPEN")]
     ])
 
+# Клавиатуры для ИИ-процесса
+@_trace_sync
+def _kb_ai_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
+
+@_trace_sync
+def _kb_ai_after_text(iid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="PLAN_AI_GEN_IMAGE")],
+        [InlineKeyboardButton("⏭ Пропустить изображение", callback_data=f"PLAN_AI_SKIP_IMAGE")],
+    ])
+
+@_trace_sync
+def _kb_ai_text_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подходит", callback_data="PLAN_AI_APPROVE_TEXT")],
+        [InlineKeyboardButton("🔁 Ещё вариант", callback_data="PLAN_AI_RETRY_TEXT")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_AI_CANCEL")],
+    ])
+
+@_trace_sync
+def _kb_ai_attach(iid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Прикрепить к задаче", callback_data=f"PLAN_AI_ATTACH:{iid}")],
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="PLAN_OPEN")],
+    ])
+
 # ---------------
 # Парсеры/хелперы
 # ---------------
@@ -364,6 +433,54 @@ def _parse_time(s: str) -> Optional[str]:
             pass
     log.debug("Time parse failed: %r", s0)
     return None
+
+# ---------------
+# ИИ-хелперы
+# ---------------
+def _ai_build_text_prompt(theme: str) -> str:
+    return (
+        "Сгенерируй лаконичный план публикации для социальной сети по теме:\n"
+        f"«{theme.strip()}».\n"
+        "- Тон: информативно и дружелюбно.\n"
+        "- Формат: 1–3 короткие мысли + 1 призыв к действию.\n"
+        "- Без хэштегов и эмодзи в начале строк.\n"
+        "- Язык: русский.\n"
+    )
+
+async def _ai_generate_text(theme: str) -> str:
+    if not _gemini_model:
+        return "⚠️ Gemini недоступен (нет GEMINI_API_KEY). Введите текст вручную."
+    prompt = _ai_build_text_prompt(theme)
+    try:
+        resp = await asyncio.to_thread(_gemini_model.generate_content, prompt)
+        text = (resp.text or "").strip() if resp else ""
+        return text or "⚠️ Пустой ответ от ИИ. Попробуйте другую формулировку."
+    except Exception as e:
+        log.error("Gemini text error: %s", e)
+        return f"⚠️ Ошибка генерации текста: {e}"
+
+async def _ai_generate_image_b64(prompt: str, size: str = "1024x1024") -> Optional[bytes]:
+    """
+    Возвращает PNG-байты изображения (или None).
+    """
+    if not _openai_client:
+        return None
+    try:
+        # OpenAI Images API (DALL·E) v1-style через beta client
+        result = await asyncio.to_thread(
+            _openai_client.images.generate,
+            model="gpt-image-1",
+            prompt=prompt,
+            size=size
+        )
+        # b64 JSON field
+        b64 = result.data[0].b64_json if hasattr(result.data[0], "b64_json") else None
+        if not b64:
+            return None
+        return base64.b64decode(b64)
+    except Exception as e:
+        log.error("OpenAI image error: %s", e)
+        return None
 
 # ---------------
 # Безопасные действия TG
@@ -472,10 +589,29 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = (q.data or "").strip()
     await _safe_q_answer(q)
 
+    # -------- Главный экран и список
     if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
+    # -------- ИИ: вход
+    if data == "PLAN_AI_OPEN":
+        # сброс/установка состояния: ждём тему
+        set_state_for_update(update, {"mode": "ai_theme", "uid": uid})
+        txt = (
+            "🧠 План ИИ на день\n"
+            "Напиши тему/задачу для генерации текста публикации.\n\n"
+            "Пример: «обновления рынка крипты за утро»"
+        )
+        await edit_or_pass(q, txt, _kb_ai_cancel())
+        return
+
+    if data == "PLAN_AI_CANCEL":
+        clear_state_for_update(update)
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
+        return
+
+    # -------- CRUD задач
     if data == "PLAN_ADD_EMPTY":
         it = await _insert_item(uid, "")
         set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id, "uid": uid})
@@ -551,13 +687,94 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
+    # -------- ИИ процесс (кнопки после текста)
+    if data == "PLAN_AI_APPROVE_TEXT":
+        st = get_state_for_update(update) or {}
+        ai_text = (st.get("ai_text") or "").strip()
+        if not ai_text:
+            await q.answer("Текста нет, попробуйте снова."); return
+        # создаём задачу с этим текстом
+        it = await _insert_item(uid, ai_text)
+        # запоминаем iid для возможного прикрепления изображения
+        set_state_for_update(update, {"mode": "ai_after_text", "uid": uid, "item_id": it.item_id, "ai_text": ai_text})
+        await edit_or_pass(q,
+                           f"✅ Текст сохранён в задачу #{it.item_id}.\n"
+                           "Хотите сгенерировать изображение?",
+                           _kb_ai_after_text(it.item_id))
+        return
+
+    if data == "PLAN_AI_RETRY_TEXT":
+        st = get_state_for_update(update) or {}
+        theme = (st.get("ai_theme") or "").strip()
+        if not theme:
+            await edit_or_pass(q, "Введите тему заново:", _kb_ai_cancel()); 
+            set_state_for_update(update, {"mode": "ai_theme", "uid": uid})
+            return
+        await edit_or_pass(q, "⏳ Генерирую новый вариант текста…", _kb_ai_cancel())
+        ai_text = await _ai_generate_text(theme)
+        set_state_for_update(update, {"mode": "ai_confirm_text", "uid": uid, "ai_theme": theme, "ai_text": ai_text})
+        await edit_or_pass(q, f"✍️ Вариант текста:\n\n{ai_text}\n\nПодходит?", _kb_ai_text_confirm())
+        return
+
+    if data == "PLAN_AI_GEN_IMAGE":
+        st = get_state_for_update(update) or {}
+        if not st or st.get("mode") not in ("ai_after_text",):
+            await q.answer("Сначала подтвердите текст."); return
+        iid = int(st.get("item_id", 0))
+        ai_text = st.get("ai_text") or ""
+        if not _openai_client:
+            await edit_or_pass(q,
+                               "⚠️ Генерация изображения недоступна (нет OPENAI_API_KEY). "
+                               "Можно пропустить этот шаг.",
+                               _kb_ai_attach(iid))
+            return
+        await edit_or_pass(q, "🖼 Генерирую изображение…", _kb_ai_cancel())
+        img_bytes = await _ai_generate_image_b64(f"Иллюстрация к посту: {ai_text}")
+        if not img_bytes:
+            await edit_or_pass(q, "⚠️ Не удалось сгенерировать изображение. Хотите прикрепить ничего и продолжить?", _kb_ai_attach(iid))
+            return
+        bio = BytesIO(img_bytes); bio.name = "ai_image.png"
+        msg = await q.message.bot.send_photo(chat_id=q.message.chat_id, photo=bio, caption="Предпросмотр изображения")
+        # сохраняем file_id в state для последующего прикрепления
+        file_id = msg.photo[-1].file_id if msg and msg.photo else None
+        set_state_for_update(update, {"mode": "ai_image_ready", "uid": uid, "item_id": iid, "image_file_id": file_id})
+        await edit_or_pass(q, "Прикрепляем к задаче?", _kb_ai_attach(iid))
+        return
+
+    if data == "PLAN_AI_SKIP_IMAGE":
+        st = get_state_for_update(update) or {}
+        iid = int(st.get("item_id", 0)) if st else 0
+        if iid:
+            # сразу предлагаем поставить время
+            set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": uid})
+            await edit_or_pass(q, f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)", _kb_cancel_to_list())
+        else:
+            await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
+        return
+
+    if data.startswith("PLAN_AI_ATTACH:"):
+        try:
+            iid = int(data.split(":", 1)[1])
+        except Exception:
+            await q.answer("Некорректный ID"); return
+        st = get_state_for_update(update) or {}
+        file_id = st.get("image_file_id")
+        if file_id:
+            await _update_media(uid, iid, file_id, "photo")
+        # после прикрепления — спросим время для задачи
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": uid})
+        await edit_or_pass(q, f"📎 Изображение прикреплено к задаче #{iid}.\n"
+                              f"⏰ Теперь укажи время (HH:MM, Киев):", _kb_cancel_to_list())
+        return
+
 # --------------------------------------
 # Текстовые/медийные сообщения (ввод для режимов)
 # --------------------------------------
 @_trace_async
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming_uid = update.effective_user.id  # для логов
-    txt = (getattr(update.message, "text", None) or "").strip()
+    msg = update.message
+    txt = (getattr(msg, "text", None) or "").strip()
     st = get_state_for_update(update)
     log.debug("MSG router: incoming_uid=%s has_state=%s text=%r", incoming_uid, bool(st), _short(txt))
 
@@ -565,53 +782,66 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mode = st.get("mode")
-    iid = int(st.get("item_id", 0))
+    iid = int(st.get("item_id", 0)) if st.get("item_id") else 0
     owner_uid = int(st.get("uid", incoming_uid))
 
-    if iid == 0:
-        clear_state_for_update(update)
-        await update.message.reply_text("Что-то пошло не так. Пожалуйста, попробуй ещё раз.")
+    # ---- ИИ: пользователь ввёл тему
+    if mode == "ai_theme":
+        theme = txt
+        if not theme:
+            await msg.reply_text("Введите тему (например: «обновления рынка крипты за утро»).", reply_markup=_kb_ai_cancel())
+            return
+        await msg.reply_text("⏳ Генерирую текст…", reply_markup=_kb_ai_cancel())
+        ai_text = await _ai_generate_text(theme)
+        set_state_for_update(update, {"mode": "ai_confirm_text", "uid": owner_uid, "ai_theme": theme, "ai_text": ai_text})
+        await msg.reply_text(f"✍️ Вариант текста:\n\n{ai_text}\n\nПодходит?", reply_markup=_kb_ai_text_confirm())
         return
 
+    # ---- Обычное редактирование текста задачи (поддерживает медиа)
     if mode == "edit_text":
-        # собираем текст и, если есть, медиа
         final_text = txt
         file_id = None
         mtype = None
 
-        if update.message.photo:
-            file_id = update.message.photo[-1].file_id
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
             mtype = "photo"
             if not final_text:
-                final_text = (update.message.caption or "").strip() or "Фото"
-        elif update.message.document:
-            mime = (update.message.document.mime_type or "")
+                final_text = (msg.caption or "").strip() or "Фото"
+        elif msg.document:
+            mime = (msg.document.mime_type or "")
             if mime.startswith("image/"):
-                file_id = update.message.document.file_id
+                file_id = msg.document.file_id
                 mtype = "document"
                 if not final_text:
-                    final_text = (update.message.caption or "").strip() or "Изображение"
+                    final_text = (msg.caption or "").strip() or "Изображение"
+
+        if iid == 0:
+            clear_state_for_update(update)
+            await msg.reply_text("Что-то пошло не так. Пожалуйста, попробуй ещё раз.")
+            return
 
         await _update_text(owner_uid, iid, final_text or "")
         if file_id:
             await _update_media(owner_uid, iid, file_id, mtype)
 
-        # переходим к времени (без автопоказа главного)
+        # переходим к времени
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": owner_uid})
-        await update.message.reply_text(
+        await msg.reply_text(
             "✅ Сохранено!\n⏰ Теперь введи время публикации в формате HH:MM (по Киеву)",
             reply_markup=_kb_cancel_to_list()
         )
         return
 
+    # ---- Установка времени
     if mode == "edit_time":
         t = _parse_time(txt)
         if not t:
-            await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
+            await msg.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
             return
         await _update_time(owner_uid, iid, t)
         clear_state_for_update(update)
-        await update.message.reply_text(
+        await msg.reply_text(
             f"✅ Время установлено: {t}\n\nДобавить ещё одну задачу или закончить?",
             reply_markup=_kb_add_more()
         )
@@ -664,8 +894,13 @@ def register_planner_handlers(app: Application) -> None:
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
-            # строго перечисляем допустимые колбэки планировщика
-            pattern=r"^(?:show_day_plan$|PLAN_OPEN$|PLAN_ADD_EMPTY$|ITEM_MENU:\d+$|DEL_ITEM:\d+$|EDIT_TIME:\d+$|EDIT_ITEM:\d+$|TOGGLE_DONE:\d+$|SHOW_ITEM:\d+$)"
+            # перечисляем допустимые колбэки планировщика, включая ИИ
+            pattern=(
+                r"^(?:show_day_plan$|PLAN_OPEN$|PLAN_ADD_EMPTY$|ITEM_MENU:\d+$|DEL_ITEM:\d+$|EDIT_TIME:\d+$|"
+                r"EDIT_ITEM:\d+$|TOGGLE_DONE:\d+$|SHOW_ITEM:\d+$|"
+                r"PLAN_AI_OPEN$|PLAN_AI_CANCEL$|PLAN_AI_APPROVE_TEXT$|PLAN_AI_RETRY_TEXT$|"
+                r"PLAN_AI_GEN_IMAGE$|PLAN_AI_SKIP_IMAGE$|PLAN_AI_ATTACH:\d+$)"
+            )
         ),
         group=0
     )
@@ -677,7 +912,6 @@ def register_planner_handlers(app: Application) -> None:
     try:
         app.add_handler(MessageHandler(filters.Document.IMAGE, _msg_router), group=0)
     except Exception:
-        # на старых версиях PTB можно было бы проверить mime через кастомный фильтр, но оставим как есть
         pass
 
     print("✅ Planner handlers registered successfully")
