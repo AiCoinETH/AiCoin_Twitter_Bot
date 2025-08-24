@@ -39,6 +39,9 @@ jobs:
       # OpenAI (важно для новой версии клиента)
       OPENAI_API_KEY:              ${{ secrets.OPENAI_API_KEY }}
 
+      # Google Gemini
+      GEMINI_API_KEY:              ${{ secrets.GEMINI_API_KEY }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
