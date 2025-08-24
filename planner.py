@@ -53,23 +53,17 @@ if log.level == logging.NOTSET:
     log.setLevel(logging.INFO)
 
 TZ = ZoneInfo("Europe/Kyiv")
-# Абсолютный путь к базе данных
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planner.db")
 
 print(f"📁 Database path: {DB_FILE}")
 print(f"📂 Current directory: {os.getcwd()}")
 print(f"📂 Script directory: {os.path.dirname(os.path.abspath(__file__))}")
 
-# Состояние ожиданий ввода (правка текста/времени/новая тема)
-STATE: Dict[Tuple[int, int], dict] = {}
-
-# Экспортируемое имя для совместимости с импортом в twitter_bot.py
+STATE: Dict[Tuple[int, int], dict] = {}  # (chat_id,user_id)->state   и (chat_id,0)->state (fallback)
 USER_STATE = STATE  # alias
 
-# Для анти-дубликатов правок сообщений (защита от 400 "Message is not modified")
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
-
-_db_ready = False  # ленивый init
+_db_ready = False
 
 # ------------
 # Утилиты логирования
@@ -154,7 +148,7 @@ def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
 @dataclass
 class PlanItem:
     user_id: int
-    item_id: int        # локальный порядковый id внутри пользователя
+    item_id: int        # локальный id внутри пользователя
     text: str
     when_hhmm: Optional[str]  # "HH:MM" | None
     done: bool
@@ -200,7 +194,6 @@ async def _ensure_db() -> None:
 
         _db_ready = True
 
-        # Проверяем после создания
         if os.path.exists(DB_FILE):
             print(f"✅ Database created successfully!")
             print(f"📊 File size after: {os.path.getsize(DB_FILE)} bytes")
@@ -433,17 +426,10 @@ def _kb_add_more() -> InlineKeyboardMarkup:
 # ---------------
 # Парсеры/хелперы
 # ---------------
-_TIME_RE_COLON = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")  # строго HH:MM
+_TIME_RE_COLON = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 @_trace_sync
 def _parse_time(s: str) -> Optional[str]:
-    """
-    Принимает:
-      - 'HH:MM' (00:00–23:59)
-      - '930'  / '0930' -> '09:30'
-      - '1230' -> '12:30'
-    Возвращает 'HH:MM' или None.
-    """
     original = s
     print(f"⏰ Parsing time: '{s}'")
     s = (s or "").strip().replace(" ", "")
@@ -512,7 +498,6 @@ async def _safe_q_answer(q) -> bool:
 
 @_trace_async
 async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
-    """Фоллбэк: если редактировать нельзя — шлём новое сообщение туда же."""
     print(f"📨 Sending fallback message")
     try:
         chat_id = q.message.chat_id if q and q.message else None
@@ -541,13 +526,6 @@ async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardM
 
 @_trace_async
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
-    """
-    Безопасно редактируем сообщение.
-    - Если «Message is not modified» — пробуем изменить только разметку.
-    - Если флад-контроль — ждём и пробуем ещё раз.
-    - Если ничего не поменялось (anti-dup) — тихо пропускаем.
-    - Если всё равно не удаётся — отправляем НОВОЕ сообщение (фоллбэк).
-    """
     print(f"✏️ Editing message with text: '{_short(text, 50)}'")
     try:
         msg = getattr(q, "message", None)
@@ -641,32 +619,22 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
 # -----------------------------
 @_trace_async
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Открыть/обновить экран планировщика."""
+    """Открыть/обновить экран планировщика (ТОЛЬКО по явной кнопке)."""
     uid = update.effective_user.id
     print(f"📋 Opening planner for user {uid}, callback={bool(update.callback_query)}")
     log.info("Planner: open for uid=%s (cb=%s)", uid, bool(update.callback_query))
 
-    try:
-        kb = await _kb_main(uid)
-        text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
-
-        if update.callback_query:
-            print(f"✏️ Editing message for callback")
-            await edit_or_pass(update.callback_query, text, kb)
-        else:
-            print(f"📨 Sending new message")
-            await update.effective_message.reply_text(text=text, reply_markup=kb)
-
-        print(f"✅ Planner opened successfully for user {uid}")
-        log.debug("Planner: open done for uid=%s", uid)
-
-    except Exception as e:
-        print(f"❌ Error opening planner: {e}")
-        log.error("Error opening planner: %s", e)
-        raise
+    kb = await _kb_main(uid)
+    text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
+    if update.callback_query:
+        await edit_or_pass(update.callback_query, text, kb)
+    else:
+        await update.effective_message.reply_text(text=text, reply_markup=kb)
+    print(f"✅ Planner opened successfully for user {uid}")
+    log.debug("Planner: open done for uid=%s", uid)
 
 # --------------------------------------
-# Внутренний роутер callback-кнопок (group=0)
+# Роутер callback-кнопок (group=0)
 # --------------------------------------
 @_trace_async
 async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,182 +647,124 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_q_answer(q)
 
     if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
-        print(f"📋 Opening plan list")
-        log.debug("CB: open list")
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     if data == "PLAN_ADD_EMPTY":
-        print(f"➕ Adding empty item")
-        log.debug("CB: add empty")
         it = await _insert_item(uid, "")
-        set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id})
-        await edit_or_pass(
-            q,
-            f"✏️ Введи текст для задачи #{it.item_id}",
-            _kb_cancel_to_list()
-        )
+        # сохраняем владельца записи в STATE, чтобы не было путаницы uid
+        set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id, "uid": uid})
+        await edit_or_pass(q, f"✏️ Введи текст для задачи #{it.item_id}", _kb_cancel_to_list())
         return
 
     if data.startswith("ITEM_MENU:"):
         try:
             iid = int(data.split(":", 1)[1])
-            print(f"📝 Opening item menu: {iid}")
         except (ValueError, IndexError):
-            print(f"❌ Invalid ITEM_MENU data: {data}")
-            log.warning("CB: ITEM_MENU parse error: %r", data)
             await q.answer("Некорректный ID")
             return
-
         it = await _get_item(uid, iid)
         if not it:
-            print(f"❌ Item not found: {iid}")
             await q.answer("Задача не найдена")
             return
-
-        log.debug("CB: open item menu iid=%s", iid)
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     if data.startswith("DEL_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-            print(f"🗑️ Deleting item: {iid}")
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-
         await _delete_item(uid, iid)
         await q.answer("Удалено.")
-        log.info("CB: deleted iid=%s", iid)
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
     if data.startswith("TOGGLE_DONE:"):
         try:
             iid = int(data.split(":", 1)[1])
-            print(f"✅ Toggling done status: {iid}")
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Нет такой задачи")
             return
-
         await _update_done(uid, iid, not it.done)
-        it = await _get_item(uid, iid)  # Обновляем объект, т.к. состояние поменялось
-        print(f"✅ Done status toggled: {it.done if it else None}")
-        log.info("CB: toggle done iid=%s -> %s", iid, it.done if it else None)
+        it = await _get_item(uid, iid)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
     if data.startswith("EDIT_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-            print(f"✏️ Editing item text: {iid}")
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-
-        set_state_for_update(update, {"mode": "edit_text", "item_id": iid})
-        await edit_or_pass(
-            q,
-            f"✏️ Введи новый текст для задачи #{iid}",
-            _kb_cancel_to_list()
-        )
+        set_state_for_update(update, {"mode": "edit_text", "item_id": iid, "uid": uid})
+        await edit_or_pass(q, f"✏️ Введи новый текст для задачи #{iid}", _kb_cancel_to_list())
         return
 
     if data.startswith("EDIT_TIME:"):
         try:
             iid = int(data.split(":", 1)[1])
-            print(f"⏰ Editing item time: {iid}")
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-
-        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
-        await edit_or_pass(
-            q,
-            f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-            _kb_cancel_to_list()
-        )
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": uid})
+        await edit_or_pass(q, f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)", _kb_cancel_to_list())
         return
-
-    if data.startswith("PLAN_"):
-        print(f"📋 Fallback to open planner for: {data}")
-        log.debug("CB: fallback open planner for %r", data)
-        await open_planner(update, context)
 
 # --------------------------------------
 # Текстовые сообщения (ввод для режимов)
 # --------------------------------------
 @_trace_async
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    incoming_uid = update.effective_user.id  # только для логов
     txt = (update.message.text or "").strip()
     st = get_state_for_update(update)
-    print(f"📨 Message router: user {uid}, has_state={bool(st)}, text='{_short(txt)}'")
-    log.debug("MSG router: uid=%s has_state=%s text=%r", uid, bool(st), _short(txt))
+    print(f"📨 Message router: incoming_uid={incoming_uid}, has_state={bool(st)}, text='{_short(txt)}'")
+    log.debug("MSG router: incoming_uid=%s has_state=%s text=%r", incoming_uid, bool(st), _short(txt))
 
     if not st:
-        print(f"⚠️ No state, skipping message")
-        log.debug("MSG: skip (no pending state) uid=%s", uid)
         return
 
     mode = st.get("mode")
     iid = int(st.get("item_id", 0))
+    owner_uid = int(st.get("uid", incoming_uid))  # <- владелец задачи (важно!)
 
-    print(f"🔍 Processing mode='{mode}', item_id={iid}")
-
-    # Защита от некорректного iid
     if iid == 0:
-        print(f"❌ Invalid item_id in state, clearing")
-        log.warning("MSG router: invalid item_id in state, clearing state for uid=%s", uid)
         clear_state_for_update(update)
         await update.message.reply_text("Что-то пошло не так. Пожалуйста, попробуй ещё раз.")
         return
 
-    log.info("MSG: uid=%s mode=%s text=%r", uid, mode, _short(txt, 200))
-
     if mode == "edit_text":
-        print(f"📝 Processing text input for item {iid}")
-        await _update_text(uid, iid, txt)
-
-        # Переходим к вводу времени (НЕ очищаем состояние здесь!)
-        set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
-        print(f"⏰ Transitioning to time input for item {iid}")
+        await _update_text(owner_uid, iid, txt)
+        # остаёмся в сценарии — переходим к вводу времени, НИКУДА не вываливаемся
+        set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": owner_uid})
         await update.message.reply_text(
-            f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            "✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
             reply_markup=_kb_cancel_to_list()
         )
         return
 
     if mode == "edit_time":
-        print(f"⏰ Processing time input for item {iid}")
         t = _parse_time(txt)
         if not t:
-            print(f"❌ Invalid time format: '{txt}'")
             await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
             return
-
-        await _update_time(uid, iid, t)
+        await _update_time(owner_uid, iid, t)
         clear_state_for_update(update)
-        print(f"✅ Time updated successfully: {t}")
-
-        # Спрашиваем, добавить еще или закончить
-        print(f"❓ Asking if user wants to add more")
+        # показа главного меню здесь НЕТ — только выбор, что делать дальше
         await update.message.reply_text(
-            f"✅ Время установлено: {t}\n\nДобавить еще одну задачу или закончить?",
+            f"✅ Время установлено: {t}\n\nДобавить ещё одну задачу или закончить?",
             reply_markup=_kb_add_more()
         )
         return
 
-    print(f"⚠️ Unknown state mode: {mode}, clearing")
-    log.debug("MSG: unknown state -> clearing")
+    # неизвестный режим — не открываем планировщик самопроизвольно
     clear_state_for_update(update)
-    await open_planner(update, context)
 
 # ==== Экспорт для twitter_bot.py ====
 @_trace_async
@@ -864,13 +774,11 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
     it = await _insert_item(uid, text or "")
     log.info("API: planner_add_from_text uid=%s -> iid=%s", uid, it.item_id)
 
-    # Если переданы chat_id и bot, сразу запрашиваем время
     if chat_id is not None and bot is not None:
-        print(f"⏰ Immediately prompting for time: iid={it.item_id}")
-        set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id})
+        set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id, "uid": uid})
         await bot.send_message(
             chat_id=chat_id,
-            text=f"✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            text="✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
             reply_markup=_kb_cancel_to_list()
         )
         log.info("API: immediately prompted for time uid=%s iid=%s", uid, it.item_id)
@@ -880,16 +788,13 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
 @_trace_async
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     """Спрашивает у пользователя время для задачи последней/созданной записи."""
-    print(f"⏰ planner_prompt_time: uid={uid}, chat_id={chat_id}")
+    print(f"⏰ planner_prompt_time: uid=%s, chat_id=%s" % (uid, chat_id))
     items = await _get_items(uid)
     if not items:
-        print(f"❌ No items found for user {uid}")
         log.warning("API: planner_prompt_time — no items for uid=%s", uid)
         return
-
     iid = items[-1].item_id
-    print(f"🔍 Prompting for last item: {iid}")
-    set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid})
+    set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid, "uid": uid})
     await bot.send_message(
         chat_id=chat_id,
         text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
@@ -905,9 +810,7 @@ def register_planner_handlers(app: Application) -> None:
     """
     Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
     забирал только свои колбэки. BACK_MAIN_MENU не ловим, т.к. это возврат в основной бот.
-
-    Текстовый хендлер обрабатывает сообщения ТОЛЬКО,
-    когда у пользователя есть ожидаемый ввод (STATE).
+    Текстовый хендлер обрабатывает сообщения ТОЛЬКО при наличии STATE.
     """
     print("📝 Registering planner handlers (group=0)")
     log.info("Planner: registering handlers (group=0)")
@@ -927,7 +830,6 @@ def register_planner_handlers(app: Application) -> None:
     print("✅ Planner handlers registered successfully")
     log.info("Planner: handlers registered")
 
-# Добавляем вывод информации при импорте модуля
 print(f"✅ Planner module loaded successfully!")
 print(f"📁 Database will be created at: {DB_FILE}")
 print(f"📂 Current working directory: {os.getcwd()}")
