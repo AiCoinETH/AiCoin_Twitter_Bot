@@ -113,7 +113,7 @@ def _trace_async(fn):
                   ", ".join(_fmt_arg(a) for a in args),
                   ((", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else ""))
         res = await fn(*args, **kwargs)
-        log.debug("← %极简风，但保持专业性。直接回答问题，避免不必要的信息。s = %s", fn.__name__, _fmt_arg(res))
+        log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
         return res
     return wrap
 
@@ -128,7 +128,7 @@ def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int,
 def set_state_for_update(update: Update, st: dict) -> None:
     k_personal, k_chat = _state_keys_from_update(update)
     STATE[k_personal] = st
-    STATE[k_chat极简风，但保持专业性。直接回答问题，避免不必要的信息。] = st
+    STATE[k_chat] = st
     log.debug("STATE set for %s and %s -> %s", k_personal, k_chat, st)
 
 def get_state_for_update(update: Update) -> Optional[dict]:
@@ -177,19 +177,19 @@ CREATE TABLE IF NOT EXISTS plan_items (
 @_trace_async
 async def _ensure_db() -> None:
     global _db_ready
-    if _db极简风，但保持专业性。直接回答问题，避免不必要的信息。_ready:
+    if _db_ready:
         log.debug("DB already ready")
         return
-    
+
     print(f"🔄 Starting database initialization...")
     print(f"📁 Database file: {DB_FILE}")
     print(f"📂 File exists before init: {os.path.exists(DB_FILE)}")
-    
+
     if os.path.exists(DB_FILE):
         print(f"📊 File size before: {os.path.getsize(DB_FILE)} bytes")
-    
+
     log.info("DB init start: %s", DB_FILE)
-    
+
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             print(f"✅ Successfully connected to database")
@@ -197,9 +197,9 @@ async def _ensure_db() -> None:
             await db.execute(CREATE_SQL)
             await db.commit()
             print(f"✅ CREATE TABLE executed successfully")
-        
+
         _db_ready = True
-        
+
         # Проверяем после создания
         if os.path.exists(DB_FILE):
             print(f"✅ Database created successfully!")
@@ -208,9 +208,9 @@ async def _ensure_db() -> None:
         else:
             print(f"❌ ERROR: Database file not found after creation!")
             print(f"❌ Expected path: {os.path.abspath(DB_FILE)}")
-            
+
         log.info("DB init complete")
-        
+
     except Exception as e:
         print(f"❌ DATABASE ERROR: {e}")
         print(f"❌ Error type: {type(e).__name__}")
@@ -238,18 +238,19 @@ async def _next_item_id(uid: int) -> int:
     print(f"🔢 Getting next item ID for user {uid}")
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        sql = "SELECT COALES极简风，但保持专业性。直接回答问题，避免不必要的信息。CE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
+        sql = "SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
         log.debug("SQL: %s | args=(%s,)", sql, uid)
         print(f"🔍 Executing SQL: {sql} with uid={uid}")
         cur = await db.execute(sql, (uid,))
-        (mx,) = await cur.fetchone()
+        row = await cur.fetchone()
+        mx = row[0] if row is not None else 0
     nxt = int(mx) + 1
     print(f"✅ Next item ID for user {uid}: {nxt}")
-    log.debug("Next item_id=%s for uid=%极简风，但保持专业性。直接回答问题，避免不必要的信息。s", nxt, uid)
+    log.debug("Next item_id=%s for uid=%s", nxt, uid)
     return nxt
 
 @_trace_async
-async def _insert_item(uid: int, text: str = "", when_hhmm极简风，但保持专业性。直接回答问题，避免不必要的信息。: Optional[str] = None) -> PlanItem:
+async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None) -> PlanItem:
     print(f"📝 Inserting item for user {uid}: text='{text}', time={when_hhmm}")
     iid = await _next_item_id(uid)
     now = datetime.now(TZ).isoformat()
@@ -321,11 +322,11 @@ async def _delete_item(uid: int, iid: int) -> None:
         sql = "DELETE FROM plan_items WHERE user_id=? AND item_id=?"
         args = (uid, iid)
         log.debug("SQL: %s | args=%s", sql, args)
-        print(f"🗑️ Executing DELETE极简风，但保持专业性。直接回答问题，避免不必要的信息。: {sql}")
+        print(f"🗑️ Executing DELETE: {sql}")
         print(f"🗑️ Values: {args}")
         await db.execute(sql, args)
         await db.commit()
-       极简风，但保持专业性。直接回答问题，避免不必要的信息。 print(f"✅ Item deleted successfully")
+        print(f"✅ Item deleted successfully")
     log.info("Deleted uid=%s iid=%s", uid, iid)
 
 @_trace_async
@@ -335,7 +336,7 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         sql = "SELECT user_id, item_id, text, when_hhmm, done FROM plan_items WHERE user_id=? AND item_id=?"
-        log.debug("SQL: %s | args=(%s,%s)", sql, uid极简风，但保持专业性。直接回答问题，避免不必要的信息。, iid)
+        log.debug("SQL: %s | args=(%s,%s)", sql, uid, iid)
         print(f"🔍 Executing SELECT: {sql} with uid={uid}, iid={iid}")
         cur = await db.execute(sql, (uid, iid))
         row = await cur.fetchone()
@@ -358,8 +359,8 @@ async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         sql = ("SELECT user_id, item_id, text, when_hhmm, done FROM plan_items "
-               "WHERE user_id=? AND item_id>? ORDER BY item_id ASC LIM极简风，但保持专业性。直接回答问题，避免不必要的信息。IT 1")
-        log.debug("SQL: %s | args=(极简风，但保持专业性。直接回答问题，避免不必要的信息。%s,%s)", sql, uid, after_iid)
+               "WHERE user_id=? AND item_id>? ORDER BY item_id ASC LIMIT 1")
+        log.debug("SQL: %s | args=(%s,%s)", sql, uid, after_iid)
         print(f"🔍 Executing SQL: {sql} with uid={uid}, after_iid={after_iid}")
         cur = await db.execute(sql, (uid, after_iid))
         row = await cur.fetchone()
@@ -368,7 +369,7 @@ async def _find_next_item(uid: int, after_iid: int) -> Optional[PlanItem]:
         else:
             print(f"❌ No next item found")
     if not row:
-        log.debug("No next item after iid=%s for uid=%s", after极简风，但保持专业性。直接回答问题，避免不必要的信息。_iid, uid)
+        log.debug("No next item after iid=%s for uid=%s", after_iid, uid)
         return None
     nxt = PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]))
     log.debug("Next item: %s", _fmt_arg(nxt))
@@ -382,10 +383,10 @@ def _fmt_item(i: PlanItem) -> str:
     t = f"[{i.when_hhmm}]" if i.when_hhmm else "[—]"
     d = "✅" if i.done else "🟡"
     txt = (i.text or "").strip() or "(пусто)"
-    return f"{d} {极简风，但保持专业性。直接回答问题，避免不必要的信息。t} {txt}"
+    return f"{d} {t} {txt}"
 
 @_trace_async
-async def _kb_main(uid: int极简风，但保持专业性。直接回答问题，避免不必要的信息。) -> InlineKeyboardMarkup:
+async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     print(f"⌨️ Building main keyboard for user {uid}")
     items = await _get_items(uid)
     rows: List[List[InlineKeyboardButton]] = []
@@ -421,7 +422,7 @@ def _kb_cancel_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="PLAN_OPEN")]])
 
 @_trace_sync
-def _kb_add_more() -> In极简风，但保持专业性。直接回答问题，避免不必要的信息。lineKeyboardMarkup:
+def _kb_add_more() -> InlineKeyboardMarkup:
     """Клавиатура для выбора: добавить еще или закончить"""
     print("⌨️ Building 'add more' keyboard")
     return InlineKeyboardMarkup([
@@ -523,7 +524,7 @@ async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardM
         print(f"✅ Fallback message sent")
         log.debug("TG: fallback message sent")
     except RetryAfter as e:
-        delay = getattr(e, "retry_after", 2)极简风，但保持专业性。直接回答问题，避免不必要的信息。 + 1
+        delay = getattr(e, "retry_after", 2) + 1
         print(f"⚠️ Flood control in fallback, sleeping {delay}s")
         log.warning("TG: send_message flood, sleep=%s", delay)
         await asyncio.sleep(delay)
@@ -532,7 +533,7 @@ async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardM
             print(f"✅ Fallback message sent after retry")
             log.debug("TG: fallback message retry sent")
         except Exception as e2:
-            print(f"❌ Fallback send retry failed: {e极简风，但保持专业性。直接回答问题，避免不必要的信息。2}")
+            print(f"❌ Fallback send retry failed: {e2}")
             log.error("TG: fallback send retry failed: %s", e2)
     except Exception as e:
         print(f"❌ Fallback send error: {e}")
@@ -554,7 +555,7 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
             key = (msg.chat_id, msg.message_id)
             markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
             new_sig = (text or "", markup_json)
-            if LAST_SIG.get(key) == new_s极简风，但保持专业性。直接回答问题，避免不必要的信息。ig:
+            if LAST_SIG.get(key) == new_sig:
                 print(f"⚠️ Nothing to modify (anti-dup), passing")
                 log.debug("TG: nothing to modify; pass (anti-dup)")
                 return
@@ -571,7 +572,7 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
         delay = getattr(e, "retry_after", 2) + 1
         print(f"⚠️ Flood control, sleeping {delay}s")
         log.warning("TG: edit_message_text flood, sleep=%s", delay)
-        await asyn极简风，但保持专业性。直接回答问题，避免不必要的信息。cio.sleep(delay)
+        await asyncio.sleep(delay)
         try:
             await q.edit_message_text(text=text, reply_markup=reply_markup)
             print(f"✅ Message edited after retry")
@@ -605,7 +606,7 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 log.warning("TG: edit_message_reply_markup flood, sleep=%s", delay)
                 await asyncio.sleep(delay)
                 try:
-                    await q.edit_message_reply_markup(reply_markup极简风，但保持专业性。直接回答问题，避免不必要的信息。=reply_markup)
+                    await q.edit_message_reply_markup(reply_markup=reply_markup)
                     print(f"✅ Reply markup edited after retry")
                     log.debug("TG: edit_message_reply_markup retry OK")
                     msg = getattr(q, "message", None)
@@ -625,8 +626,6 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                     return
                 print(f"❌ BadRequest in markup edit: {e2}, sending fallback")
                 log.error("TG: edit_message_reply_markup bad request: %s", e2)
-        await _send_new_message_fallback(q, text, reply_markup)
-        return
         print(f"❌ BadRequest: {e}, sending fallback")
         log.warning("TG: edit_message_text bad request -> fallback, err=%s", e)
         await _send_new_message_fallback(q, text, reply_markup)
@@ -646,21 +645,21 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     print(f"📋 Opening planner for user {uid}, callback={bool(update.callback_query)}")
     log.info("Planner: open for uid=%s (cb=%s)", uid, bool(update.callback_query))
-    
+
     try:
         kb = await _kb_main(uid)
         text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу или добавь новую."
-        
+
         if update.callback_query:
             print(f"✏️ Editing message for callback")
             await edit_or_pass(update.callback_query, text, kb)
         else:
             print(f"📨 Sending new message")
             await update.effective_message.reply_text(text=text, reply_markup=kb)
-            
+
         print(f"✅ Planner opened successfully for user {uid}")
         log.debug("Planner: open done for uid=%s", uid)
-        
+
     except Exception as e:
         print(f"❌ Error opening planner: {e}")
         log.error("Error opening planner: %s", e)
@@ -670,11 +669,11 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Внутренний роутер callback-кнопок (group=0)
 # --------------------------------------
 @_trace_async
-async def _cb_plan_router(update: Update, context: ContextTypes极简风，但保持专业性。直接回答问题，避免不必要的信息。.DEFAULT_TYPE):
+async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = update.effective_user.id
     data = (q.data or "").strip()
-    print(f"🔄 Callback router: user {uid}, data='极简风，但保持专业性。直接回答问题，避免不必要的信息。{data}'")
+    print(f"🔄 Callback router: user {uid}, data='{data}'")
     log.info("CB router: uid=%s data=%r", uid, data)
 
     await _safe_q_answer(q)
@@ -687,7 +686,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
 
     if data == "PLAN_ADD_EMPTY":
         print(f"➕ Adding empty item")
-        log.debug("CB极简风，但保持专业性。直接回答问题，避免不必要的信息。: add empty")
+        log.debug("CB: add empty")
         it = await _insert_item(uid, "")
         set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id})
         await edit_or_pass(
@@ -706,13 +705,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
             log.warning("CB: ITEM_MENU parse error: %r", data)
             await q.answer("Некорректный ID")
             return
-            
+
         it = await _get_item(uid, iid)
         if not it:
             print(f"❌ Item not found: {iid}")
             await q.answer("Задача не найдена")
             return
-            
+
         log.debug("CB: open item menu iid=%s", iid)
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
@@ -724,7 +723,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-            
+
         await _delete_item(uid, iid)
         await q.answer("Удалено.")
         log.info("CB: deleted iid=%s", iid)
@@ -736,17 +735,17 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
             iid = int(data.split(":", 1)[1])
             print(f"✅ Toggling done status: {iid}")
         except (ValueError, IndexError):
-            await q极简风，但保持专业性。直接回答问题，避免不必要的信息。.answer("Некорректный ID")
+            await q.answer("Некорректный ID")
             return
-            
+
         it = await _get_item(uid, iid)
         if not it:
             await q.answer("Нет такой задачи")
             return
-            
+
         await _update_done(uid, iid, not it.done)
-        it = await _get_item(uid, iid) # Обновляем объект, т.к. состояние поменялось
-        print(f"✅ Done status toggled: {it.done}")
+        it = await _get_item(uid, iid)  # Обновляем объект, т.к. состояние поменялось
+        print(f"✅ Done status toggled: {it.done if it else None}")
         log.info("CB: toggle done iid=%s -> %s", iid, it.done if it else None)
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
@@ -758,9 +757,9 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-            
-        set_state_for_update(update, {"mode": "edit_text", "极简风，但保持专业性。直接回答问题，避免不必要的信息。item_id": iid})
-        await edit极简风，但保持专业性。直接回答问题，避免不必要的信息。_or_pass(
+
+        set_state_for_update(update, {"mode": "edit_text", "item_id": iid})
+        await edit_or_pass(
             q,
             f"✏️ Введи новый текст для задачи #{iid}",
             _kb_cancel_to_list()
@@ -774,7 +773,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes极简风，但�
         except (ValueError, IndexError):
             await q.answer("Некорректный ID")
             return
-            
+
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
         await edit_or_pass(
             q,
@@ -806,9 +805,9 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = st.get("mode")
     iid = int(st.get("item_id", 0))
-    
+
     print(f"🔍 Processing mode='{mode}', item_id={iid}")
-    
+
     # Защита от некорректного iid
     if iid == 0:
         print(f"❌ Invalid item_id in state, clearing")
@@ -822,7 +821,7 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "edit_text":
         print(f"📝 Processing text input for item {iid}")
         await _update_text(uid, iid, txt)
-        
+
         # Переходим к вводу времени (НЕ очищаем состояние здесь!)
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid})
         print(f"⏰ Transitioning to time input for item {iid}")
@@ -839,11 +838,11 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"❌ Invalid time format: '{txt}'")
             await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
             return
-        
+
         await _update_time(uid, iid, t)
         clear_state_for_update(update)
         print(f"✅ Time updated successfully: {t}")
-        
+
         # Спрашиваем, добавить еще или закончить
         print(f"❓ Asking if user wants to add more")
         await update.message.reply_text(
@@ -864,7 +863,7 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
     print(f"🚀 planner_add_from_text: uid={uid}, text='{text}', chat_id={chat_id}")
     it = await _insert_item(uid, text or "")
     log.info("API: planner_add_from_text uid=%s -> iid=%s", uid, it.item_id)
-    
+
     # Если переданы chat_id и bot, сразу запрашиваем время
     if chat_id is not None and bot is not None:
         print(f"⏰ Immediately prompting for time: iid={it.item_id}")
@@ -875,7 +874,7 @@ async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = 
             reply_markup=_kb_cancel_to_list()
         )
         log.info("API: immediately prompted for time uid=%s iid=%s", uid, it.item_id)
-    
+
     return it.item_id
 
 @_trace_async
@@ -887,7 +886,7 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
         print(f"❌ No items found for user {uid}")
         log.warning("API: planner_prompt_time — no items for uid=%s", uid)
         return
-        
+
     iid = items[-1].item_id
     print(f"🔍 Prompting for last item: {iid}")
     set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid})
@@ -912,7 +911,7 @@ def register_planner_handlers(app: Application) -> None:
     """
     print("📝 Registering planner handlers (group=0)")
     log.info("Planner: registering handlers (group=0)")
-    
+
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
@@ -924,7 +923,7 @@ def register_planner_handlers(app: Application) -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router),
         group=0
     )
-    
+
     print("✅ Planner handlers registered successfully")
     log.info("Planner: handlers registered")
 
