@@ -1,28 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Планировщик с персистентностью в SQLite для twitter_bot.py.
+Планировщик с ИИ-мастером (Gemini) и персистентностью в SQLite для twitter_bot.py.
 
-Новые фичи:
-- Две ветки постов: source = 'manual' (✍️) и 'ai' (🤖)
-- Экран «🧠 План ИИ»: отдельный список ИИ-постов + создание ИИ/ручных
-- Генерация текста (Gemini) и, опционально, изображения (OpenAI)
+Поддерживаемые действия (основные):
+  PLAN_OPEN, PLAN_ADD_EMPTY, ITEM_MENU:<id>, DEL_ITEM:<id>, EDIT_TIME:<id>, EDIT_ITEM:<id>,
+  TOGGLE_DONE:<id>, SHOW_ITEM:<id>, BACK_MAIN_MENU (обрабатывает основной бот)
 
-Поддерживаемые callback-и:
-  PLAN_OPEN, PLAN_AI_OPEN, PLAN_ADD_EMPTY, PLAN_ADD_MANUAL, PLAN_ADD_AI,
-  ITEM_MENU:<id>, DEL_ITEM:<id>, EDIT_TIME:<id>, EDIT_ITEM:<id>,
-  TOGGLE_DONE:<id>, SHOW_ITEM:<id>,
-  AI_REGEN:<id>, AI_ACCEPT:<id>, AI_CANCEL:<id>, AI_GEN_IMG:<id>
+Ветка ИИ-плана:
+  AI_PLAN_OPEN, AI_TOPIC, AI_TXT_APPROVE, AI_TXT_REGEN,
+  AI_IMG_GEN, AI_IMG_APPROVE, AI_IMG_REGEN, AI_IMG_SKIP,
+  AI_SAVE_AND_TIME, AI_DONE_ADD_MORE, AI_DONE_FINISH
 
 Хранение:
-  - Таблица plan_items(user_id, item_id, text, when_hhmm, done,
-                      media_file_id, media_type, source, created_at)
+  - Таблица plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at, source)
+  - source: 'manual' | 'ai'
   - item_id — локальная последовательность на пользователя (1,2,3,...) — сохраняется
 
-Состояние ввода (STATE):
+Состояние ввода:
   - Привязка по (chat_id, user_id) с общечатовым fallback (chat_id, 0)
-  - Режимы:
-      edit_text, edit_time,
-      ai_topic (ввод темы для ИИ), ai_review (обзор с кнопками)
 """
 
 from __future__ import annotations
@@ -30,6 +25,7 @@ import re
 import os
 import io
 import json
+import time
 import base64
 import asyncio
 import logging
@@ -40,18 +36,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import wraps
 
-# ИИ SDK (безопасно импортируем; если нет ключей — просто не используем)
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
-
-try:
-    from openai import OpenAI as OpenAIClient
-except Exception:
-    OpenAIClient = None
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -60,6 +45,19 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, RetryAfter
+
+# ===== Gemini =====
+_GEMINI_OK = False
+try:
+    import google.generativeai as genai
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        _GEMINI_OK = True
+    else:
+        _GEMINI_OK = False
+except Exception:
+    _GEMINI_OK = False
 
 __all__ = [
     "register_planner_handlers",
@@ -83,23 +81,25 @@ STATE: Dict[Tuple[int, int], dict] = {}  # (chat_id,user_id)->state   и (chat_i
 USER_STATE = STATE  # alias
 
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
+LAST_EDIT_AT: Dict[Tuple[int, int], float] = {}        # (chat_id, message_id) -> ts
+MIN_EDIT_GAP = 0.8
 _db_ready = False
 
-# env для ИИ
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # опционально для картинок
-
-# ------------
-# Утилиты логирования
-# ------------
 def _short(val: Any, n: int = 120) -> str:
     s = str(val)
     return s if len(s) <= n else s[:n] + "…"
 
 def _fmt_arg(v: Any) -> str:
+    try:
+        from telegram import Update as TGUpdate
+        if isinstance(v, TGUpdate):
+            return f"<Update chat={getattr(getattr(v, 'effective_chat', None), 'id', None)} cb={bool(v.callback_query)}>"
+        if v.__class__.__name__ in {"Bot", "Application"}:
+            return f"<{v.__class__.__name__}>"
+    except Exception:
+        pass
     if isinstance(v, PlanItem):
-        return f"PlanItem(iid={v.item_id}, src={v.source}, time={v.when_hhmm}, done={v.done}, text={_short(v.text, 60)!r})"
+        return f"PlanItem(iid={v.item_id}, time={v.when_hhmm}, done={v.done}, src={getattr(v,'source','?')}, text={_short(v.text, 60)!r})"
     if isinstance(v, list) and v and isinstance(v[0], PlanItem):
         return f"[PlanItem×{len(v)}: {', '.join('#'+str(i.item_id) for i in v[:5])}{'…' if len(v)>5 else ''}]"
     if isinstance(v, str):
@@ -129,7 +129,7 @@ def _trace_async(fn):
     return wrap
 
 # ------------
-# Helpers для STATE
+# STATE helpers
 # ------------
 def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     chat_id = update.effective_chat.id if update.effective_chat else 0
@@ -155,21 +155,21 @@ def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
     STATE[(chat_id, 0)] = st
 
 # ------------
-# Модель данных
+# Data model
 # ------------
 @dataclass
 class PlanItem:
     user_id: int
-    item_id: int        # локальный id внутри пользователя
+    item_id: int
     text: str
-    when_hhmm: Optional[str]  # "HH:MM" | None
+    when_hhmm: Optional[str]
     done: bool
-    media_file_id: Optional[str] = None  # Telegram file_id
-    media_type: Optional[str] = None     # "photo" | "document" | None
-    source: str = "manual"               # 'manual' | 'ai'
+    media_file_id: Optional[str] = None
+    media_type: Optional[str] = None
+    source: str = "manual"  # 'manual' or 'ai'
 
 # ------------
-# База (SQLite)
+# SQLite
 # ------------
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS plan_items (
@@ -180,15 +180,14 @@ CREATE TABLE IF NOT EXISTS plan_items (
   done          INTEGER NOT NULL DEFAULT 0,
   media_file_id TEXT,
   media_type    TEXT,
-  source        TEXT    NOT NULL DEFAULT 'manual',
   created_at    TEXT    NOT NULL,
+  source        TEXT    NOT NULL DEFAULT 'manual',
   PRIMARY KEY (user_id, item_id)
 );
 """
 
 @_trace_async
 async def _migrate_db() -> None:
-    """Мягкие миграции до новых полей."""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             for sql in (
@@ -215,20 +214,14 @@ async def _ensure_db() -> None:
     await _migrate_db()
     _db_ready = True
 
-# --- CRUD ---
 @_trace_async
-async def _get_items(uid: int, source: Optional[str] = None) -> List[PlanItem]:
+async def _get_items(uid: int) -> List[PlanItem]:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
-        if source:
-            sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
-                     FROM plan_items WHERE user_id=? AND source=? ORDER BY item_id ASC"""
-            cur = await db.execute(sql, (uid, source))
-        else:
-            sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
-                     FROM plan_items WHERE user_id=? ORDER BY item_id ASC"""
-            cur = await db.execute(sql, (uid,))
+        sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
+                 FROM plan_items WHERE user_id=? ORDER BY COALESCE(when_hhmm,'99:99'), item_id"""
+        cur = await db.execute(sql, (uid,))
         rows = await cur.fetchall()
     return [PlanItem(r["user_id"], r["item_id"], r["text"], r["when_hhmm"], bool(r["done"]),
                      r["media_file_id"], r["media_type"], r["source"]) for r in rows]
@@ -237,20 +230,21 @@ async def _get_items(uid: int, source: Optional[str] = None) -> List[PlanItem]:
 async def _next_item_id(uid: int) -> int:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?", (uid,))
+        sql = "SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
+        cur = await db.execute(sql, (uid,))
         row = await cur.fetchone()
         mx = row[0] if row is not None else 0
     return int(mx) + 1
 
 @_trace_async
-async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None, *, source: str = "manual") -> PlanItem:
+async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None, source: str = "manual") -> PlanItem:
     iid = await _next_item_id(uid)
     now = datetime.now(TZ).isoformat()
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        sql = """INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source, created_at)
+        sql = """INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at, source)
                  VALUES (?,?,?,?,?,?,?,?,?)"""
-        args = (uid, iid, text or "", when_hhmm, 0, None, None, source, now)
+        args = (uid, iid, text or "", when_hhmm, 0, None, None, now, source)
         await db.execute(sql, args)
         await db.commit()
     return PlanItem(uid, iid, text or "", when_hhmm, False, None, None, source)
@@ -259,21 +253,24 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
 async def _update_text(uid: int, iid: int, text: str) -> None:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?", (text or "", uid, iid))
+        await db.execute("UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?",
+                         (text or "", uid, iid))
         await db.commit()
 
 @_trace_async
 async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?", (when_hhmm, uid, iid))
+        await db.execute("UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?",
+                         (when_hhmm, uid, iid))
         await db.commit()
 
 @_trace_async
 async def _update_done(uid: int, iid: int, done: bool) -> None:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?", (1 if done else 0, uid, iid))
+        await db.execute("UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?",
+                         (1 if done else 0, uid, iid))
         await db.commit()
 
 @_trace_async
@@ -296,8 +293,9 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     await _ensure_db()
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
-                                  FROM plan_items WHERE user_id=? AND item_id=?""", (uid, iid))
+        sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
+                 FROM plan_items WHERE user_id=? AND item_id=?"""
+        cur = await db.execute(sql, (uid, iid))
         row = await cur.fetchone()
     if not row:
         return None
@@ -309,10 +307,10 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
 # -------------------------
 @_trace_sync
 def _fmt_item(i: PlanItem) -> str:
-    t = f"[{i.when_hhmm or '—'}]"
+    t = f"[{i.when_hhmm}]" if i.when_hhmm else "[—]"
     d = "✅" if i.done else "🟡"
     cam = " 📷" if i.media_file_id else ""
-    src = "🤖" if i.source == "ai" else "✍️"
+    src = "🤖" if i.source == "ai" else "✋"
     txt = (i.text or "").strip() or "(пусто)"
     return f"{d} {t} {src} {txt}{cam}"
 
@@ -323,22 +321,9 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     for it in items:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
     rows += [
-        [InlineKeyboardButton("➕ Новая (моя)", callback_data="PLAN_ADD_MANUAL"),
-         InlineKeyboardButton("🧠 План ИИ", callback_data="PLAN_AI_OPEN")],
+        [InlineKeyboardButton("➕ Новая (моя)", callback_data="PLAN_ADD_EMPTY"),
+         InlineKeyboardButton("🧠 План ИИ", callback_data="AI_PLAN_OPEN")],
         [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-@_trace_async
-async def _kb_ai(uid: int) -> InlineKeyboardMarkup:
-    items = await _get_items(uid, source="ai")
-    rows: List[List[InlineKeyboardButton]] = []
-    for it in items:
-        rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
-    rows += [
-        [InlineKeyboardButton("🧠 Новая (ИИ)", callback_data="PLAN_ADD_AI"),
-         InlineKeyboardButton("➕ Новая (моя)", callback_data="PLAN_ADD_MANUAL")],
-        [InlineKeyboardButton("⬅️ К общему плану", callback_data="PLAN_OPEN")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -348,11 +333,8 @@ def _kb_item(it: PlanItem) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ Текст", callback_data=f"EDIT_ITEM:{it.item_id}"),
          InlineKeyboardButton("⏰ Время", callback_data=f"EDIT_TIME:{it.item_id}")],
     ]
-    if it.source == "ai":
-        rows.append([InlineKeyboardButton("🔁 ИИ: ещё вариант", callback_data=f"AI_REGEN:{it.item_id}"),
-                     InlineKeyboardButton("🖼 ИИ: изображение", callback_data=f"AI_GEN_IMG:{it.item_id}")])
     if it.media_file_id:
-        rows.append([InlineKeyboardButton("👁 Показать медиа", callback_data=f"SHOW_ITEM:{it.item_id}")])
+        rows.append([InlineKeyboardButton("👁 Показать", callback_data=f"SHOW_ITEM:{it.item_id}")])
     rows += [
         [InlineKeyboardButton("✅/🟡 Переключить статус", callback_data=f"TOGGLE_DONE:{it.item_id}")],
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"DEL_ITEM:{it.item_id}")],
@@ -367,18 +349,40 @@ def _kb_cancel_to_list() -> InlineKeyboardMarkup:
 @_trace_sync
 def _kb_add_more() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Еще одна задача", callback_data="PLAN_ADD_MANUAL")],
-        [InlineKeyboardButton("🧠 В ИИ-план", callback_data="PLAN_AI_OPEN")],
+        [InlineKeyboardButton("➕ Ещё одна", callback_data="PLAN_ADD_EMPTY"),
+         InlineKeyboardButton("🧠 Ещё ИИ-пост", callback_data="AI_PLAN_OPEN")],
         [InlineKeyboardButton("✅ Готово", callback_data="PLAN_OPEN")]
     ])
 
-def _kb_ai_review(iid: int) -> InlineKeyboardMarkup:
+# ----- ИИ мастер UI -----
+@_trace_sync
+def _kb_ai_home() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Подходит", callback_data=f"AI_ACCEPT:{iid}"),
-         InlineKeyboardButton("🔁 Ещё вариант", callback_data=f"AI_REGEN:{iid}")],
-        [InlineKeyboardButton("✏️ Править вручную", callback_data=f"EDIT_ITEM:{iid}")],
-        [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data=f"AI_GEN_IMG:{iid}")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"AI_CANCEL:{iid}")]
+        [InlineKeyboardButton("📝 Создать ИИ-пост", callback_data="AI_TOPIC")],
+        [InlineKeyboardButton("⬅️ Назад к плану", callback_data="PLAN_OPEN")],
+    ])
+
+@_trace_sync
+def _kb_ai_text_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Текст подходит", callback_data="AI_TXT_APPROVE"),
+         InlineKeyboardButton("🔁 Перегенерировать", callback_data="AI_TXT_REGEN")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
+    ])
+
+@_trace_sync
+def _kb_ai_image_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="AI_IMG_GEN")],
+        [InlineKeyboardButton("⏭ Пропустить картинку", callback_data="AI_IMG_SKIP")],
+    ])
+
+@_trace_sync
+def _kb_ai_image_after_gen() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Изображение ок", callback_data="AI_IMG_APPROVE"),
+         InlineKeyboardButton("🔁 Ещё вариант", callback_data="AI_IMG_REGEN")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
     ])
 
 # ---------------
@@ -406,27 +410,8 @@ def _parse_time(s: str) -> Optional[str]:
     return None
 
 # ---------------
-# Безопасные действия TG
+# Telegram safe ops
 # ---------------
-@_trace_async
-async def _safe_q_answer(q) -> bool:
-    try:
-        await q.answer()
-        return True
-    except BadRequest as e:
-        if "query is too old" in str(e).lower():
-            return False
-        return False
-    except RetryAfter as e:
-        await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
-        try:
-            await q.answer()
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
-
 @_trace_async
 async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
     try:
@@ -453,9 +438,14 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
             new_sig = (text or "", markup_json)
             if LAST_SIG.get(key) == new_sig:
                 return
+            ts = time.time()
+            last_ts = LAST_EDIT_AT.get(key, 0.0)
+            if ts - last_ts < MIN_EDIT_GAP:
+                await asyncio.sleep(MIN_EDIT_GAP - (ts - last_ts))
         await q.edit_message_text(text=text, reply_markup=reply_markup)
         if msg:
-            LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
+            LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
+            LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
         return
     except RetryAfter as e:
         await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
@@ -463,8 +453,8 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
             await q.edit_message_text(text=text, reply_markup=reply_markup)
             msg = getattr(q, "message", None)
             if msg:
-                markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
-                LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", markup_json)
+                LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
+                LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
             return
         except Exception:
             await _send_new_message_fallback(q, text, reply_markup)
@@ -476,88 +466,55 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
                 msg = getattr(q, "message", None)
                 if msg:
-                    markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
-                    LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), markup_json)
+                    LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
+                    LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
                 return
             except Exception:
                 await _send_new_message_fallback(q, text, reply_markup)
                 return
+        if "query is too old" in s.lower():
+            await _send_new_message_fallback(q, text, reply_markup)
+            return
         await _send_new_message_fallback(q, text, reply_markup)
         return
     except Exception:
         await _send_new_message_fallback(q, text, reply_markup)
         return
 
-# -----------------------------
-# ИИ helpers
-# -----------------------------
-def _gemini_model():
-    if not genai or not GEMINI_API_KEY:
-        return None
+@_trace_async
+async def _safe_q_answer(q) -> bool:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        return genai.GenerativeModel(GEMINI_MODEL)
-    except Exception as e:
-        log.error("Gemini init error: %s", e)
-        return None
-
-async def _ai_generate_text(topic: str) -> Optional[str]:
-    """Генерация текста поста по теме."""
-    model = _gemini_model()
-    if not model:
-        return None
-    prompt = (
-        "Сгенерируй короткий твит на русском или украинском по теме ниже. "
-        "До 260 символов, живой тон, без хэштегов, без эмодзи в начале, по сути.\n\n"
-        f"Тема: {topic}"
-    )
-    try:
-        resp = await asyncio.to_thread(model.generate_content, prompt)
-        text = (resp.text or "").strip()
-        # подстрахуемся от слишком длинного
-        if len(text) > 270:
-            text = text[:260].rstrip() + "…"
-        return text or None
-    except Exception as e:
-        log.error("Gemini text error: %s", e)
-        return None
-
-async def _ai_generate_image_bytes(prompt: str) -> Optional[bytes]:
-    """Опциональная генерация изображения (OpenAI gpt-image-1). Возвращает bytes или None."""
-    if not OPENAI_API_KEY or not OpenAIClient:
-        return None
-    try:
-        client = OpenAIClient(api_key=OPENAI_API_KEY)
-        # Небольшая подача контекста
-        infix = "\nРеалистичный квадратный арт для поста, без текста на изображении."
-        result = await asyncio.to_thread(
-            client.images.generate,
-            model="gpt-image-1",
-            prompt=(prompt or "") + infix,
-            size="1024x1024",
-        )
-        b64 = result.data[0].b64_json
-        return base64.b64decode(b64)
-    except Exception as e:
-        log.error("OpenAI image error: %s", e)
-        return None
+        await q.answer()
+        return True
+    except BadRequest as e:
+        if "query is too old" in str(e).lower():
+            return False
+        return False
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
+        try:
+            await q.answer()
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 # -----------------------------
-# Публичный entry-point для бота
+# Публичный entry-point
 # -----------------------------
 @_trace_async
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Открыть/обновить экран планировщика (общий список)."""
     uid = update.effective_user.id
     kb = await _kb_main(uid)
-    text = "🗓 ПЛАН НА ДЕНЬ\n(общий список: ✍️ мои и 🤖 ИИ)"
+    text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу, добавь новую или запусти 🧠 План ИИ."
     if update.callback_query:
         await edit_or_pass(update.callback_query, text, kb)
     else:
         await update.effective_message.reply_text(text=text, reply_markup=kb)
 
 # --------------------------------------
-# Роутер callback-кнопок (group=0)
+# Callback router (group=0)
 # --------------------------------------
 @_trace_async
 async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -566,33 +523,158 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = (q.data or "").strip()
     await _safe_q_answer(q)
 
-    # Экраны списков
+    # Главный экран
     if data in ("PLAN_OPEN", "PLAN_LIST", "show_day_plan"):
-        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ\n(общий список)", await _kb_main(uid))
+        await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
-    if data == "PLAN_AI_OPEN":
-        await edit_or_pass(q, "🧠 ПЛАН ИИ (только 🤖 посты)", await _kb_ai(uid))
+    # ----- ИИ-план: домашний экран -----
+    if data == "AI_PLAN_OPEN":
+        set_state_for_update(update, {"mode": "ai_home", "uid": uid})
+        await edit_or_pass(q, "🧠 План ИИ\nТы можешь создать ИИ-пост по теме.\nНажми «Создать ИИ-пост».", _kb_ai_home())
         return
 
-    # Создание задач
-    if data in ("PLAN_ADD_EMPTY", "PLAN_ADD_MANUAL"):
-        it = await _insert_item(uid, "", source="manual")
+    # Старт ввода темы
+    if data == "AI_TOPIC":
+        set_state_for_update(update, {"mode": "ai_topic", "uid": uid})
+        await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).\nПосле этого я сгенерирую текст.", _kb_cancel_to_list())
+        return
+
+    # Текст подходит
+    if data == "AI_TXT_APPROVE":
+        st = get_state_for_update(update) or {}
+        ai_text = (st.get("ai_text") or "").strip()
+        if not ai_text:
+            await edit_or_pass(q, "Пока нет текста. Введи тему и сгенерируй снова.", _kb_ai_home())
+            return
+        # После подтверждения текста — предлагаю сгенерировать изображение
+        st["mode"] = "ai_image_choice"
+        set_state_for_update(update, st)
+        await edit_or_pass(q, f"📝 Текст принят.\nСгенерировать изображение для этого поста?", _kb_ai_image_actions())
+        return
+
+    # Генерация изображения
+    if data == "AI_IMG_GEN":
+        st = get_state_for_update(update) or {}
+        if st.get("busy_ai_image"):
+            await edit_or_pass(q, "⚙️ Уже генерирую изображение…", _kb_ai_image_after_gen())
+            return
+        st["busy_ai_image"] = True
+        set_state_for_update(update, st)
+
+        topic = (st.get("ai_topic") or "").strip()
+        text_for_img = (st.get("ai_text") or "").strip()
+        prompt_img = f"Create a square social-media illustration matching this post:\nTopic: {topic}\nPost text: {text_for_img}\nClean, eye-catching, no text overlay."
+        photo_file_id = None
+
+        try:
+            if not _GEMINI_OK:
+                raise RuntimeError("Gemini API key missing.")
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            img_resp = await asyncio.to_thread(model.generate_content, [{"text": prompt_img}], request_options={"timeout": 60})
+            # Берём любую картинку из parts (если модель вернула base64 image)
+            b64 = None
+            for part in getattr(img_resp, "candidates", []) or []:
+                for p in getattr(part, "content", {}).get("parts", []):
+                    # поддержка возможного image_data
+                    if hasattr(p, "inline_data") and getattr(p.inline_data, "mime_type", "").startswith("image/"):
+                        b64 = p.inline_data.data
+                        break
+                if b64:
+                    break
+            if not b64:
+                # fallback: попросим модель вернуть data:image/png;base64,...
+                model2 = genai.GenerativeModel("gemini-1.5-flash")
+                img2 = await asyncio.to_thread(model2.generate_content, [{"text": prompt_img + "\nReturn an image as base64 PNG inline_data."}], request_options={"timeout": 60})
+                for part in getattr(img2, "candidates", []) or []:
+                    for p in getattr(part, "content", {}).get("parts", []):
+                        if hasattr(p, "inline_data") and getattr(p.inline_data, "mime_type", "").startswith("image/"):
+                            b64 = p.inline_data.data
+                            break
+                    if b64:
+                        break
+            if not b64:
+                raise RuntimeError("Модель не вернула изображение.")
+
+            image_bytes = base64.b64decode(b64)
+            bio = io.BytesIO(image_bytes)
+            bio.name = "ai_image.png"
+            msg = await q.message.bot.send_photo(chat_id=q.message.chat_id, photo=InputFile(bio), caption="🖼 Вариант изображения")
+            # Телеграм вернёт file_id в сообщении
+            if msg and msg.photo:
+                photo_file_id = msg.photo[-1].file_id
+            st = get_state_for_update(update) or {}
+            st["busy_ai_image"] = False
+            st["ai_image_file_id"] = photo_file_id
+            set_state_for_update(update, st)
+            await edit_or_pass(q, "Изображение сгенерировано. Подходит?", _kb_ai_image_after_gen())
+            return
+        except Exception as e:
+            st = get_state_for_update(update) or {}
+            st["busy_ai_image"] = False
+            set_state_for_update(update, st)
+            await edit_or_pass(q, f"Не удалось сгенерировать изображение: {e}\nМожешь попробовать ещё раз или пропустить.", _kb_ai_image_actions())
+            return
+
+    # Ещё вариант изображения
+    if data == "AI_IMG_REGEN":
+        st = get_state_for_update(update) or {}
+        st.pop("ai_image_file_id", None)
+        set_state_for_update(update, st)
+        # запустим ту же логику
+        update.callback_query.data = "AI_IMG_GEN"
+        await _cb_plan_router(update, context)
+        return
+
+    # Изображение принято
+    if data == "AI_IMG_APPROVE":
+        st = get_state_for_update(update) or {}
+        st["mode"] = "ai_ready_to_save"
+        set_state_for_update(update, st)
+        await edit_or_pass(q, "Супер! Сохранить в план и задать время?", InlineKeyboardMarkup([
+            [InlineKeyboardButton("💾 Сохранить и выбрать время", callback_data="AI_SAVE_AND_TIME")],
+            [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
+        ]))
+        return
+
+    # Пропуск изображения — сразу к сохранению
+    if data == "AI_IMG_SKIP":
+        st = get_state_for_update(update) or {}
+        st["ai_image_file_id"] = None
+        st["mode"] = "ai_ready_to_save"
+        set_state_for_update(update, st)
+        await edit_or_pass(q, "Ок, без изображения. Сохранить в план и выбрать время?", InlineKeyboardMarkup([
+            [InlineKeyboardButton("💾 Сохранить и выбрать время", callback_data="AI_SAVE_AND_TIME")],
+            [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
+        ]))
+        return
+
+    # Сохранение ИИ-поста как item и запрос времени
+    if data == "AI_SAVE_AND_TIME":
+        st = get_state_for_update(update) or {}
+        ai_text = (st.get("ai_text") or "").strip()
+        if not ai_text:
+            await edit_or_pass(q, "Нет текста. Начнём заново?", _kb_ai_home())
+            return
+        it = await _insert_item(uid, ai_text, None, source="ai")
+        if st.get("ai_image_file_id"):
+            await _update_media(uid, it.item_id, st["ai_image_file_id"], "photo")
+        set_state_for_update(update, {"mode": "edit_time", "item_id": it.item_id, "uid": uid})
+        await edit_or_pass(q, f"💾 Сохранено как задача #{it.item_id}.\n⏰ Введи время в формате HH:MM (по Киеву).", _kb_cancel_to_list())
+        return
+
+    # ----- Обычный план: добавить пустую -----
+    if data == "PLAN_ADD_EMPTY":
+        it = await _insert_item(uid, "", None, source="manual")
         set_state_for_update(update, {"mode": "edit_text", "item_id": it.item_id, "uid": uid})
         await edit_or_pass(q, f"✏️ Введи текст для задачи #{it.item_id}", _kb_cancel_to_list())
         return
 
-    if data == "PLAN_ADD_AI":
-        it = await _insert_item(uid, "", source="ai")
-        set_state_for_update(update, {"mode": "ai_topic", "item_id": it.item_id, "uid": uid})
-        await edit_or_pass(q, f"🧠 Тема для ИИ-задачи #{it.item_id}?\nНапиши 1–2 предложения о чем пост.", _kb_cancel_to_list())
-        return
-
-    # Открыть карточку
+    # Карточка айтема
     if data.startswith("ITEM_MENU:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID"); return
         it = await _get_item(uid, iid)
         if not it:
@@ -600,22 +682,20 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
-    # Удаление
     if data.startswith("DEL_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID"); return
         await _delete_item(uid, iid)
         await q.answer("Удалено.")
         await edit_or_pass(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         return
 
-    # Done toggle
     if data.startswith("TOGGLE_DONE:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID"); return
         it = await _get_item(uid, iid)
         if not it:
@@ -625,11 +705,10 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, f"📝 Задача #{iid}\n{_fmt_item(it)}", _kb_item(it))
         return
 
-    # Редактирование полей
     if data.startswith("EDIT_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID"); return
         set_state_for_update(update, {"mode": "edit_text", "item_id": iid, "uid": uid})
         await edit_or_pass(q, f"✏️ Введи новый текст для задачи #{iid}", _kb_cancel_to_list())
@@ -638,13 +717,12 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("EDIT_TIME:"):
         try:
             iid = int(data.split(":", 1)[1])
-        except Exception:
+        except (ValueError, IndexError):
             await q.answer("Некорректный ID"); return
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": uid})
         await edit_or_pass(q, f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)", _kb_cancel_to_list())
         return
 
-    # Показ медиа
     if data.startswith("SHOW_ITEM:"):
         try:
             iid = int(data.split(":", 1)[1])
@@ -661,78 +739,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
-    # ИИ-кнопки обзора
-    if data.startswith("AI_REGEN:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Некорректный ID"); return
-        st = get_state_for_update(update) or {}
-        topic = st.get("topic")  # тема должна лежать в STATE из ai_topic/ai_review
-        if not topic:
-            # fallback — попробуем взять текущий текст как тему
-            it = await _get_item(uid, iid)
-            topic = (it.text or "Пост") if it else "Пост"
-        text = await _ai_generate_text(topic)
-        if not text:
-            await q.answer("Gemini недоступен или ключ не задан"); return
-        await _update_text(uid, iid, text)
-        set_state_for_update(update, {"mode": "ai_review", "item_id": iid, "uid": uid, "topic": topic})
-        await edit_or_pass(q, f"🤖 Вариант текста для #{iid}:\n\n{text}", _kb_ai_review(iid))
-        return
-
-    if data.startswith("AI_ACCEPT:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Некорректный ID"); return
-        set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": uid})
-        await edit_or_pass(q, f"⏰ Отлично! Введи время для задачи #{iid} (HH:MM, Киев).", _kb_cancel_to_list())
-        return
-
-    if data.startswith("AI_CANCEL:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Ок"); return
-        clear_state_for_update(update)
-        await edit_or_pass(q, "🧠 ПЛАН ИИ", await _kb_ai(uid))
-        return
-
-    if data.startswith("AI_GEN_IMG:"):
-        try:
-            iid = int(data.split(":", 1)[1])
-        except Exception:
-            await q.answer("Некорректный ID"); return
-        it = await _get_item(uid, iid)
-        if not it:
-            await q.answer("Нет такой задачи"); return
-        if not OPENAI_API_KEY or not OpenAIClient:
-            await q.answer("OPENAI_API_KEY не задан"); return
-        # prompt на основе текста
-        img_bytes = await _ai_generate_image_bytes(it.text or "Пост")
-        if not img_bytes:
-            await q.answer("Не удалось сгенерировать изображение"); return
-        bio = io.BytesIO(img_bytes)
-        bio.name = f"ai_{iid}.png"
-        msg = await q.message.bot.send_photo(chat_id=q.message.chat_id, photo=bio, caption=f"🤖 Изображение для #{iid}")
-        try:
-            file_id = msg.photo[-1].file_id
-        except Exception:
-            file_id = None
-        if file_id:
-            await _update_media(uid, iid, file_id, "photo")
-        await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(await _get_item(uid, iid))}", _kb_item(await _get_item(uid, iid)))
-        return
-
 # --------------------------------------
 # Текстовые/медийные сообщения (ввод для режимов)
 # --------------------------------------
 @_trace_async
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming_uid = update.effective_user.id
-    msg = update.message
-    txt = (getattr(msg, "text", None) or "").strip()
+    txt = (getattr(update.message, "text", None) or "").strip()
     st = get_state_for_update(update)
 
     if not st:
@@ -742,71 +755,74 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     iid = int(st.get("item_id", 0))
     owner_uid = int(st.get("uid", incoming_uid))
 
-    if iid == 0:
-        clear_state_for_update(update)
-        await msg.reply_text("Что-то пошло не так. Попробуй ещё раз.")
+    # ===== Ветка ИИ: ввод темы =====
+    if mode == "ai_topic":
+        topic = txt
+        # запускаем генерацию текста
+        await update.message.reply_text("🧠 Генерирую текст…")
+        try:
+            if not _GEMINI_OK:
+                raise RuntimeError("Не задан GEMINI_API_KEY.")
+            sys_prompt = (
+                "You are a social media copywriter. Create a short, engaging post for X/Twitter: "
+                "limit ~230 chars, 1–2 sentences, 1 emoji max, include a subtle hook, no hashtags."
+            )
+            model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=sys_prompt)
+            resp = await asyncio.to_thread(model.generate_content, [topic], request_options={"timeout": 45})
+            text_out = (getattr(resp, "text", None) or "").strip()
+            if not text_out:
+                text_out = "Не удалось получить текст. Попробуй изменить тему."
+            st["mode"] = "ai_text_ready"
+            st["ai_topic"] = topic
+            st["ai_text"] = text_out
+            set_state_for_update(update, st)
+            await update.message.reply_text(f"✍️ Вариант текста:\n\n{text_out}", reply_markup=_kb_ai_text_actions())
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка генерации: {e}", reply_markup=_kb_ai_home())
         return
 
-    # === Ручное редактирование текста ===
-    if mode == "edit_text":
+    # ===== Ветка ИИ: время после сохранения =====
+    if mode == "edit_time" and iid != 0:
+        t = _parse_time(txt)
+        if not t:
+            await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
+            return
+        await _update_time(owner_uid, iid, t)
+        clear_state_for_update(update)
+        await update.message.reply_text(
+            f"✅ Время установлено: {t}\n\nДобавить ещё?",
+            reply_markup=_kb_add_more()
+        )
+        return
+
+    # ===== Обычный режим: ввод/редакт текста =====
+    if mode == "edit_text" and iid != 0:
         final_text = txt
         file_id = None
         mtype = None
-        if msg.photo:
-            file_id = msg.photo[-1].file_id
+
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
             mtype = "photo"
             if not final_text:
-                final_text = (msg.caption or "").strip() or "Фото"
-        elif msg.document:
-            mime = (msg.document.mime_type or "")
+                final_text = (update.message.caption or "").strip() or "Фото"
+        elif update.message.document:
+            mime = (update.message.document.mime_type or "")
             if mime.startswith("image/"):
-                file_id = msg.document.file_id
+                file_id = update.message.document.file_id
                 mtype = "document"
                 if not final_text:
-                    final_text = (msg.caption or "").strip() or "Изображение"
+                    final_text = (update.message.caption or "").strip() or "Изображение"
 
         await _update_text(owner_uid, iid, final_text or "")
         if file_id:
             await _update_media(owner_uid, iid, file_id, mtype)
 
-        # Далее — время
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": owner_uid})
-        await msg.reply_text("✅ Сохранено!\n⏰ Теперь введи время в формате HH:MM (по Киеву)", reply_markup=_kb_cancel_to_list())
-        return
-
-    # === Ввод темы для ИИ ===
-    if mode == "ai_topic":
-        topic = txt or "Пост"
-        text = await _ai_generate_text(topic)
-        if not text:
-            await msg.reply_text("❗️ Gemini недоступен или не задан GEMINI_API_KEY. Можно ввести текст вручную.",
-                                 reply_markup=_kb_cancel_to_list())
-            # Переходим в ручное редактирование
-            set_state_for_update(update, {"mode": "edit_text", "item_id": iid, "uid": owner_uid})
-            return
-        # Сохраняем сгенерированный черновик в текст
-        await _update_text(owner_uid, iid, text)
-        # Переходим в режим обзора ИИ
-        set_state_for_update(update, {"mode": "ai_review", "item_id": iid, "uid": owner_uid, "topic": topic})
-        await msg.reply_text(f"🤖 Черновик для #{iid}:\n\n{text}", reply_markup=_kb_ai_review(iid))
-        return
-
-    # === Экран обзора ИИ (ввод здесь не ожидаем, только кнопки), но на всякий случай разрешим перезаписать текст ===
-    if mode == "ai_review":
-        if txt:
-            await _update_text(owner_uid, iid, txt)
-            await msg.reply_text("✏️ Текст обновлён вручную. Нажми «✅ Подходит» или «⏰ Время».", reply_markup=_kb_ai_review(iid))
-        return
-
-    # === Время ===
-    if mode == "edit_time":
-        t = _parse_time(txt)
-        if not t:
-            await msg.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
-            return
-        await _update_time(owner_uid, iid, t)
-        clear_state_for_update(update)
-        await msg.reply_text(f"✅ Время установлено: {t}\n\nДобавить ещё одну задачу или закончить?", reply_markup=_kb_add_more())
+        await update.message.reply_text(
+            "✅ Сохранено!\n⏰ Теперь введи время в формате HH:MM (по Киеву)",
+            reply_markup=_kb_cancel_to_list()
+        )
         return
 
     # неизвестный режим
@@ -815,20 +831,18 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==== Экспорт для twitter_bot.py ====
 @_trace_async
 async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = None) -> int:
-    """Создаёт новую задачу (ручную) и возвращает item_id. Если передан chat_id и bot, сразу запрашивает время."""
     it = await _insert_item(uid, text or "", source="manual")
     if chat_id is not None and bot is not None:
         set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id, "uid": uid})
         await bot.send_message(
             chat_id=chat_id,
-            text="✅ Текст сохранён!\n⏰ Теперь введи время для публикации в формате HH:MM (по Киеву)",
+            text="✅ Текст сохранён!\n⏰ Теперь введи время (HH:MM, Киев)",
             reply_markup=_kb_cancel_to_list()
         )
     return it.item_id
 
 @_trace_async
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
-    """Спрашивает у пользователя время для последней/созданной записи."""
     items = await _get_items(uid)
     if not items:
         return
@@ -845,11 +859,6 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 # --------------------------------------
 @_trace_sync
 def register_planner_handlers(app: Application) -> None:
-    """
-    Регистрируем РАНЬШЕ основного бота (group=0), чтобы планировщик
-    забирал только свои колбэки. BACK_MAIN_MENU не ловим — это основной бот.
-    Текст/медиа обрабатываем ТОЛЬКО при наличии STATE.
-    """
     log.info("Planner: registering handlers (group=0)")
 
     app.add_handler(
@@ -857,21 +866,22 @@ def register_planner_handlers(app: Application) -> None:
             _cb_plan_router,
             pattern=(
                 r"^(?:"
-                r"show_day_plan$|PLAN_OPEN$|PLAN_AI_OPEN$|"
-                r"PLAN_ADD_EMPTY$|PLAN_ADD_MANUAL$|PLAN_ADD_AI$|"
-                r"ITEM_MENU:\d+$|DEL_ITEM:\d+$|EDIT_TIME:\d+$|EDIT_ITEM:\d+$|"
-                r"TOGGLE_DONE:\d+$|SHOW_ITEM:\d+$|"
-                r"AI_REGEN:\d+$|AI_ACCEPT:\d+$|AI_CANCEL:\d+$|AI_GEN_IMG:\d+$"
-                r")"
+                r"show_day_plan$|PLAN_OPEN$|PLAN_ADD_EMPTY$|"
+                r"ITEM_MENU:\d+$|DEL_ITEM:\d+$|EDIT_TIME:\d+$|EDIT_ITEM:\d+$|TOGGLE_DONE:\d+$|SHOW_ITEM:\d+$|"
+                r"AI_PLAN_OPEN$|AI_TOPIC$|AI_TXT_APPROVE$|AI_TXT_REGEN$|"
+                r"AI_IMG_GEN$|AI_IMG_APPROVE$|AI_IMG_REGEN$|AI_IMG_SKIP$|"
+                r"AI_SAVE_AND_TIME$"
+                r")$"
             )
         ),
         group=0
     )
+
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router), group=0)
     # Фото
     app.add_handler(MessageHandler(filters.PHOTO, _msg_router), group=0)
-    # Документ-изображение (image/*)
+    # Документ-изображение
     try:
         app.add_handler(MessageHandler(filters.Document.IMAGE, _msg_router), group=0)
     except Exception:
