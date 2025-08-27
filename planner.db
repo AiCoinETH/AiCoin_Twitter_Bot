@@ -1,0 +1,10 @@
+CREATE TABLE plan_items (
+    user_id      INTEGER NOT NULL,              -- твой Telegram ID (можно любой, если один пользователь)
+    item_id      INTEGER NOT NULL,              -- локальный ID поста (1, 2, 3, …)
+    text         TEXT NOT NULL,                 -- текст поста
+    when_hhmm    TEXT NOT NULL,                 -- время публикации в формате HH:MM (например "09:00")
+    done         INTEGER DEFAULT 0,             -- 0 = не опубликован, 1 = опубликован
+    media_file_id TEXT,                         -- опционально: file_id медиа из TG
+    media_type    TEXT,                         -- "photo", "video" (опционально)
+    PRIMARY KEY (user_id, item_id)
+);
