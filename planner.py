@@ -7,7 +7,7 @@
   TOGGLE_DONE:<id>, SHOW_ITEM:<id>, BACK_MAIN_MENU (обрабатывает основной бот)
 
 Ветка ИИ-плана:
-  AI_PLAN_OPEN, AI_TOPIC, AI_TXT_APPROVE, AI_TXT_REGEN,
+  AI_PLAN_OPEN, AI_TOPIC, AI_TXT_APPROVE, AI_TXT_REGEN, AI_EDIT_TEXT,
   AI_IMG_GEN, AI_IMG_APPROVE, AI_IMG_REGEN, AI_IMG_SKIP,
   AI_SAVE_AND_TIME, AI_DONE_ADD_MORE, AI_DONE_FINISH
 
@@ -364,6 +364,7 @@ def _kb_ai_home() -> InlineKeyboardMarkup:
 
 @_trace_sync
 def _kb_ai_text_actions() -> InlineKeyboardMarkup:
+    # оставлено для совместимости, но основной поток идёт через предпросмотр
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Текст подходит", callback_data="AI_TXT_APPROVE"),
          InlineKeyboardButton("🔁 Перегенерировать", callback_data="AI_TXT_REGEN")],
@@ -382,6 +383,18 @@ def _kb_ai_image_after_gen() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Изображение ок", callback_data="AI_IMG_APPROVE"),
          InlineKeyboardButton("🔁 Ещё вариант", callback_data="AI_IMG_REGEN")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
+    ])
+
+# >>>>>>>>>> НОВОЕ: клавиатура предпросмотра
+@_trace_sync
+def _kb_ai_preview() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить текст", callback_data="AI_EDIT_TEXT"),
+         InlineKeyboardButton("🔁 Реген текста", callback_data="AI_TXT_REGEN")],
+        [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="AI_IMG_GEN"),
+         InlineKeyboardButton("⏭ Без изображения", callback_data="AI_IMG_SKIP")],
+        [InlineKeyboardButton("💾 Сохранить и выбрать время", callback_data="AI_SAVE_AND_TIME")],
         [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
     ])
 
@@ -540,17 +553,50 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).\nПосле этого я сгенерирую текст.", _kb_cancel_to_list())
         return
 
-    # Текст подходит
+    # >>>>>>>>>> НОВОЕ: подтверждение текста ведёт в предпросмотр
     if data == "AI_TXT_APPROVE":
         st = get_state_for_update(update) or {}
         ai_text = (st.get("ai_text") or "").strip()
         if not ai_text:
             await edit_or_pass(q, "Пока нет текста. Введи тему и сгенерируй снова.", _kb_ai_home())
             return
-        # После подтверждения текста — предлагаю сгенерировать изображение
-        st["mode"] = "ai_image_choice"
+        st["mode"] = "ai_preview"
         set_state_for_update(update, st)
-        await edit_or_pass(q, f"📝 Текст принят.\nСгенерировать изображение для этого поста?", _kb_ai_image_actions())
+        await edit_or_pass(q, f"📝 Предпросмотр:\n\n{ai_text}", _kb_ai_preview())
+        return
+
+    # >>>>>>>>>> НОВОЕ: регенерация текста
+    if data == "AI_TXT_REGEN":
+        st = get_state_for_update(update) or {}
+        topic = (st.get("ai_topic") or "").strip()
+        if not topic:
+            await edit_or_pass(q, "Сначала укажи тему.", _kb_ai_home())
+            return
+        await edit_or_pass(q, "🧠 Генерирую новый вариант текста…", _kb_cancel_to_list())
+        try:
+            if not _GEMINI_OK:
+                raise RuntimeError("Не задан GEMINI_API_KEY.")
+            sys_prompt = (
+                "You are a social media copywriter. Create a short, engaging post for X/Twitter: "
+                "limit ~230 chars, 1–2 sentences, 1 emoji max, include a subtle hook, no hashtags."
+            )
+            model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=sys_prompt)
+            resp = await asyncio.to_thread(model.generate_content, [topic], request_options={"timeout": 45})
+            text_out = (getattr(resp, "text", None) or "").strip() or "Не удалось получить текст. Попробуй ещё раз."
+            st["ai_text"] = text_out
+            st["mode"] = "ai_preview"
+            set_state_for_update(update, st)
+            await edit_or_pass(q, f"✍️ Обновлённый текст:\n\n{text_out}", _kb_ai_preview())
+        except Exception as e:
+            await edit_or_pass(q, f"Ошибка генерации: {e}", _kb_ai_home())
+        return
+
+    # >>>>>>>>>> НОВОЕ: переход к ручной правке текста
+    if data == "AI_EDIT_TEXT":
+        st = get_state_for_update(update) or {}
+        st["mode"] = "ai_edit_text"
+        set_state_for_update(update, st)
+        await edit_or_pass(q, "✏️ Отправь новый текст поста одним сообщением.", _kb_cancel_to_list())
         return
 
     # Генерация изображения
@@ -572,18 +618,15 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise RuntimeError("Gemini API key missing.")
             model = genai.GenerativeModel("gemini-1.5-flash")
             img_resp = await asyncio.to_thread(model.generate_content, [{"text": prompt_img}], request_options={"timeout": 60})
-            # Берём любую картинку из parts (если модель вернула base64 image)
             b64 = None
             for part in getattr(img_resp, "candidates", []) or []:
                 for p in getattr(part, "content", {}).get("parts", []):
-                    # поддержка возможного image_data
                     if hasattr(p, "inline_data") and getattr(p.inline_data, "mime_type", "").startswith("image/"):
                         b64 = p.inline_data.data
                         break
                 if b64:
                     break
             if not b64:
-                # fallback: попросим модель вернуть data:image/png;base64,...
                 model2 = genai.GenerativeModel("gemini-1.5-flash")
                 img2 = await asyncio.to_thread(model2.generate_content, [{"text": prompt_img + "\nReturn an image as base64 PNG inline_data."}], request_options={"timeout": 60})
                 for part in getattr(img2, "candidates", []) or []:
@@ -600,7 +643,6 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio = io.BytesIO(image_bytes)
             bio.name = "ai_image.png"
             msg = await q.message.bot.send_photo(chat_id=q.message.chat_id, photo=InputFile(bio), caption="🖼 Вариант изображения")
-            # Телеграм вернёт file_id в сообщении
             if msg and msg.photo:
                 photo_file_id = msg.photo[-1].file_id
             st = get_state_for_update(update) or {}
@@ -621,7 +663,6 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = get_state_for_update(update) or {}
         st.pop("ai_image_file_id", None)
         set_state_for_update(update, st)
-        # запустим ту же логику
         update.callback_query.data = "AI_IMG_GEN"
         await _cb_plan_router(update, context)
         return
@@ -758,7 +799,6 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== Ветка ИИ: ввод темы =====
     if mode == "ai_topic":
         topic = txt
-        # запускаем генерацию текста
         await update.message.reply_text("🧠 Генерирую текст…")
         try:
             if not _GEMINI_OK:
@@ -772,16 +812,28 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text_out = (getattr(resp, "text", None) or "").strip()
             if not text_out:
                 text_out = "Не удалось получить текст. Попробуй изменить тему."
-            st["mode"] = "ai_text_ready"
+            st["mode"] = "ai_preview"              # <<<< изменить режим
             st["ai_topic"] = topic
             st["ai_text"] = text_out
             set_state_for_update(update, st)
-            await update.message.reply_text(f"✍️ Вариант текста:\n\n{text_out}", reply_markup=_kb_ai_text_actions())
+            await update.message.reply_text(f"✍️ Вариант текста:\n\n{text_out}", reply_markup=_kb_ai_preview())  # <<<< показать предпросмотр
         except Exception as e:
             await update.message.reply_text(f"Ошибка генерации: {e}", reply_markup=_kb_ai_home())
         return
 
-    # ===== Ветка ИИ: время после сохранения =====
+    # >>>>>>>>>> НОВОЕ: ручная правка ИИ-текста
+    if mode == "ai_edit_text":
+        new_text = txt
+        if not new_text:
+            await update.message.reply_text("Текст пуст. Отправь содержимое поста сообщением.", reply_markup=_kb_cancel_to_list())
+            return
+        st["ai_text"] = new_text
+        st["mode"] = "ai_preview"
+        set_state_for_update(update, st)
+        await update.message.reply_text(f"✅ Обновил текст.\n\n{new_text}", reply_markup=_kb_ai_preview())
+        return
+
+    # ===== Ветка ИИ/Обычная: установка времени =====
     if mode == "edit_time" and iid != 0:
         t = _parse_time(txt)
         if not t:
@@ -868,7 +920,7 @@ def register_planner_handlers(app: Application) -> None:
                 r"^(?:"
                 r"show_day_plan$|PLAN_OPEN$|PLAN_ADD_EMPTY$|"
                 r"ITEM_MENU:\d+$|DEL_ITEM:\d+$|EDIT_TIME:\d+$|EDIT_ITEM:\d+$|TOGGLE_DONE:\d+$|SHOW_ITEM:\d+$|"
-                r"AI_PLAN_OPEN$|AI_TOPIC$|AI_TXT_APPROVE$|AI_TXT_REGEN$|"
+                r"AI_PLAN_OPEN$|AI_TOPIC$|AI_TXT_APPROVE$|AI_TXT_REGEN$|AI_EDIT_TEXT$|"
                 r"AI_IMG_GEN$|AI_IMG_APPROVE$|AI_IMG_REGEN$|AI_IMG_SKIP$|"
                 r"AI_SAVE_AND_TIME$"
                 r")$"
