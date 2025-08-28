@@ -11,6 +11,10 @@
 - Жёсткая обработка устаревших callback: немедленный выход и отправка свежего меню (+лог).
 - Подробные логи парсинга времени; после установки времени — подтверждение и повторное чтение айтема.
 - Лог содержимого главного меню (список задач и их времена/статусы).
+
+Доп. фиксы:
+- Кнопка «↩️ Назад» теперь шлёт callback_data="PLAN_OPEN" (раньше было BACK_MAIN_MENU без обработчика).
+- Все UPDATE/DELETE-операции после починки «битой» БД повторно выполняют SQL, чтобы изменения не потерялись.
 """
 
 from __future__ import annotations
@@ -341,15 +345,19 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
 async def _update_text(uid: int, iid: int, text: str) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?"
+    args = (text or "", uid, iid)
     log.info("SQL set text uid=%s iid=%s len=%s", uid, iid, len(text or ""))
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(sql, (text or "", uid, iid))
+            await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
             log.error("DB invalid on update_text: %s", e)
             _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
         else:
             raise
 
@@ -357,15 +365,19 @@ async def _update_text(uid: int, iid: int, text: str) -> None:
 async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?"
+    args = (when_hhmm, uid, iid)
     log.info("SQL set time uid=%s iid=%s when=%s", uid, iid, when_hhmm)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(sql, (when_hhmm, uid, iid))
+            await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
             log.error("DB invalid on update_time: %s", e)
             _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
         else:
             raise
 
@@ -373,15 +385,19 @@ async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
 async def _update_done(uid: int, iid: int, done: bool) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?"
+    args = (1 if done else 0, uid, iid)
     log.info("SQL set done uid=%s iid=%s done=%s", uid, iid, done)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(sql, (1 if done else 0, uid, iid))
+            await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
             log.error("DB invalid on update_done: %s", e)
             _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
         else:
             raise
 
@@ -389,15 +405,19 @@ async def _update_done(uid: int, iid: int, done: bool) -> None:
 async def _update_media(uid: int, iid: int, file_id: Optional[str], mtype: Optional[str]) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET media_file_id=?, media_type=? WHERE user_id=? AND item_id=?"
+    args = (file_id, mtype, uid, iid)
     log.info("SQL set media uid=%s iid=%s mtype=%s file_id=%s", uid, iid, mtype, file_id)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(sql, (file_id, mtype, uid, iid))
+            await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
             log.error("DB invalid on update_media: %s", e)
             _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
         else:
             raise
 
@@ -405,15 +425,19 @@ async def _update_media(uid: int, iid: int, file_id: Optional[str], mtype: Optio
 async def _delete_item(uid: int, iid: int) -> None:
     await _ensure_db()
     sql = "DELETE FROM plan_items WHERE user_id=? AND item_id=?"
+    args = (uid, iid)
     log.info("SQL delete uid=%s iid=%s", uid, iid)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(sql, (uid, iid))
+            await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
             log.error("DB invalid on delete_item: %s", e)
             _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
         else:
             raise
 
@@ -466,7 +490,7 @@ async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     rows += [
         [InlineKeyboardButton("➕ Новая (моя)", callback_data="PLAN_ADD_EMPTY"),
          InlineKeyboardButton("🧠 План ИИ", callback_data="AI_PLAN_OPEN")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="BACK_MAIN_MENU")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="PLAN_OPEN")],  # фикс
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -721,7 +745,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Старт ввода темы
     if data == "AI_TOPIC":
         set_state_for_update(update, {"mode": "ai_topic", "uid": uid})
-        await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).\nПосле этого я сгенерирую текст.", _kb_cancel_to_list())
+        await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).\нПосле этого я сгенерирую текст.", _kb_cancel_to_list())
         return
 
     # Подтверждение текста -> предпросмотр
