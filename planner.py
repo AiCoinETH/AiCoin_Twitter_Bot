@@ -2,6 +2,10 @@
 """
 Планировщик с ИИ-мастером (Gemini) и персистентностью в SQLite для twitter_bot.py.
 
+Главное исправление: защита от ошибки SQLite "file is not a database".
+Если обнаружена повреждённая/левого формата БД, файл автоматически переносится
+в quarantine с суффиксом .bad-YYYYMMDDHHMMSS, затем БД создаётся заново.
+
 Поддерживаемые действия (основные):
   PLAN_OPEN, PLAN_ADD_EMPTY, ITEM_MENU:<id>, DEL_ITEM:<id>, EDIT_TIME:<id>, EDIT_ITEM:<id>,
   TOGGLE_DONE:<id>, SHOW_ITEM:<id>, BACK_MAIN_MENU (обрабатывает основной бот)
@@ -29,6 +33,8 @@ import time
 import base64
 import asyncio
 import logging
+import sqlite3
+import shutil
 import aiosqlite
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -75,7 +81,11 @@ if log.level == logging.NOTSET:
     log.setLevel(logging.INFO)
 
 TZ = ZoneInfo("Europe/Kyiv")
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planner.db")
+
+# Где хранить БД (по умолчанию — рядом с файлом)
+DB_DIR = os.getenv("PLANNER_DB_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DB_DIR, exist_ok=True)
+DB_FILE = os.path.join(DB_DIR, "planner.db")
 
 STATE: Dict[Tuple[int, int], dict] = {}  # (chat_id,user_id)->state   и (chat_id,0)->state (fallback)
 USER_STATE = STATE  # alias
@@ -186,6 +196,28 @@ CREATE TABLE IF NOT EXISTS plan_items (
 );
 """
 
+# --- Вспомогательные функции по инициализации/ремонту БД ---
+
+def _quarantine_bad_db() -> Optional[str]:
+    """Переименовать текущий DB_FILE в *.bad-<ts> и вернуть новый путь (или None, если файла нет)."""
+    if os.path.exists(DB_FILE):
+        ts = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
+        bad_path = f"{DB_FILE}.bad-{ts}"
+        try:
+            os.replace(DB_FILE, bad_path)
+            log.warning("Planner DB quarantined: %s -> %s", DB_FILE, bad_path)
+            return bad_path
+        except Exception as e:
+            log.error("Failed to quarantine DB %s: %s", DB_FILE, e)
+    return None
+
+async def _create_schema() -> None:
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute(CREATE_SQL)
+        await db.commit()
+
 @_trace_async
 async def _migrate_db() -> None:
     try:
@@ -205,35 +237,72 @@ async def _migrate_db() -> None:
 
 @_trace_async
 async def _ensure_db() -> None:
+    """Убедиться, что БД существует и валидна. При ошибке 'file is not a database' — авто-ремонт."""
     global _db_ready
     if _db_ready:
         return
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(CREATE_SQL)
-        await db.commit()
+    log.info("Planner DB path: %s", DB_FILE)
+
+    # Если на месте БД вдруг директория — в карантин
+    if os.path.isdir(DB_FILE):
+        _quarantine_bad_db()
+
+    try:
+        await _create_schema()
+    except Exception as e:
+        msg = str(e).lower()
+        if isinstance(e, sqlite3.DatabaseError) or "file is not a database" in msg:
+            _quarantine_bad_db()
+            await _create_schema()
+        else:
+            raise
     await _migrate_db()
     _db_ready = True
+
+# --- CRUD ---
 
 @_trace_async
 async def _get_items(uid: int) -> List[PlanItem]:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
-                 FROM plan_items WHERE user_id=? ORDER BY COALESCE(when_hhmm,'99:99'), item_id"""
-        cur = await db.execute(sql, (uid,))
-        rows = await cur.fetchall()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
+                     FROM plan_items WHERE user_id=? ORDER BY COALESCE(when_hhmm,'99:99'), item_id"""
+            cur = await db.execute(sql, (uid,))
+            rows = await cur.fetchall()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db()
+            await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(sql, (uid,))
+                rows = await cur.fetchall()
+        else:
+            raise
     return [PlanItem(r["user_id"], r["item_id"], r["text"], r["when_hhmm"], bool(r["done"]),
                      r["media_file_id"], r["media_type"], r["source"]) for r in rows]
 
 @_trace_async
 async def _next_item_id(uid: int) -> int:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        sql = "SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
-        cur = await db.execute(sql, (uid,))
-        row = await cur.fetchone()
-        mx = row[0] if row is not None else 0
+    sql = "SELECT COALESCE(MAX(item_id),0) FROM plan_items WHERE user_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cur = await db.execute(sql, (uid,))
+            row = await cur.fetchone()
+            mx = row[0] if row is not None else 0
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db()
+            await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                cur = await db.execute(sql, (uid,))
+                row = await cur.fetchone()
+                mx = row[0] if row is not None else 0
+        else:
+            raise
     return int(mx) + 1
 
 @_trace_async
@@ -241,62 +310,113 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
     iid = await _next_item_id(uid)
     now = datetime.now(TZ).isoformat()
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        sql = """INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at, source)
-                 VALUES (?,?,?,?,?,?,?,?,?)"""
-        args = (uid, iid, text or "", when_hhmm, 0, None, None, now, source)
-        await db.execute(sql, args)
-        await db.commit()
+    sql = """INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at, source)
+             VALUES (?,?,?,?,?,?,?,?,?)"""
+    args = (uid, iid, text or "", when_hhmm, 0, None, None, now, source)
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, args)
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db()
+            await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(sql, args)
+                await db.commit()
+        else:
+            raise
     return PlanItem(uid, iid, text or "", when_hhmm, False, None, None, source)
 
 @_trace_async
 async def _update_text(uid: int, iid: int, text: str) -> None:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?",
-                         (text or "", uid, iid))
-        await db.commit()
+    sql = "UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, (text or "", uid, iid))
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+        else:
+            raise
 
 @_trace_async
 async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?",
-                         (when_hhmm, uid, iid))
-        await db.commit()
+    sql = "UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, (when_hhmm, uid, iid))
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+        else:
+            raise
 
 @_trace_async
 async def _update_done(uid: int, iid: int, done: bool) -> None:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?",
-                         (1 if done else 0, uid, iid))
-        await db.commit()
+    sql = "UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, (1 if done else 0, uid, iid))
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+        else:
+            raise
 
 @_trace_async
 async def _update_media(uid: int, iid: int, file_id: Optional[str], mtype: Optional[str]) -> None:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE plan_items SET media_file_id=?, media_type=? WHERE user_id=? AND item_id=?",
-                         (file_id, mtype, uid, iid))
-        await db.commit()
+    sql = "UPDATE plan_items SET media_file_id=?, media_type=? WHERE user_id=? AND item_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, (file_id, mtype, uid, iid))
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+        else:
+            raise
 
 @_trace_async
 async def _delete_item(uid: int, iid: int) -> None:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM plan_items WHERE user_id=? AND item_id=?", (uid, iid))
-        await db.commit()
+    sql = "DELETE FROM plan_items WHERE user_id=? AND item_id=?"
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(sql, (uid, iid))
+            await db.commit()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+        else:
+            raise
 
 @_trace_async
 async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     await _ensure_db()
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
-                 FROM plan_items WHERE user_id=? AND item_id=?"""
-        cur = await db.execute(sql, (uid, iid))
-        row = await cur.fetchone()
+    sql = """SELECT user_id, item_id, text, when_hhmm, done, media_file_id, media_type, source
+             FROM plan_items WHERE user_id=? AND item_id=?"""
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, (uid, iid))
+            row = await cur.fetchone()
+    except sqlite3.DatabaseError as e:
+        if "file is not a database" in str(e).lower():
+            _quarantine_bad_db(); await _create_schema()
+            async with aiosqlite.connect(DB_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(sql, (uid, iid))
+                row = await cur.fetchone()
+        else:
+            raise
     if not row:
         return None
     return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]),
@@ -912,6 +1032,7 @@ async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
 @_trace_sync
 def register_planner_handlers(app: Application) -> None:
     log.info("Planner: registering handlers (group=0)")
+    log.info("Planner DB path (again): %s", DB_FILE)
 
     app.add_handler(
         CallbackQueryHandler(
