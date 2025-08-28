@@ -9,3 +9,8 @@ __pycache__/
 .env
 output.log
 *.png
+
+# SQLite / базы данных
+*.db
+*.db-shm
+*.db-wal
