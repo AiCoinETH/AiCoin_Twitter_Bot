@@ -1,33 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Планировщик с ИИ-мастером (Gemini) и персистентностью в SQLite для twitter_bot.py.
+Планировщик с ИИ-мастером (Gemini + Images API) и персистентностью в SQLite.
 
-Главное исправление: защита от ошибки SQLite "file is not a database".
-Если обнаружена повреждённая/левого формата БД, файл автоматически переносится
-в quarantine с суффиксом .bad-YYYYMMDDHHMMSS, затем БД создаётся заново.
+Главное:
+- Защита от "file is not a database": битый файл переезжает в *.bad-<ts>, схема создаётся заново.
+- Тотальное логирование действий, кнопок и SQL.
+- Поддержка генерации текста (Gemini) и изображений (Imagen 3 / Images API).
+- Устойчивые UI-обновления: игнор устаревших callback, безопасные правки сообщений.
 
-Новое в этом варианте:
-- Тотальное логирование: КАЖДАЯ кнопка, КАЖДОЕ сообщение, все CRUD SQL, смены состояний.
-- Жёсткая обработка устаревших callback: немедленный выход и отправка свежего меню (+лог).
-- Подробные логи парсинга времени; после установки времени — подтверждение и повторное чтение айтема.
-- Лог содержимого главного меню (список задач и их времена/статусы).
-
-Доп. фиксы:
-- Кнопка «↩️ Назад» теперь шлёт callback_data="PLAN_OPEN" (раньше было BACK_MAIN_MENU без обработчика).
-- Все UPDATE/DELETE-операции после починки «битой» БД повторно выполняют SQL, чтобы изменения не потерялись.
+ENV:
+  GEMINI_API_KEY или GOOGLE_API_KEY — ключ для генерирования текста/изображений
+  IMAGEN_MODEL (опц.) — имя модели Imagen 3, по умолчанию "imagen-3.0-fast-generate-001"
+  PLANNER_DB_DIR (опц.) — где хранить planner.db (по умолчанию рядом с файлом)
 """
 
 from __future__ import annotations
-import re
-import os
-import io
-import json
-import time
-import base64
-import asyncio
-import logging
-import sqlite3
-import shutil
+import os, re, io, json, time, base64, asyncio, logging, sqlite3, shutil
 import aiosqlite
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -36,16 +24,10 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import BadRequest, RetryAfter
 
-# ===== Gemini =====
+# ===== Gemini presence flag (не обязателен для запуска бота без ИИ) =====
 _GEMINI_OK = False
 try:
     import google.generativeai as genai
@@ -53,8 +35,6 @@ try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         _GEMINI_OK = True
-    else:
-        _GEMINI_OK = False
 except Exception:
     _GEMINI_OK = False
 
@@ -66,14 +46,10 @@ __all__ = [
     "USER_STATE",
 ]
 
-# ------------------
-# Логи / Константы / глобалы
-# ------------------
+# ------------------ Логи / Константы / глобалы ------------------
 log = logging.getLogger("planner")
 if log.level == logging.NOTSET:
     log.setLevel(logging.INFO)
-
-# Глобальный хендлер формата логов (чтобы в GitHub Actions всё читалось)
 if not log.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
@@ -81,17 +57,14 @@ if not log.handlers:
 log.propagate = False
 
 TZ = ZoneInfo("Europe/Kyiv")
-
-# Где хранить БД (по умолчанию — рядом с файлом)
 DB_DIR = os.getenv("PLANNER_DB_DIR") or os.path.dirname(os.path.abspath(__file__))
 os.makedirs(DB_DIR, exist_ok=True)
 DB_FILE = os.path.join(DB_DIR, "planner.db")
 
-STATE: Dict[Tuple[int, int], dict] = {}  # (chat_id,user_id)->state   и (chat_id,0)->state (fallback)
-USER_STATE = STATE  # alias
-
-LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}  # (chat_id, message_id) -> (text, markup_json)
-LAST_EDIT_AT: Dict[Tuple[int, int], float] = {}        # (chat_id, message_id) -> ts
+STATE: Dict[Tuple[int, int], dict] = {}   # (chat_id,user_id)->state   и (chat_id,0)->state
+USER_STATE = STATE
+LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}
+LAST_EDIT_AT: Dict[Tuple[int, int], float] = {}
 MIN_EDIT_GAP = 0.8
 _db_ready = False
 
@@ -119,8 +92,7 @@ def _fmt_arg(v: Any) -> str:
 def _trace_sync(fn):
     @wraps(fn)
     def wrap(*args, **kwargs):
-        log.debug("→ %s(%s%s)", fn.__name__,
-                  ", ".join(_fmt_arg(a) for a in args),
+        log.debug("→ %s(%s%s)", fn.__name__, ", ".join(_fmt_arg(a) for a in args),
                   (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
         res = fn(*args, **kwargs)
         log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
@@ -130,17 +102,14 @@ def _trace_sync(fn):
 def _trace_async(fn):
     @wraps(fn)
     async def wrap(*args, **kwargs):
-        log.debug("→ %s(%s%s)", fn.__name__,
-                  ", ".join(_fmt_arg(a) for a in args),
-                  ((", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else ""))
+        log.debug("→ %s(%s%s)", fn.__name__, ", ".join(_fmt_arg(a) for a in args),
+                  (", " + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in kwargs.items())) if kwargs else "")
         res = await fn(*args, **kwargs)
         log.debug("← %s = %s", fn.__name__, _fmt_arg(res))
         return res
     return wrap
 
-# ------------
-# STATE helpers
-# ------------
+# ------------------ STATE helpers ------------------
 def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     chat_id = update.effective_chat.id if update.effective_chat else 0
     user_id = update.effective_user.id if update.effective_user else 0
@@ -148,9 +117,9 @@ def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int,
 
 def set_state_for_update(update: Update, st: dict) -> None:
     k_personal, k_chat = _state_keys_from_update(update)
-    log.info("STATE set (chat=%s user=%s): %s", k_personal[0], k_personal[1], st)
     STATE[k_personal] = st
     STATE[k_chat] = st
+    log.info("STATE set (chat=%s user=%s): %s", k_personal[0], k_personal[1], st)
 
 def get_state_for_update(update: Update) -> Optional[dict]:
     k_personal, k_chat = _state_keys_from_update(update)
@@ -165,13 +134,11 @@ def clear_state_for_update(update: Update) -> None:
     log.info("STATE cleared for chat=%s user=%s", k_personal[0], k_personal[1])
 
 def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
-    log.info("STATE set by ids (chat=%s user=%s): %s", chat_id, user_id, st)
     STATE[(chat_id, user_id)] = st
     STATE[(chat_id, 0)] = st
+    log.info("STATE set by ids (chat=%s user=%s): %s", chat_id, user_id, st)
 
-# ------------
-# Data model
-# ------------
+# ------------------ Data model ------------------
 @dataclass
 class PlanItem:
     user_id: int
@@ -183,9 +150,7 @@ class PlanItem:
     media_type: Optional[str] = None
     source: str = "manual"  # 'manual' or 'ai'
 
-# ------------
-# SQLite
-# ------------
+# ------------------ SQLite ------------------
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS plan_items (
   user_id       INTEGER NOT NULL,
@@ -202,7 +167,6 @@ CREATE TABLE IF NOT EXISTS plan_items (
 """
 
 def _quarantine_bad_db() -> Optional[str]:
-    """Переименовать текущий DB_FILE в *.bad-<ts> и вернуть новый путь (или None, если файла нет)."""
     if os.path.exists(DB_FILE):
         ts = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
         bad_path = f"{DB_FILE}.bad-{ts}"
@@ -224,7 +188,6 @@ async def _create_schema() -> None:
 
 @_trace_async
 async def _migrate_db() -> None:
-    log.info("DB migrate (ensure optional columns)")
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             for sql in (
@@ -243,15 +206,12 @@ async def _migrate_db() -> None:
 
 @_trace_async
 async def _ensure_db() -> None:
-    """Убедиться, что БД существует и валидна. При ошибке 'file is not a database' — авто-ремонт."""
     global _db_ready
     if _db_ready:
         return
     log.info("Planner DB path: %s", DB_FILE)
-
     if os.path.isdir(DB_FILE):
         _quarantine_bad_db()
-
     try:
         await _create_schema()
     except Exception as e:
@@ -266,8 +226,7 @@ async def _ensure_db() -> None:
     _db_ready = True
     log.info("DB ready")
 
-# --- CRUD ---
-
+# CRUD
 @_trace_async
 async def _get_items(uid: int) -> List[PlanItem]:
     await _ensure_db()
@@ -278,12 +237,9 @@ async def _get_items(uid: int) -> List[PlanItem]:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, (uid,))
             rows = await cur.fetchall()
-            log.info("SQL get_items uid=%s -> %s rows", uid, len(rows))
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on get_items: %s", e)
-            _quarantine_bad_db()
-            await _create_schema()
+            _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 db.row_factory = aiosqlite.Row
                 cur = await db.execute(sql, (uid,))
@@ -302,12 +258,9 @@ async def _next_item_id(uid: int) -> int:
             cur = await db.execute(sql, (uid,))
             row = await cur.fetchone()
             mx = row[0] if row is not None else 0
-            log.info("SQL next_item_id uid=%s -> max=%s", uid, mx)
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on next_item_id: %s", e)
-            _quarantine_bad_db()
-            await _create_schema()
+            _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 cur = await db.execute(sql, (uid,))
                 row = await cur.fetchone()
@@ -324,16 +277,13 @@ async def _insert_item(uid: int, text: str = "", when_hhmm: Optional[str] = None
     sql = """INSERT INTO plan_items(user_id, item_id, text, when_hhmm, done, media_file_id, media_type, created_at, source)
              VALUES (?,?,?,?,?,?,?,?,?)"""
     args = (uid, iid, text or "", when_hhmm, 0, None, None, now, source)
-    log.info("SQL insert item uid=%s iid=%s when=%s source=%s text_preview=%r", uid, iid, when_hhmm, source, (text or "")[:80])
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on insert_item: %s", e)
-            _quarantine_bad_db()
-            await _create_schema()
+            _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
                 await db.commit()
@@ -346,14 +296,12 @@ async def _update_text(uid: int, iid: int, text: str) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET text=? WHERE user_id=? AND item_id=?"
     args = (text or "", uid, iid)
-    log.info("SQL set text uid=%s iid=%s len=%s", uid, iid, len(text or ""))
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on update_text: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
@@ -366,14 +314,12 @@ async def _update_time(uid: int, iid: int, when_hhmm: Optional[str]) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET when_hhmm=? WHERE user_id=? AND item_id=?"
     args = (when_hhmm, uid, iid)
-    log.info("SQL set time uid=%s iid=%s when=%s", uid, iid, when_hhmm)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on update_time: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
@@ -386,14 +332,12 @@ async def _update_done(uid: int, iid: int, done: bool) -> None:
     await _ensure_db()
     sql = "UPDATE plan_items SET done=? WHERE user_id=? AND item_id=?"
     args = (1 if done else 0, uid, iid)
-    log.info("SQL set done uid=%s iid=%s done=%s", uid, iid, done)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on update_done: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
@@ -406,14 +350,12 @@ async def _update_media(uid: int, iid: int, file_id: Optional[str], mtype: Optio
     await _ensure_db()
     sql = "UPDATE plan_items SET media_file_id=?, media_type=? WHERE user_id=? AND item_id=?"
     args = (file_id, mtype, uid, iid)
-    log.info("SQL set media uid=%s iid=%s mtype=%s file_id=%s", uid, iid, mtype, file_id)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on update_media: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
@@ -426,14 +368,12 @@ async def _delete_item(uid: int, iid: int) -> None:
     await _ensure_db()
     sql = "DELETE FROM plan_items WHERE user_id=? AND item_id=?"
     args = (uid, iid)
-    log.info("SQL delete uid=%s iid=%s", uid, iid)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(sql, args)
             await db.commit()
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on delete_item: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(sql, args)
@@ -451,10 +391,8 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, (uid, iid))
             row = await cur.fetchone()
-            log.info("SQL get_item uid=%s iid=%s -> %s", uid, iid, "HIT" if row else "MISS")
     except sqlite3.DatabaseError as e:
         if "file is not a database" in str(e).lower():
-            log.error("DB invalid on get_item: %s", e)
             _quarantine_bad_db(); await _create_schema()
             async with aiosqlite.connect(DB_FILE) as db:
                 db.row_factory = aiosqlite.Row
@@ -467,9 +405,7 @@ async def _get_item(uid: int, iid: int) -> Optional[PlanItem]:
     return PlanItem(row["user_id"], row["item_id"], row["text"], row["when_hhmm"], bool(row["done"]),
                     row["media_file_id"], row["media_type"], row["source"])
 
-# -------------------------
-# Рендеринг и клавиатуры UI
-# -------------------------
+# ------------------ UI helpers ------------------
 @_trace_sync
 def _fmt_item(i: PlanItem) -> str:
     t = f"[{i.when_hhmm}]" if i.when_hhmm else "[—]"
@@ -482,15 +418,13 @@ def _fmt_item(i: PlanItem) -> str:
 @_trace_async
 async def _kb_main(uid: int) -> InlineKeyboardMarkup:
     items = await _get_items(uid)
-    snapshot = [f"#{it.item_id}[{it.when_hhmm or '--'}]{'✓' if it.done else ''}" for it in items]
-    log.info("KB_MAIN uid=%s items=%s", uid, snapshot)
     rows: List[List[InlineKeyboardButton]] = []
     for it in items:
         rows.append([InlineKeyboardButton(_fmt_item(it), callback_data=f"ITEM_MENU:{it.item_id}")])
     rows += [
         [InlineKeyboardButton("➕ Новая (моя)", callback_data="PLAN_ADD_EMPTY"),
          InlineKeyboardButton("🧠 План ИИ", callback_data="AI_PLAN_OPEN")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="PLAN_OPEN")],  # фикс
+        [InlineKeyboardButton("↩️ Назад", callback_data="PLAN_OPEN")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -563,41 +497,30 @@ def _kb_ai_preview() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Отмена", callback_data="AI_PLAN_OPEN")],
     ])
 
-# ---------------
-# Парсеры/хелперы
-# ---------------
+# --------------- Парсер времени ---------------
 _TIME_RE_COLON = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
-
 @_trace_sync
 def _parse_time(s: str) -> Optional[str]:
     s0 = s
-    log.info("TIME parse try: %r", s0)
     s = (s or "").strip().replace(" ", "")
     m = _TIME_RE_COLON.match(s)
     if m:
         hh, mm = m.groups()
-        t = f"{int(hh):02d}:{int(mm):02d}"
-        log.info("TIME parsed HH:MM -> %s", t)
-        return t
+        return f"{int(hh):02d}:{int(mm):02d}"
     if s.isdigit() and len(s) in (3, 4):
         hh, mm = (s[0], s[1:]) if len(s) == 3 else (s[:2], s[2:])
         try:
             hh_i, mm_i = int(hh), int(mm)
             if 0 <= hh_i <= 23 and 0 <= mm_i <= 59:
-                t = f"{hh_i:02d}:{mm_i:02d}"
-                log.info("TIME parsed compact -> %s", t)
-                return t
+                return f"{hh_i:02d}:{mm_i:02d}"
         except ValueError:
             pass
     log.warning("TIME parse failed: %r", s0)
     return None
 
-# ---------------
-# Telegram safe ops
-# ---------------
+# --------------- Telegram safe ops ---------------
 @_trace_async
 async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
-    log.info("UI fallback send_message (new) text_preview=%r", (text or "")[:100])
     try:
         chat_id = q.message.chat_id if q and q.message else None
         if chat_id is None:
@@ -621,20 +544,17 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
             markup_json = json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True)
             new_sig = (text or "", markup_json)
             if LAST_SIG.get(key) == new_sig:
-                log.info("UI skip edit: not modified (sig equal)")
                 return
             ts = time.time()
             last_ts = LAST_EDIT_AT.get(key, 0.0)
             if ts - last_ts < MIN_EDIT_GAP:
                 await asyncio.sleep(MIN_EDIT_GAP - (ts - last_ts))
-        log.info("UI edit_message_text text_preview=%r", (text or "")[:100])
         await q.edit_message_text(text=text, reply_markup=reply_markup)
         if msg:
             LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
             LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
         return
     except RetryAfter as e:
-        log.warning("UI edit retry_after=%s", getattr(e, "retry_after", None))
         await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
         try:
             await q.edit_message_text(text=text, reply_markup=reply_markup)
@@ -644,12 +564,10 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
             return
         except Exception as ee:
-            log.error("UI edit after retry failed: %s", ee)
             await _send_new_message_fallback(q, text, reply_markup)
             return
     except BadRequest as e:
         s = str(e)
-        log.warning("UI edit BadRequest: %s", s)
         if "Message is not modified" in s:
             try:
                 await q.edit_message_reply_markup(reply_markup=reply_markup)
@@ -658,18 +576,15 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                     LAST_SIG[(msg.chat_id, msg.message_id)] = ((msg.text or ""), json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
                     LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
                 return
-            except Exception as ee:
-                log.error("UI edit only markup failed: %s", ee)
+            except Exception:
                 await _send_new_message_fallback(q, text, reply_markup)
                 return
         if "query is too old" in s.lower():
-            log.warning("UI edit: query too old -> fallback new message")
-            await _send_new_message_fallback(q, text, reply_markup)
+            await _send_new_message_fallback(q, "⏱ Кнопка устарела. Вот актуальное меню:", await _kb_main(q.from_user.id))
             return
         await _send_new_message_fallback(q, text, reply_markup)
         return
-    except Exception as e:
-        log.error("UI edit error: %s", e)
+    except Exception:
         await _send_new_message_fallback(q, text, reply_markup)
         return
 
@@ -677,58 +592,42 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
 async def _safe_q_answer(q) -> bool:
     try:
         await q.answer()
-        log.info("CALLBACK answered OK")
         return True
-    except BadRequest as e:
-        s = str(e).lower()
-        log.warning("CALLBACK answer BadRequest: %s", s)
-        if "query is too old" in s:
-            return False
+    except BadRequest:
         return False
     except RetryAfter as e:
-        log.warning("CALLBACK answer retry_after=%s", getattr(e, "retry_after", None))
         await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
         try:
             await q.answer()
             return True
-        except Exception as ee:
-            log.error("CALLBACK answer after retry failed: %s", ee)
+        except Exception:
             return False
-    except Exception as e:
-        log.error("CALLBACK answer error: %s", e)
+    except Exception:
         return False
 
-# -----------------------------
-# Публичный entry-point
-# -----------------------------
+# ----------------------------- Публичные entry-points -----------------------------
 @_trace_async
 async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     kb = await _kb_main(uid)
     text = "🗓 ПЛАН НА ДЕНЬ\nВыбирай задачу, добавь новую или запусти 🧠 План ИИ."
-    log.info("OPEN_PLANNER uid=%s via=%s", uid, "callback" if update.callback_query else "message")
     if update.callback_query:
         await edit_or_pass(update.callback_query, text, kb)
     else:
         await update.effective_message.reply_text(text=text, reply_markup=kb)
 
-# --------------------------------------
-# Callback router (group=0)
-# --------------------------------------
+# -------------------------------------- Callback router --------------------------------------
 @_trace_async
 async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = update.effective_user.id
     data = (q.data or "").strip()
-    chat_id = getattr(getattr(q, "message", None), "chat_id", None)
-    log.info("CB CLICK uid=%s chat=%s data=%r state=%s", uid, chat_id, data, get_state_for_update(update))
     ok = await _safe_q_answer(q)
     if not ok:
-        log.warning("Callback TOO OLD -> send fresh menu & return")
         try:
             await q.message.reply_text("⏱ Кнопка устарела. Вот актуальное меню:", reply_markup=await _kb_main(uid))
-        except Exception as e:
-            log.warning("Failed to send fresh menu: %s", e)
+        except Exception:
+            pass
         return
 
     # Главный экран
@@ -739,13 +638,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ----- ИИ-план: домашний экран -----
     if data == "AI_PLAN_OPEN":
         set_state_for_update(update, {"mode": "ai_home", "uid": uid})
-        await edit_or_pass(q, "🧠 План ИИ\nТы можешь создать ИИ-пост по теме.\nНажми «Создать ИИ-пост».", _kb_ai_home())
+        await edit_or_pass(q, "🧠 План ИИ\nНажми «Создать ИИ-пост», чтобы получить текст, затем картинку.", _kb_ai_home())
         return
 
     # Старт ввода темы
     if data == "AI_TOPIC":
         set_state_for_update(update, {"mode": "ai_topic", "uid": uid})
-        await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).\нПосле этого я сгенерирую текст.", _kb_cancel_to_list())
+        await edit_or_pass(q, "🧠 Введи ТЕМУ поста (1–2 предложения).", _kb_cancel_to_list())
         return
 
     # Подтверждение текста -> предпросмотр
@@ -764,14 +663,13 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "AI_TXT_REGEN":
         st = get_state_for_update(update) or {}
         topic = (st.get("ai_topic") or "").strip()
-        log.info("AI_TXT_REGEN topic=%r", topic)
         if not topic:
             await edit_or_pass(q, "Сначала укажи тему.", _kb_ai_home())
             return
         await edit_or_pass(q, "🧠 Генерирую новый вариант текста…", _kb_cancel_to_list())
         try:
             if not _GEMINI_OK:
-                raise RuntimeError("Не задан GEMINI_API_KEY.")
+                raise RuntimeError("Не задан GEMINI_API_KEY/GOOGLE_API_KEY.")
             sys_prompt = (
                 "You are a social media copywriter. Create a short, engaging post for X/Twitter: "
                 "limit ~230 chars, 1–2 sentences, 1 emoji max, include a subtle hook, no hashtags."
@@ -784,7 +682,6 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_state_for_update(update, st)
             await edit_or_pass(q, f"✍️ Обновлённый текст:\n\n{text_out}", _kb_ai_preview())
         except Exception as e:
-            log.error("AI_TXT_REGEN error: %s", e)
             await edit_or_pass(q, f"Ошибка генерации: {e}", _kb_ai_home())
         return
 
@@ -796,7 +693,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, "✏️ Отправь новый текст поста одним сообщением.", _kb_cancel_to_list())
         return
 
-    # Генерация изображения
+    # ---- Генерация изображения (Imagen 3 / Images API) ----
     if data == "AI_IMG_GEN":
         st = get_state_for_update(update) or {}
         if st.get("busy_ai_image"):
@@ -807,53 +704,82 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         topic = (st.get("ai_topic") or "").strip()
         text_for_img = (st.get("ai_text") or "").strip()
-        prompt_img = f"Create a square social-media illustration matching this post:\nTopic: {topic}\nPost text: {text_for_img}\nClean, eye-catching, no text overlay."
+        prompt_img = (
+            "Generate a clean, square social-media illustration without any text overlay. "
+            "Style: modern, high-contrast, eye-catching, safe for work. "
+            f"Theme: {topic}. Post text for context: {text_for_img}"
+        )
+
         photo_file_id = None
-
         try:
-            if not _GEMINI_OK:
-                raise RuntimeError("Gemini API key missing.")
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            img_resp = await asyncio.to_thread(model.generate_content, [{"text": prompt_img}], request_options={"timeout": 60})
-            b64 = None
-            for part in getattr(img_resp, "candidates", []) or []:
-                for p in getattr(part, "content", {}).get("parts", []):
-                    if hasattr(p, "inline_data") and getattr(p.inline_data, "mime_type", "").startswith("image/"):
-                        b64 = p.inline_data.data
-                        break
-                if b64:
-                    break
-            if not b64:
-                model2 = genai.GenerativeModel("gemini-1.5-flash")
-                img2 = await asyncio.to_thread(model2.generate_content, [{"text": prompt_img + "\nReturn an image as base64 PNG inline_data."}], request_options={"timeout": 60})
-                for part in getattr(img2, "candidates", []) or []:
-                    for p in getattr(part, "content", {}).get("parts", []):
-                        if hasattr(p, "inline_data") and getattr(p.inline_data, "mime_type", "").startswith("image/"):
-                            b64 = p.inline_data.data
-                            break
-                    if b64:
-                        break
-            if not b64:
-                raise RuntimeError("Модель не вернула изображение.")
+            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                raise RuntimeError("GOOGLE_API_KEY/GEMINI_API_KEY не задан для Images API.")
+            genai.configure(api_key=api_key)
 
-            image_bytes = base64.b64decode(b64)
-            bio = io.BytesIO(image_bytes)
-            bio.name = "ai_image.png"
-            msg = await q.message.bot.send_photo(chat_id=q.message.chat_id, photo=InputFile(bio), caption="🖼 Вариант изображения")
+            model_name = os.getenv("IMAGEN_MODEL", "imagen-3.0-fast-generate-001")
+
+            # Попытка №1: современный namespace genai.images (SDK >= 0.6)
+            img_resp = await asyncio.to_thread(
+                genai.images.generate,
+                prompt=prompt_img,
+                model=model_name,
+                # size="1024x1024",
+            )
+
+            b64_png = None
+            if img_resp is not None:
+                gi = getattr(img_resp, "generated_images", None)
+                if gi:
+                    g0 = gi[0]
+                    raw = getattr(g0, "image", None)
+                    b64_png = getattr(raw, "data", raw)
+                if not b64_png:
+                    single = getattr(img_resp, "image", None)
+                    if single and getattr(single, "data", None):
+                        b64_png = single.data
+
+            # Fallback: через GenerativeModel.generate_images
+            if not b64_png:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    img2 = await asyncio.to_thread(model.generate_images, prompt_img)
+                    if img2 and getattr(img2, "generated_images", None):
+                        raw = img2.generated_images[0].image
+                        b64_png = getattr(raw, "data", raw)
+                except Exception:
+                    pass
+
+            if not b64_png:
+                raise RuntimeError("Images API не вернул base64-изображение.")
+
+            image_bytes = base64.b64decode(b64_png)
+            bio = io.BytesIO(image_bytes); bio.name = "ai_image.png"
+            msg = await q.message.bot.send_photo(
+                chat_id=q.message.chat_id,
+                photo=InputFile(bio),
+                caption="🖼 Вариант изображения"
+            )
             if msg and msg.photo:
                 photo_file_id = msg.photo[-1].file_id
+
             st = get_state_for_update(update) or {}
             st["busy_ai_image"] = False
             st["ai_image_file_id"] = photo_file_id
             set_state_for_update(update, st)
             await edit_or_pass(q, "Изображение сгенерировано. Подходит?", _kb_ai_image_after_gen())
             return
+
         except Exception as e:
-            log.error("AI_IMG_GEN error: %s", e)
+            log.error("AI_IMG_GEN (Images API) error: %s", e)
             st = get_state_for_update(update) or {}
             st["busy_ai_image"] = False
             set_state_for_update(update, st)
-            await edit_or_pass(q, f"Не удалось сгенерировать изображение: {e}\nМожешь попробовать ещё раз или пропустить.", _kb_ai_image_actions())
+            await edit_or_pass(
+                q,
+                f"Не удалось сгенерировать изображение: {e}\nМожешь попробовать ещё раз или пропустить.",
+                _kb_ai_image_actions()
+            )
             return
 
     # Ещё вариант изображения
@@ -892,7 +818,6 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "AI_SAVE_AND_TIME":
         st = get_state_for_update(update) or {}
         ai_text = (st.get("ai_text") or "").strip()
-        log.info("AI_SAVE_AND_TIME ai_text_len=%s", len(ai_text))
         if not ai_text:
             await edit_or_pass(q, "Нет текста. Начнём заново?", _kb_ai_home())
             return
@@ -979,56 +904,43 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_pass(q, f"📝 Задача #{it.item_id}\n{_fmt_item(it)}", _kb_item(it))
         return
 
-# --------------------------------------
-# Текстовые/медийные сообщения (ввод для режимов)
-# --------------------------------------
+# -------------------------------------- Сообщения --------------------------------------
 @_trace_async
 async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming_uid = update.effective_user.id
     txt = (getattr(update.message, "text", None) or "").strip()
     st = get_state_for_update(update)
-    chat_id = getattr(update.effective_chat, "id", None)
-    log.info("MSG uid=%s chat=%s mode=%s txt=%r state=%s", incoming_uid, chat_id, st.get("mode") if st else None, txt, st)
-
     if not st:
-        log.info("MSG without state -> ignore")
         return
 
     mode = st.get("mode")
     iid = int(st.get("item_id", 0))
     owner_uid = int(st.get("uid", incoming_uid))
 
-    # ===== Ветка ИИ: ввод темы =====
+    # ИИ: ввод темы
     if mode == "ai_topic":
         topic = txt
-        log.info("AI_TOPIC txt_len=%s", len(topic or ""))
         await update.message.reply_text("🧠 Генерирую текст…")
         try:
             if not _GEMINI_OK:
-                raise RuntimeError("Не задан GEMINI_API_KEY.")
+                raise RuntimeError("Не задан GEMINI_API_KEY/GOOGLE_API_KEY.")
             sys_prompt = (
                 "You are a social media copywriter. Create a short, engaging post for X/Twitter: "
                 "limit ~230 chars, 1–2 sentences, 1 emoji max, include a subtle hook, no hashtags."
             )
             model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=sys_prompt)
             resp = await asyncio.to_thread(model.generate_content, [topic], request_options={"timeout": 45})
-            text_out = (getattr(resp, "text", None) or "").strip()
-            if not text_out:
-                text_out = "Не удалось получить текст. Попробуй изменить тему."
-            st["mode"] = "ai_preview"
-            st["ai_topic"] = topic
-            st["ai_text"] = text_out
+            text_out = (getattr(resp, "text", None) or "").strip() or "Не удалось получить текст. Попробуй изменить тему."
+            st["mode"] = "ai_preview"; st["ai_topic"] = topic; st["ai_text"] = text_out
             set_state_for_update(update, st)
             await update.message.reply_text(f"✍️ Вариант текста:\n\n{text_out}", reply_markup=_kb_ai_preview())
         except Exception as e:
-            log.error("AI_TOPIC gen error: %s", e)
             await update.message.reply_text(f"Ошибка генерации: {e}", reply_markup=_kb_ai_home())
         return
 
     # Ручная правка ИИ-текста
     if mode == "ai_edit_text":
         new_text = txt
-        log.info("AI_EDIT_TEXT new_len=%s", len(new_text or ""))
         if not new_text:
             await update.message.reply_text("Текст пуст. Отправь содержимое поста сообщением.", reply_markup=_kb_cancel_to_list())
             return
@@ -1038,30 +950,22 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Обновил текст.\n\n{new_text}", reply_markup=_kb_ai_preview())
         return
 
-    # ===== Установка времени =====
+    # Установка времени
     if mode == "edit_time" and iid != 0:
         t = _parse_time(txt)
         if not t:
             await update.message.reply_text("⏰ Формат HH:MM. Можно также 930 или 0930. Попробуй ещё раз.")
             return
-        log.info("TIME set for uid=%s iid=%s -> %s", owner_uid, iid, t)
         await _update_time(owner_uid, iid, t)
-        # Повторно читаем айтем для проверки
-        it_check = await _get_item(owner_uid, iid)
-        log.info("TIME verify after set: item=%s", it_check)
         clear_state_for_update(update)
-        await update.message.reply_text(
-            f"✅ Время установлено: {t}\n\nДобавить ещё?",
-            reply_markup=_kb_add_more()
-        )
+        await update.message.reply_text(f"✅ Время установлено: {t}\n\nДобавить ещё?", reply_markup=_kb_add_more())
         return
 
-    # ===== Обычный режим: ввод/редакт текста =====
+    # Ввод/редакт текста обычной задачи
     if mode == "edit_text" and iid != 0:
         final_text = txt
         file_id = None
         mtype = None
-
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             mtype = "photo"
@@ -1075,59 +979,39 @@ async def _msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not final_text:
                     final_text = (update.message.caption or "").strip() or "Изображение"
 
-        log.info("EDIT_TEXT save uid=%s iid=%s len=%s media=%s/%s", owner_uid, iid, len(final_text or ""), mtype, file_id)
         await _update_text(owner_uid, iid, final_text or "")
         if file_id:
             await _update_media(owner_uid, iid, file_id, mtype)
 
         set_state_for_update(update, {"mode": "edit_time", "item_id": iid, "uid": owner_uid})
-        await update.message.reply_text(
-            "✅ Сохранено!\n⏰ Теперь введи время в формате HH:MM (по Киеву)",
-            reply_markup=_kb_cancel_to_list()
-        )
+        await update.message.reply_text("✅ Сохранено!\n⏰ Теперь введи время в формате HH:MM (по Киеву)", reply_markup=_kb_cancel_to_list())
         return
 
-    # неизвестный режим
-    log.warning("MSG unknown mode=%r -> clear state", mode)
     clear_state_for_update(update)
 
 # ==== Экспорт для twitter_bot.py ====
 @_trace_async
 async def planner_add_from_text(uid: int, text: str, chat_id: int = None, bot = None) -> int:
     it = await _insert_item(uid, text or "", source="manual")
-    log.info("EXPORT add_from_text uid=%s -> iid=%s", uid, it.item_id)
     if chat_id is not None and bot is not None:
         set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": it.item_id, "uid": uid})
-        await bot.send_message(
-            chat_id=chat_id,
-            text="✅ Текст сохранён!\n⏰ Теперь введи время (HH:MM, Киев)",
-            reply_markup=_kb_cancel_to_list()
-        )
+        await bot.send_message(chat_id=chat_id, text="✅ Текст сохранён!\n⏰ Теперь введи время (HH:MM, Киев)", reply_markup=_kb_cancel_to_list())
     return it.item_id
 
 @_trace_async
 async def planner_prompt_time(uid: int, chat_id: int, bot) -> None:
     items = await _get_items(uid)
     if not items:
-        log.info("EXPORT prompt_time: no items for uid=%s", uid)
         return
     iid = items[-1].item_id
-    log.info("EXPORT prompt_time uid=%s last_iid=%s", uid, iid)
     set_state_for_ids(chat_id, uid, {"mode": "edit_time", "item_id": iid, "uid": uid})
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)",
-        reply_markup=_kb_cancel_to_list()
-    )
+    await bot.send_message(chat_id=chat_id, text=f"⏰ Введи время для задачи #{iid} в формате HH:MM (по Киеву)", reply_markup=_kb_cancel_to_list())
 
-# --------------------------------------
-# Регистрация хендлеров в PTB (group=0)
-# --------------------------------------
+# -------------------------------------- Регистрация хендлеров --------------------------------------
 @_trace_sync
 def register_planner_handlers(app: Application) -> None:
     log.info("Planner: registering handlers (group=0)")
-    log.info("Planner DB path (again): %s", DB_FILE)
-
+    log.info("Planner DB path: %s", DB_FILE)
     app.add_handler(
         CallbackQueryHandler(
             _cb_plan_router,
@@ -1143,15 +1027,10 @@ def register_planner_handlers(app: Application) -> None:
         ),
         group=0
     )
-
-    # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _msg_router), group=0)
-    # Фото
     app.add_handler(MessageHandler(filters.PHOTO, _msg_router), group=0)
-    # Документ-изображение
     try:
         app.add_handler(MessageHandler(filters.Document.IMAGE, _msg_router), group=0)
     except Exception as e:
         log.warning("register filters.Document.IMAGE failed: %s", e)
-
     log.info("Planner: handlers registered")
