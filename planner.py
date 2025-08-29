@@ -4,16 +4,19 @@
 
 Главное:
 - ЕДИНОЕ меню в чате (без спама): _send_or_update_menu с якорем сообщения.
-- Нет общего состояния (chat_id, 0) -> никакой путаницы с чужими апдейтами.
+- Только персональное состояние (chat_id,user_id) — никакой путаницы.
 - Защита от "file is not a database": битый файл уходит в *.bad-<ts>, схема создаётся заново.
-- Тотальное логирование действий, кнопок и SQL.
+- Логирование действий, кнопок и SQL.
 - Генерация текста (Gemini) и изображений (Imagen 3 / Images API).
-- Устойчивые UI-обновления: игнор устаревших callback, безопасные правки сообщений.
+- Устойчивые UI-обновления и игнор устаревших callback.
 
 ENV:
   GEMINI_API_KEY или GOOGLE_API_KEY — ключ для генерации текста/изображений
-  IMAGEN_MODEL (опц.) — имя модели Imagen 3, по умолчанию "imagen-3.0-fast-generate-001"
+  IMAGEN_MODEL (опц.) — "imagen-3.0-fast-generate-001" (по умолчанию)
   PLANNER_DB_DIR (опц.) — где хранить planner.db (по умолчанию рядом с файлом)
+
+pip:
+  pip install google-generativeai>=0.6 aiosqlite
 """
 
 from __future__ import annotations
@@ -535,14 +538,12 @@ async def _send_or_update_menu(chat_id: int, bot, text: str, reply_markup: Inlin
             try:
                 await bot.edit_message_text(chat_id=chat_id, message_id=anchor, text=text, reply_markup=reply_markup)
                 return
-            except Exception as _:
+            except Exception:
                 pass
         except BadRequest as e:
-            # message to edit not found / can't be edited -> пошлём новое и обновим якорь
             log.info("edit anchor failed, will send new: %s", e)
         except Exception as e:
             log.info("edit anchor err, will send new: %s", e)
-    # send new & pin anchor
     msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     MENU_ANCHOR[chat_id] = msg.message_id
 
@@ -553,7 +554,6 @@ async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardM
         chat_id = q.message.chat_id if q and q.message else None
         if chat_id is None:
             return
-        # Вместо простого sendMessage — идемпотентное меню
         await _send_or_update_menu(chat_id, q.message.bot, text, reply_markup)
     except Exception as e:
         log.error("fallback send error: %s", e)
@@ -603,7 +603,6 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 await _send_new_message_fallback(q, text, reply_markup)
                 return
         if "query is too old" in s.lower():
-            # Обновляем единственное меню, без лишних сообщений
             await _send_new_message_fallback(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(q.from_user.id))
             return
         await _send_new_message_fallback(q, text, reply_markup)
@@ -638,7 +637,6 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await edit_or_pass(update.callback_query, text, kb)
     else:
-        # ИДЕМПОТЕНТНО: одно меню на чат
         await _send_or_update_menu(update.effective_chat.id, update.effective_message.bot, text, kb)
 
 # -------------------------------------- Callback router --------------------------------------
