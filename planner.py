@@ -3,13 +3,15 @@
 Планировщик с ИИ-мастером (Gemini + Images API) и персистентностью в SQLite.
 
 Главное:
-- Защита от "file is not a database": битый файл переезжает в *.bad-<ts>, схема создаётся заново.
+- ЕДИНОЕ меню в чате (без спама): _send_or_update_menu с якорем сообщения.
+- Нет общего состояния (chat_id, 0) -> никакой путаницы с чужими апдейтами.
+- Защита от "file is not a database": битый файл уходит в *.bad-<ts>, схема создаётся заново.
 - Тотальное логирование действий, кнопок и SQL.
-- Поддержка генерации текста (Gemini) и изображений (Imagen 3 / Images API).
+- Генерация текста (Gemini) и изображений (Imagen 3 / Images API).
 - Устойчивые UI-обновления: игнор устаревших callback, безопасные правки сообщений.
 
 ENV:
-  GEMINI_API_KEY или GOOGLE_API_KEY — ключ для генерирования текста/изображений
+  GEMINI_API_KEY или GOOGLE_API_KEY — ключ для генерации текста/изображений
   IMAGEN_MODEL (опц.) — имя модели Imagen 3, по умолчанию "imagen-3.0-fast-generate-001"
   PLANNER_DB_DIR (опц.) — где хранить planner.db (по умолчанию рядом с файлом)
 """
@@ -27,7 +29,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFi
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import BadRequest, RetryAfter
 
-# ===== Gemini presence flag (не обязателен для запуска бота без ИИ) =====
+# ===== Gemini presence flag =====
 _GEMINI_OK = False
 try:
     import google.generativeai as genai
@@ -61,8 +63,13 @@ DB_DIR = os.getenv("PLANNER_DB_DIR") or os.path.dirname(os.path.abspath(__file__
 os.makedirs(DB_DIR, exist_ok=True)
 DB_FILE = os.path.join(DB_DIR, "planner.db")
 
-STATE: Dict[Tuple[int, int], dict] = {}   # (chat_id,user_id)->state   и (chat_id,0)->state
+# --- STATE (только персональный ключ!) ---
+STATE: Dict[Tuple[int, int], dict] = {}   # (chat_id,user_id)->state
 USER_STATE = STATE
+
+# якорь единственного сообщения-меню в чате
+MENU_ANCHOR: Dict[int, int] = {}          # chat_id -> message_id
+
 LAST_SIG: Dict[Tuple[int, int], Tuple[str, str]] = {}
 LAST_EDIT_AT: Dict[Tuple[int, int], float] = {}
 MIN_EDIT_GAP = 0.8
@@ -110,32 +117,29 @@ def _trace_async(fn):
     return wrap
 
 # ------------------ STATE helpers ------------------
-def _state_keys_from_update(update: Update) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+def _state_key(update: Update) -> Tuple[int, int]:
     chat_id = update.effective_chat.id if update.effective_chat else 0
     user_id = update.effective_user.id if update.effective_user else 0
-    return (chat_id, user_id), (chat_id, 0)
+    return (chat_id, user_id)
 
 def set_state_for_update(update: Update, st: dict) -> None:
-    k_personal, k_chat = _state_keys_from_update(update)
-    STATE[k_personal] = st
-    STATE[k_chat] = st
-    log.info("STATE set (chat=%s user=%s): %s", k_personal[0], k_personal[1], st)
+    k = _state_key(update)
+    STATE[k] = st
+    log.info("STATE set (chat=%s user=%s): %s", k[0], k[1], st)
 
 def get_state_for_update(update: Update) -> Optional[dict]:
-    k_personal, k_chat = _state_keys_from_update(update)
-    st = STATE.get(k_personal) or STATE.get(k_chat)
-    log.info("STATE get (chat=%s user=%s): %s", k_personal[0], k_personal[1], st)
+    k = _state_key(update)
+    st = STATE.get(k)
+    log.info("STATE get (chat=%s user=%s): %s", k[0], k[1], st)
     return st
 
 def clear_state_for_update(update: Update) -> None:
-    k_personal, k_chat = _state_keys_from_update(update)
-    STATE.pop(k_personal, None)
-    STATE.pop(k_chat, None)
-    log.info("STATE cleared for chat=%s user=%s", k_personal[0], k_personal[1])
+    k = _state_key(update)
+    STATE.pop(k, None)
+    log.info("STATE cleared for chat=%s user=%s", k[0], k[1])
 
 def set_state_for_ids(chat_id: int, user_id: int, st: dict) -> None:
     STATE[(chat_id, user_id)] = st
-    STATE[(chat_id, 0)] = st
     log.info("STATE set by ids (chat=%s user=%s): %s", chat_id, user_id, st)
 
 # ------------------ Data model ------------------
@@ -226,7 +230,7 @@ async def _ensure_db() -> None:
     _db_ready = True
     log.info("DB ready")
 
-# CRUD
+# ------------------ CRUD ------------------
 @_trace_async
 async def _get_items(uid: int) -> List[PlanItem]:
     await _ensure_db()
@@ -518,6 +522,30 @@ def _parse_time(s: str) -> Optional[str]:
     log.warning("TIME parse failed: %r", s0)
     return None
 
+# --------------- ЕДИНОЕ МЕНЮ (идемпотентно) ---------------
+@_trace_async
+async def _send_or_update_menu(chat_id: int, bot, text: str, reply_markup: InlineKeyboardMarkup):
+    anchor = MENU_ANCHOR.get(chat_id)
+    if anchor:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=anchor, text=text, reply_markup=reply_markup)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=anchor, text=text, reply_markup=reply_markup)
+                return
+            except Exception as _:
+                pass
+        except BadRequest as e:
+            # message to edit not found / can't be edited -> пошлём новое и обновим якорь
+            log.info("edit anchor failed, will send new: %s", e)
+        except Exception as e:
+            log.info("edit anchor err, will send new: %s", e)
+    # send new & pin anchor
+    msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    MENU_ANCHOR[chat_id] = msg.message_id
+
 # --------------- Telegram safe ops ---------------
 @_trace_async
 async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardMarkup):
@@ -525,15 +553,10 @@ async def _send_new_message_fallback(q, text: str, reply_markup: InlineKeyboardM
         chat_id = q.message.chat_id if q and q.message else None
         if chat_id is None:
             return
-        await q.message.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    except RetryAfter as e:
-        await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
-        try:
-            await q.message.bot.send_message(chat_id=q.message.chat_id, text=text, reply_markup=reply_markup)
-        except Exception as ee:
-            log.error("fallback send_message failed: %s", ee)
+        # Вместо простого sendMessage — идемпотентное меню
+        await _send_or_update_menu(chat_id, q.message.bot, text, reply_markup)
     except Exception as e:
-        log.error("fallback send_message error: %s", e)
+        log.error("fallback send error: %s", e)
 
 @_trace_async
 async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
@@ -563,7 +586,7 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 LAST_SIG[(msg.chat_id, msg.message_id)] = (text or "", json.dumps(reply_markup.to_dict() if reply_markup else {}, ensure_ascii=False, sort_keys=True))
                 LAST_EDIT_AT[(msg.chat_id, msg.message_id)] = time.time()
             return
-        except Exception as ee:
+        except Exception:
             await _send_new_message_fallback(q, text, reply_markup)
             return
     except BadRequest as e:
@@ -580,7 +603,8 @@ async def edit_or_pass(q, text: str, reply_markup: InlineKeyboardMarkup):
                 await _send_new_message_fallback(q, text, reply_markup)
                 return
         if "query is too old" in s.lower():
-            await _send_new_message_fallback(q, "⏱ Кнопка устарела. Вот актуальное меню:", await _kb_main(q.from_user.id))
+            # Обновляем единственное меню, без лишних сообщений
+            await _send_new_message_fallback(q, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(q.from_user.id))
             return
         await _send_new_message_fallback(q, text, reply_markup)
         return
@@ -614,7 +638,8 @@ async def open_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await edit_or_pass(update.callback_query, text, kb)
     else:
-        await update.effective_message.reply_text(text=text, reply_markup=kb)
+        # ИДЕМПОТЕНТНО: одно меню на чат
+        await _send_or_update_menu(update.effective_chat.id, update.effective_message.bot, text, kb)
 
 # -------------------------------------- Callback router --------------------------------------
 @_trace_async
@@ -625,7 +650,7 @@ async def _cb_plan_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = await _safe_q_answer(q)
     if not ok:
         try:
-            await q.message.reply_text("⏱ Кнопка устарела. Вот актуальное меню:", reply_markup=await _kb_main(uid))
+            await _send_or_update_menu(q.message.chat_id, q.message.bot, "🗓 ПЛАН НА ДЕНЬ", await _kb_main(uid))
         except Exception:
             pass
         return
