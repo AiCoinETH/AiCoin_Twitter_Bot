@@ -16,6 +16,7 @@ import base64
 import asyncio
 import logging
 import tempfile
+import ai_client
 from html import escape as html_escape
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, time as dt_time
