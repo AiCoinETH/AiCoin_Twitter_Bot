@@ -803,7 +803,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
-        if planner_exit or data == "BACK_MAIN_MENU":
+        if planner_exit или data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
         return
