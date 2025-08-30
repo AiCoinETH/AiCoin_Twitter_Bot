@@ -2,10 +2,11 @@
 """
 twitter_bot.py — согласование/публикация в Telegram и X (Twitter) без автогенерации ИИ.
 - Кнопка «Старт воркера» показывается ТОЛЬКО после выключения/авто-выключения.
-- На старте больше нет двух сообщений — только предпросмотр с кнопками.
+- На старте одно сообщение — предпросмотр с кнопками.
 - Этапы согласований:
   ✏️ Править текст -> ждём новый текст (5 мин) -> «Предпросмотр (текст согласован)».
   🖼️ Изменить медиа -> ждём фото/видео/URL (5 мин) -> «Предпросмотр (медиа согласовано)».
+- Режим ИИ по кнопке «🤖 ИИ»: тема → генерация → предпросмотр, перегенерация, автотеги.
 """
 
 import os
@@ -149,7 +150,7 @@ manual_expected_until: Optional[datetime] = None
 ROUTE_TO_PLANNER: set[int] = set()
 awaiting_hashtags_until: Optional[datetime] = None
 
-# ---- AI state (без автогенерации текста — только этапы согласований) ----
+# ---- AI state (без автогенерации текста — только этапы/диалоги) ----
 AI_STATE: Dict[int, Dict[str, Any]] = {}
 
 def ai_state_reset(uid: int):
@@ -165,6 +166,23 @@ def ai_state_set(uid: int, **kwargs):
 def ai_state_get(uid: int) -> Dict[str, Any]:
     return AI_STATE.get(uid, {"mode": "idle"})
 
+# --- AI UI (клавиатуры + last_topic) ---
+def ai_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 Сгенерировать текст по теме", callback_data="ai_generate")],
+        [InlineKeyboardButton("🔁 Перегенерировать по последней теме", callback_data="ai_text_regen")],
+        [InlineKeyboardButton("🔖 Подобрать хэштеги по текущему тексту", callback_data="ai_hashtags_suggest")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")]
+    ])
+
+def ai_set_last_topic(uid: int, topic: str):
+    st = AI_STATE.get(uid, {"mode": "idle"})
+    st["last_topic"] = (topic or "").strip()
+    AI_STATE[uid] = st
+
+def ai_get_last_topic(uid: int) -> str:
+    return AI_STATE.get(uid, {}).get("last_topic", "").strip()
+
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
@@ -176,9 +194,10 @@ def _worker_url_with_secret() -> str:
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}s={sec}" if sec else base
 
-# ВАЖНО: тут НЕТ кнопки «Старт воркера».
+# Главное меню — с пунктом ИИ
 def get_start_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 ИИ", callback_data="ai_home")],
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
         [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
@@ -195,9 +214,10 @@ def start_preview_keyboard():
          InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
         [InlineKeyboardButton("✏️ Править текст", callback_data="ai_text_edit"),
          InlineKeyboardButton("🖼️ Изменить медиа", callback_data="ai_image_edit")],
-        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags"),
-         InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 План на день", callback_data="show_day_plan")],
+        [InlineKeyboardButton("🤖 ИИ", callback_data="ai_home"),
+         InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
+        [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post"),
+         InlineKeyboardButton("🗓 План на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb"),
          InlineKeyboardButton("⏳ Завершить день", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
@@ -242,6 +262,7 @@ async def send_with_start_button(chat_id: int, text: str):
         await safe_send_message(approval_bot, chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
     except Exception:
         await safe_send_message(approval_bot, chat_id=chat_id, text=text)
+
 # -----------------------------------------------------------------------------
 # УТИЛИТЫ ДЛИНЫ / ХЭШТЕГИ
 # -----------------------------------------------------------------------------
@@ -297,7 +318,6 @@ def _parse_hashtags_line_user(line: str) -> List[str]:
         return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
-    # без тематического фильтра, только дедуп/нормализация
     seen, out = set(), []
     for t in raw:
         t = t.strip()
@@ -726,7 +746,6 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
                     parse_mode="HTML", reply_markup=start_preview_keyboard()
                 )
             except Exception:
-                # fallback — просто текст + ссылка
                 await safe_send_message(
                     approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
                     text=text_message, parse_mode="HTML",
@@ -761,6 +780,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
+
 # -----------------------------------------------------------------------------
 # Планировщик — роутинг
 # -----------------------------------------------------------------------------
@@ -807,7 +827,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "show_day_plan" or planner_any or planner_exit:
         ROUTE_TO_PLANNER.add(uid)
         awaiting_hashtags_until = None
-        await _route_to_planner(update, context)   # ✅ теперь внутри функции!
+        await _route_to_planner(update, context)
         if planner_exit or data == "BACK_MAIN_MENU":
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
@@ -817,6 +837,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_start_menu()
             )
         return
+
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
         awaiting_hashtags_until = None
@@ -852,7 +873,68 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр")
         return
 
-    # ===== ХЭШТЕГИ =====
+    # ===== ИИ: главное меню =====
+    if data == "ai_home":
+        ai_state_set(uid, mode="ai_home")
+        log_ai.info("AI|home | uid=%s", uid)
+        await safe_send_message(
+            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="🤖 Режим ИИ:\n— Сгенерирую текст по теме и покажу предпросмотр.\n— Могу перегенерировать по последней теме.\n— Могу предложить хэштеги по текущему тексту.",
+            reply_markup=ai_home_keyboard()
+        )
+        return
+
+    # ===== ИИ: запрос темы для генерации =====
+    if data == "ai_generate":
+        ai_state_set(uid, mode="await_topic", await_until=(now + timedelta(minutes=5)))
+        log_ai.info("AI|await_topic | uid=%s | until=%s", uid, now + timedelta(minutes=5))
+        await safe_send_message(
+            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="🧠 Введите тему поста (EN/RU/UA). У меня есть 5 минут."
+        )
+        return
+
+    # ===== ИИ: перегенерация по последней теме =====
+    if data == "ai_text_regen":
+        last_topic = ai_get_last_topic(uid)
+        if not last_topic:
+            await safe_send_message(
+                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="⚠️ Ещё нет сохранённой темы. Нажмите «🧠 Сгенерировать текст по теме».",
+                reply_markup=ai_home_keyboard()
+            )
+            return
+        txt, warn = ai_client.ai_generate_text(last_topic)
+        post_data["text_en"] = (txt or "").strip()
+        header = "Предпросмотр (текст согласован)"
+        if warn:
+            header += " — " + warn
+        log_ai.info("AI|regen | uid=%s | topic='%s' | len=%s", uid, last_topic, len(post_data["text_en"]))
+        await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header=header)
+        return
+
+    # ===== ИИ: подобрать хэштеги от текущего текста =====
+    if data == "ai_hashtags_suggest":
+        base_text = (post_data.get("text_en") or "").strip()
+        if not base_text:
+            await safe_send_message(
+                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="⚠️ Сначала нужен текст поста. Варианты: «✍️ Сделай сам» или «🧠 Сгенерировать текст по теме».",
+                reply_markup=ai_home_keyboard()
+            )
+            return
+        tags = ai_client.ai_suggest_hashtags(base_text)
+        post_data["ai_hashtags"] = tags
+        post_data["user_tags_override"] = False
+        log_ai.info("AI|hashtags.suggest | uid=%s | tags=%s", uid, " ".join(tags))
+        await safe_send_message(
+            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text=f"✅ Предложил хэштеги: {' '.join(tags) if tags else '—'}"
+        )
+        await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр (теги обновлены)")
+        return
+
+    # ===== ХЭШТЕГИ (ручной ввод) =====
     if data == "edit_hashtags":
         awaiting_hashtags_until = now + timedelta(minutes=5)
         cur = " ".join(post_data.get("ai_hashtags") or [])
@@ -955,8 +1037,39 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # ===== 1) Ранний перехват: согласование ТЕКСТА =====
     st = ai_state_get(uid)
+
+    # ===== 0) Ранний перехват: тема для генерации ИИ =====
+    if st.get("mode") == "await_topic":
+        await_until = st.get("await_until")
+        if await_until and now <= await_until:
+            topic = (update.message.text or update.message.caption or "").strip()
+            if not topic:
+                await safe_send_message(
+                    approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    text="⚠️ Пустая тема. Отправьте короткую тему поста."
+                )
+                return
+            txt, warn = ai_client.ai_generate_text(topic)
+            post_data["text_en"] = (txt or "").strip()
+            ai_set_last_topic(uid, topic)
+            ai_state_set(uid, mode="ready_text")
+            header = "Предпросмотр (текст согласован)"
+            if warn:
+                header += " — " + warn
+            log_ai.info("AI|gen | uid=%s | topic='%s' | len=%s", uid, topic, len(post_data['text_en']))
+            await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header=header)
+            return
+        else:
+            ai_state_reset(uid)
+            await safe_send_message(
+                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="⏰ Время ожидания темы истекло.",
+                reply_markup=get_start_menu()
+            )
+            return
+
+    # ===== 1) Ранний перехват: согласование ТЕКСТА =====
     if st.get("mode") == "await_text_edit":
         await_until = st.get("await_until")
         if await_until and now <= await_until:
@@ -1087,7 +1200,7 @@ async def on_start(app: Application):
     post_data["media_src"] = "tg"
     post_data["media_ref"] = None
 
-    # ТОЛЬКО ОДНО сообщение на старте — предпросмотр с кнопками
+    # ТОЛЬКО ОДНО сообщение на старте — предпросмотр с кнопками (есть «🤖 ИИ»)
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], header="Предпросмотр (ручной режим)")
     log.info("Бот запущен. Предпросмотр отправлен. Планировщик — в planner.py (если подключено).")
 
