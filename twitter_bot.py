@@ -797,26 +797,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[uid] = now
 
-# Планировщик (на вход/выход)
-planner_any = data.startswith((
-    "PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:",
-    "EDIT_FIELD:", "CLONE_ITEM:", "TOGGLE_DONE:", "show_day_plan"
-))
-planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
+    # --- Планировщик ---
+    planner_any = data.startswith((
+        "PLAN_", "ITEM_MENU:", "DEL_ITEM:", "EDIT_TIME:", "EDIT_ITEM:",
+        "EDIT_FIELD:", "CLONE_ITEM:", "TOGGLE_DONE:", "show_day_plan"
+    ))
+    planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
-if data == "show_day_plan" or planner_any or planner_exit:
-    ROUTE_TO_PLANNER.add(uid)
-    awaiting_hashtags_until = None
-    await _route_to_planner(update, context)
-    if planner_exit or data == "BACK_MAIN_MENU":
-        ROUTE_TO_PLANNER.discard(uid)
-        await safe_send_message(
-            approval_bot,
-            chat_id=TELEGRAM_APPROVAL_CHAT_ID,
-            text="Главное меню:",
-            reply_markup=get_start_menu()
-        )
-    return
+    if data == "show_day_plan" or planner_any or planner_exit:
+        ROUTE_TO_PLANNER.add(uid)
+        awaiting_hashtags_until = None
+        await _route_to_planner(update, context)   # ✅ теперь внутри функции!
+        if planner_exit or data == "BACK_MAIN_MENU":
+            ROUTE_TO_PLANNER.discard(uid)
+            await safe_send_message(
+                approval_bot,
+                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                text="Главное меню:",
+                reply_markup=get_start_menu()
+            )
+        return
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.discard(uid)
         awaiting_hashtags_until = None
