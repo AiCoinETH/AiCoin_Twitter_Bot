@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
+import urllib.parse as _up  # <— для кодирования текста в URL
 
 log = logging.getLogger("ai_client")
 
@@ -9,7 +10,7 @@ _GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 _USE_GEMINI = bool(_GEMINI_KEY)
 
 def _try_import_gemini():
-    if not _USE_GEMINI: 
+    if not _USE_GEMINI:
         return None
     try:
         import google.generativeai as genai
@@ -69,3 +70,20 @@ def ai_suggest_hashtags(text: str) -> list[str]:
     # коротко: 3-6 тегов
     out = list(base)[:6]
     return out
+
+# ---------- Примитивная генерация "картинки" (URL баннер) ----------
+def ai_generate_image_url(topic: str) -> tuple[str, str]:
+    """
+    Возвращает (image_url, warning). Без внешних ИИ/ключей.
+    Делает баннер 1200x675 c текстом темы (dummyimage.com).
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return "", "Пустая тема."
+    safe = topic.replace("\n", " ").strip()
+    if len(safe) > 80:
+        safe = safe[:80] + "…"
+    txt = _up.quote_plus(safe)
+    # Тёмный фон, светлый текст, 1200x675 (16:9) — подходит для X/TG превью
+    url = f"https://dummyimage.com/1200x675/0a0a0a/ffffff.png&text={txt}"
+    return url, "🖼️ Сгенерирован простой баннер по теме (плейсхолдер)."
