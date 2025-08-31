@@ -7,6 +7,7 @@ twitter_bot.py — согласование/публикация в Telegram и 
 - далее показывается предпросмотр.
 
 Также исправлено: всё состояние теперь ключуется по chat_id, чтобы избежать проблем с анонимным user_id.
+Добавлено: обработчик «🔖 Хэштеги» и дополнительные логи входящих сообщений в ИИ-режиме.
 """
 
 import os
@@ -95,9 +96,7 @@ TIMER_PUBLISH_EXTEND = 600
 AUTO_SHUTDOWN_AFTER_SECONDS = 600
 
 VERBATIM_MODE = False  # X: True = как написал; False = с хвостом
-
-# === НОВОЕ: флаг автогенерации изображения ИИ (если нет присланного медиа) ===
-AUTO_AI_IMAGE = True
+AUTO_AI_IMAGE = True   # автогенерация изображения ИИ (если нет присланного медиа)
 
 # -----------------------------------------------------------------------------
 # ХВОСТЫ
@@ -129,7 +128,7 @@ github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
 # -----------------------------------------------------------------------------
-# СТЕЙТ (теперь ключ = chat_id)
+# СТЕЙТ (ключ = chat_id)
 # -----------------------------------------------------------------------------
 post_data: Dict[str, Any] = {
     "text_en": "",
@@ -148,7 +147,6 @@ prev_data = post_data.copy()
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
 
-# ВАЖНО: ключуем всё по chat_id, а не user_id
 last_action_time: Dict[int, datetime] = {}      # chat_id -> last action time
 last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None
@@ -791,37 +789,23 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
 # ВСПОМОГАТЕЛЬНОЕ: автогенерация изображения для ИИ (если нет медиа)
 # -----------------------------------------------------------------------------
 async def _maybe_generate_ai_image_and_attach(topic: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Пытается вызвать ai_client.ai_generate_image(topic) -> (local_path, warn)
-    Загружает в GitHub и проставляет post_data['media_*'].
-    Возвращает (warn_from_ai, github_filename) — для лога/чистки (вторая может быть None).
-    """
     if not AUTO_AI_IMAGE:
         return None, None
-
     if not hasattr(ai_client, "ai_generate_image"):
         log_ai.info("AI|image.skip | функция ai_generate_image отсутствует в ai_client.")
         return None, None
-
     try:
         img_path, warn_img = ai_client.ai_generate_image(topic or "")
         if not img_path or not os.path.exists(img_path):
             log_ai.info("AI|image.fail | генерация не вернула файл.")
             return warn_img or "⚠️ Не удалось сгенерировать изображение ИИ.", None
-
-        # заливаем в GitHub raw
         filename = f"{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
         raw_url = upload_image_to_github(img_path, filename)
-        try:
-            os.remove(img_path)
-        except Exception:
-            pass
-
+        try: os.remove(img_path)
+        except Exception: pass
         if not raw_url:
             log_ai.info("AI|image.fail | upload to GitHub failed.")
             return (warn_img or "⚠️ Upload image failed."), None
-
-        # проставляем в state как URL-картинку
         post_data["media_kind"] = "image"
         post_data["media_src"] = "url"
         post_data["media_ref"] = raw_url
@@ -832,7 +816,7 @@ async def _maybe_generate_ai_image_and_attach(topic: str) -> Tuple[Optional[str]
         return "⚠️ Ошибка генерации изображения.", None
 
 # -----------------------------------------------------------------------------
-# РУЧНОЙ ВВОД («Сделай сам») — как было
+# РУЧНОЙ ВВОД («Сделай сам»)
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
@@ -883,7 +867,14 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    # 1) парсим сообщение по той же логике, что «Сделай сам»
+    # отметим в логах что получили сообщение в ИИ-режиме
+    _kind = "text"
+    if getattr(update.message, "photo", None): _kind = "photo"
+    elif getattr(update.message, "video", None): _kind = "video"
+    elif getattr(update.message, "document", None): _kind = "document"
+    log_ai.info("AI|recv | chat=%s | kind=%s", chat_id, _kind)
+
+    # 1) парсим сообщение как в «Сделай сам»
     raw_text = (update.message.text or update.message.caption or "").strip()
     media_kind, media_src, media_ref = "none", "tg", None
 
@@ -905,7 +896,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_kind, media_src, media_ref = "image", "url", url
             raw_text = raw_text[len(url):].strip()
 
-    # 2) тема = текст сообщения (если пусто — последняя сохранённая тема)
+    # 2) тема
     topic = (raw_text or "").strip() or ai_get_last_topic(chat_id)
     if not topic:
         await safe_send_message(
@@ -920,7 +911,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_set_last_topic(chat_id, topic)
     ai_state_set(chat_id, mode="ready_text")
 
-    # 4) если пользователь прислал медиа — используем его; иначе попробуем сгенерировать изображение
+    # 4) медиа
     if media_kind != "none" and media_ref:
         post_data["media_kind"] = media_kind
         post_data["media_src"]  = media_src
@@ -929,7 +920,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         warn_img, _ = await _maybe_generate_ai_image_and_attach(topic)
 
-    # 5) предложим хэштеги (если ещё не заданы вручную)
+    # 5) хэштеги (если не оверрайдились руками)
     if not post_data.get("user_tags_override"):
         try:
             post_data["ai_hashtags"] = ai_client.ai_suggest_hashtags(post_data["text_en"])
@@ -938,11 +929,8 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 6) предпросмотр
     header = "Предпросмотр (ИИ: текст согласован)"
-    if warn_t:
-        header += f" — {warn_t}"
-    if warn_img:
-        header += f" / {warn_img}"
-
+    if warn_t:  header += f" — {warn_t}"
+    if warn_img: header += f" / {warn_img}"
     await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header=header)
 
 # -----------------------------------------------------------------------------
@@ -1038,6 +1026,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр")
         return
 
+    # ===== новенькое: ручной ввод своих хэштегов =====
+    if data == "edit_hashtags":
+        awaiting_hashtags_until = now + timedelta(minutes=5)
+        await safe_send_message(
+            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            text="🔖 Пришлите строку хэштегов (через пробел/запятые). У меня есть 5 минут."
+        )
+        return
+
     # ===== ИИ: главное меню =====
     if data == "ai_home":
         ai_state_set(chat_id, mode="ai_home")
@@ -1049,7 +1046,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== ИИ: запрос темы для генерации =====
+    # ===== ИИ: запрос темы =====
     if data == "ai_generate":
         ai_state_set(chat_id, mode="await_topic", await_until=(now + timedelta(minutes=5)))
         log_ai.info("AI|await_topic | chat=%s | until=%s", chat_id, now + timedelta(minutes=5))
@@ -1059,7 +1056,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== ИИ: перегенерация по последней теме =====
+    # ===== ИИ: перегенерация =====
     if data == "ai_text_regen":
         last_topic = ai_get_last_topic(chat_id)
         if not last_topic:
@@ -1071,23 +1068,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         txt, warn = ai_client.ai_generate_text(last_topic)
         post_data["text_en"] = (txt or "").strip()
-
-        # если нет медиа — пробуем сгенерить картинку
         if post_data.get("media_kind") == "none" or not post_data.get("media_ref"):
             warn_img, _ = await _maybe_generate_ai_image_and_attach(last_topic)
         else:
             warn_img = None
-
         header = "Предпросмотр (ИИ: текст согласован)"
-        if warn:
-            header += " — " + warn
-        if warn_img:
-            header += f" / {warn_img}"
+        if warn: header += " — " + warn
+        if warn_img: header += f" / {warn_img}"
         log_ai.info("AI|regen | chat=%s | topic='%s' | len=%s", chat_id, last_topic, len(post_data["text_en"]))
         await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header=header)
         return
 
-    # ===== ИИ: подобрать хэштеги от текущего текста =====
+    # ===== ИИ: подобрать хэштеги =====
     if data == "ai_hashtags_suggest":
         base_text = (post_data.get("text_en") or "").strip()
         if not base_text:
@@ -1151,7 +1143,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = ai_state_get(chat_id)
 
-    # === НОВОЕ: если мы в ИИ-режиме (ai_home/await_topic) — читаем сообщение как тему+медиа
+    # === ИИ-режим: читаем сообщение как тему+медиа
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
@@ -1296,7 +1288,6 @@ async def on_start(app: Application):
     post_data["media_src"] = "tg"
     post_data["media_ref"] = None
 
-    # стартовый предпросмотр
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], header="Предпросмотр (ручной режим)")
     log.info("Бот запущен. Предпросмотр отправлен. Планировщик — в planner.py (если подключено).")
 
@@ -1346,7 +1337,7 @@ def main():
         .build()
     )
 
-    # Наши обработчики — раньше планировщика, чтобы перехватывать сообщения и кнопки
+    # Наши обработчики — раньше планировщика
     app.add_handler(CallbackQueryHandler(callback_handler), group=-100)
     app.add_handler(
         MessageHandler(
