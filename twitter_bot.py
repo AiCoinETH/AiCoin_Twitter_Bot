@@ -36,7 +36,7 @@ log = logging.getLogger("twitter_bot")
 log_ai = logging.getLogger("twitter_bot.ai")
 
 # --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
-TELEGRAM_APPROVAL_CHAT_ID: Optional[int] = None
+TELEGRAM_APPROVAL_CHAT_ID: Any = None  # может быть int (-100...) или '@username' (str)
 
 # === ПЛАНИРОВЩИК (опционально) ===
 try:
@@ -79,37 +79,49 @@ _need_env = [
 _missing = [k for k in _need_env if not os.getenv(k)]
 if _missing:
     log.error("Не заданы обязательные переменные окружения: %s", _missing)
-    # Всё же продолжаем — часть функций может работать, а ошибки проявятся точечно.
 
-# Надёжное вычисление chat_id + лог при кривом значении
-try:
-    TELEGRAM_APPROVAL_CHAT_ID = int((TELEGRAM_APPROVAL_CHAT_ID_STR or "").strip())
-    log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
-except Exception as _e:
-    log.error("ENV TELEGRAM_APPROVAL_CHAT_ID некорректен: %s", _e)
+# Надёжное вычисление chat_id: допускаем -100... и @username
+_raw_chat = (TELEGRAM_APPROVAL_CHAT_ID_STR or os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "").strip()
+if _raw_chat.startswith("@"):
+    TELEGRAM_APPROVAL_CHAT_ID = _raw_chat
+    log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s (username)", TELEGRAM_APPROVAL_CHAT_ID)
+else:
     try:
-        TELEGRAM_APPROVAL_CHAT_ID = int((os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "0").strip())
-    except Exception:
+        # int может быть отрицательным для каналов. Ноль считаем некорректным.
+        TELEGRAM_APPROVAL_CHAT_ID = int(_raw_chat) if _raw_chat else 0
+        log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
+    except Exception as _e:
         TELEGRAM_APPROVAL_CHAT_ID = 0
-    log.warning("Fallback TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
+        log.error("ENV TELEGRAM_APPROVAL_CHAT_ID некорректен: %s", _e)
 
-def _approval_chat_id() -> int:
+def _approval_chat_id() -> Any:
     """
-    Безопасный доступ к chat_id: если глобал по какой-то причине пропал
-    или равен 0, попробуем взять из ENV и залогируем предупреждение.
+    Безопасный доступ к chat_id:
+    - поддерживает integer chat_id (включая отрицательные -100... для каналов),
+    - поддерживает строковые @username.
+    Возвращает кэшированный глобал или перечитывает из ENV, если пуст.
     """
-    global TELEGRAM_APPROVAL_CHAT_ID
-    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID > 0:
+    global TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_APPROVAL_CHAT_ID_STR
+    # уже установлено и не ноль/не пустая строка
+    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID != 0:
+        return TELEGRAM_APPROVAL_CHAT_ID
+    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, str) and TELEGRAM_APPROVAL_CHAT_ID.strip():
+        return TELEGRAM_APPROVAL_CHAT_ID.strip()
+
+    raw = (os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or (TELEGRAM_APPROVAL_CHAT_ID_STR or "")).strip()
+    if not raw:
+        log.error("Approval chat id is not set (empty).")
+        return 0
+    if raw.startswith("@"):
+        TELEGRAM_APPROVAL_CHAT_ID = raw
         return TELEGRAM_APPROVAL_CHAT_ID
     try:
-        TELEGRAM_APPROVAL_CHAT_ID = int((os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "0").strip())
+        TELEGRAM_APPROVAL_CHAT_ID = int(raw)
+        return TELEGRAM_APPROVAL_CHAT_ID
     except Exception:
         TELEGRAM_APPROVAL_CHAT_ID = 0
-    if TELEGRAM_APPROVAL_CHAT_ID <= 0:
-        log.error("Approval chat id is not set or invalid (<=0).")
-    else:
-        log.warning("Recovered TELEGRAM_APPROVAL_CHAT_ID=%s from ENV", TELEGRAM_APPROVAL_CHAT_ID)
-    return TELEGRAM_APPROVAL_CHAT_ID
+        log.error("Approval chat id is invalid (cannot parse).")
+        return 0
 
 # -----------------------------------------------------------------------------
 # ГЛОБАЛЫ/БОТЫ/ЧАСОВОЙ ПОЯС
@@ -182,7 +194,7 @@ prev_data = post_data.copy()
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
 
-# Доп. глобалы (ранее отсутствовали в этом файле, но используются ниже)
+# Доп. глобалы
 last_action_time: Dict[int, datetime] = {}
 last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None
@@ -200,7 +212,6 @@ def ai_state_set(uid: int, **kwargs):
     st = AI_STATE.get(uid, {"mode": "idle"})
     st.update(kwargs)
     AI_STATE[uid] = st
-    # компактный лог без спама
     log_ai.info("AI|state.set | uid=%s | %s", uid, " ".join([f"{k}={v}" for k, v in kwargs.items()]))
 
 def ai_state_get(uid: int) -> Dict[str, Any]:
@@ -314,7 +325,7 @@ async def safe_send_message(bot: Bot, **kwargs):
             raise
     return None
 
-async def send_with_start_button(chat_id: int, text: str):
+async def send_with_start_button(chat_id: Any, text: str):
     try:
         await safe_send_message(approval_bot, chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
     except Exception:
@@ -1331,8 +1342,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _planner_active_for(uid):
         return await _route_to_planner(update, context)
 
-    # иначе — показать меню
-    await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="Главное меню:", reply_markup=get_start_menu())
+    # ---- Раньше здесь форсился показ «Главное меню». Убрано по просьбе. ----
+    return
 
 # -----------------------------------------------------------------------------
 # Общая публикация
@@ -1377,7 +1388,8 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."))
 
-    await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="Главное меню:", reply_markup=get_start_menu())
+    # ---- Раньше здесь форсилось «Главное меню». Убрано. ----
+    return
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
