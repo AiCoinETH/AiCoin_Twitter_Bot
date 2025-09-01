@@ -35,6 +35,9 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(nam
 log = logging.getLogger("twitter_bot")
 log_ai = logging.getLogger("twitter_bot.ai")
 
+# --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
+TELEGRAM_APPROVAL_CHAT_ID: Optional[int] = None
+
 # === ПЛАНИРОВЩИК (опционально) ===
 try:
     from planner import register_planner_handlers, open_planner
@@ -61,9 +64,59 @@ GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
 GITHUB_IMAGE_PATH = "images_for_posts"
 
+# Публичный триггер воркера (опционально)
+AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
+PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
+FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
+
+# Проверка обязательных ENV (мягкая)
+_need_env = [
+    "TELEGRAM_BOT_TOKEN_APPROVAL", "TELEGRAM_APPROVAL_CHAT_ID",
+    "TELEGRAM_BOT_TOKEN_CHANNEL", "TELEGRAM_CHANNEL_USERNAME_ID",
+    "TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET",
+    "ACTION_PAT_GITHUB", "ACTION_REPO_GITHUB",
+]
+_missing = [k for k in _need_env if not os.getenv(k)]
+if _missing:
+    log.error("Не заданы обязательные переменные окружения: %s", _missing)
+    # Всё же продолжаем — часть функций может работать, а ошибки проявятся точечно.
+
+# Надёжное вычисление chat_id + лог при кривом значении
+try:
+    TELEGRAM_APPROVAL_CHAT_ID = int((TELEGRAM_APPROVAL_CHAT_ID_STR or "").strip())
+    log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
+except Exception as _e:
+    log.error("ENV TELEGRAM_APPROVAL_CHAT_ID некорректен: %s", _e)
+    try:
+        TELEGRAM_APPROVAL_CHAT_ID = int((os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "0").strip())
+    except Exception:
+        TELEGRAM_APPROVAL_CHAT_ID = 0
+    log.warning("Fallback TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
+
+def _approval_chat_id() -> int:
+    """
+    Безопасный доступ к chat_id: если глобал по какой-то причине пропал
+    или равен 0, попробуем взять из ENV и залогируем предупреждение.
+    """
+    global TELEGRAM_APPROVAL_CHAT_ID
+    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID > 0:
+        return TELEGRAM_APPROVAL_CHAT_ID
+    try:
+        TELEGRAM_APPROVAL_CHAT_ID = int((os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "0").strip())
+    except Exception:
+        TELEGRAM_APPROVAL_CHAT_ID = 0
+    if TELEGRAM_APPROVAL_CHAT_ID <= 0:
+        log.error("Approval chat id is not set or invalid (<=0).")
+    else:
+        log.warning("Recovered TELEGRAM_APPROVAL_CHAT_ID=%s from ENV", TELEGRAM_APPROVAL_CHAT_ID)
+    return TELEGRAM_APPROVAL_CHAT_ID
+
+# -----------------------------------------------------------------------------
+# ГЛОБАЛЫ/БОТЫ/ЧАСОВОЙ ПОЯС
+# -----------------------------------------------------------------------------
 TZ = ZoneInfo("Europe/Kyiv")
-approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
-channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
+approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL) if TELEGRAM_BOT_TOKEN_APPROVAL else None
+channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL) if TELEGRAM_BOT_TOKEN_CHANNEL else None
 
 # -----------------------------------------------------------------------------
 # ГЛОБАЛЫ
@@ -77,10 +130,21 @@ AUTO_AI_IMAGE = False
 TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 🐺 https://t.me/AiCoin_ETH"
 TG_TAIL_HTML = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter X</a>'
 
+def _worker_url_with_secret() -> str:
+    base = AICOIN_WORKER_URL or ""
+    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
+    if not base:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}s={sec}" if sec else base
+
 # -----------------------------------------------------------------------------
 # Twitter API
 # -----------------------------------------------------------------------------
 def get_twitter_clients():
+    if not (TWITTER_API_KEY and TWITTER_API_SECRET and TWITTER_ACCESS_TOKEN and TWITTER_ACCESS_TOKEN_SECRET):
+        log.warning("Twitter ENV переменные не заданы полностью — клиенты не будут созданы.")
+        return None, None
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
         consumer_secret=TWITTER_API_SECRET,
@@ -96,8 +160,8 @@ def get_twitter_clients():
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
-github_client = Github(GITHUB_TOKEN)
-github_repo = github_client.get_repo(GITHUB_REPO)
+github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+github_repo = github_client.get_repo(GITHUB_REPO) if (github_client and GITHUB_REPO) else None
 
 # -----------------------------------------------------------------------------
 # СТЕЙТ
@@ -117,6 +181,15 @@ prev_data = post_data.copy()
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
+
+# Доп. глобалы (ранее отсутствовали в этом файле, но используются ниже)
+last_action_time: Dict[int, datetime] = {}
+last_button_pressed_at: Optional[datetime] = None
+manual_expected_until: Optional[datetime] = None
+ROUTE_TO_PLANNER: set[int] = set()
+awaiting_hashtags_until: Optional[datetime] = None
+
+# ---- AI state ----
 AI_STATE: Dict[int, Dict[str, Any]] = {}
 
 def ai_state_reset(uid: int):
@@ -127,7 +200,19 @@ def ai_state_set(uid: int, **kwargs):
     st = AI_STATE.get(uid, {"mode": "idle"})
     st.update(kwargs)
     AI_STATE[uid] = st
-    log_ai.info("AI|state.set | uid=%s | %s", uid, kwargs)
+    # компактный лог без спама
+    log_ai.info("AI|state.set | uid=%s | %s", uid, " ".join([f"{k}={v}" for k, v in kwargs.items()]))
+
+def ai_state_get(uid: int) -> Dict[str, Any]:
+    return AI_STATE.get(uid, {"mode": "idle"})
+
+def ai_set_last_topic(uid: int, topic: str):
+    st = AI_STATE.get(uid, {"mode": "idle"})
+    st["last_topic"] = (topic or "").strip()
+    AI_STATE[uid] = st
+
+def ai_get_last_topic(uid: int) -> str:
+    return AI_STATE.get(uid, {}).get("last_topic", "").strip()
 
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
@@ -213,6 +298,9 @@ async def safe_q_answer(q) -> bool:
             return False
 
 async def safe_send_message(bot: Bot, **kwargs):
+    if bot is None:
+        log.error("Bot is not initialized — cannot send message. kwargs=%s", kwargs)
+        return None
     for _ in range(3):
         try:
             return await bot.send_message(**kwargs)
@@ -459,6 +547,9 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
 # GitHub helpers
 # -----------------------------------------------------------------------------
 def upload_image_to_github(image_path, filename):
+    if not github_repo:
+        log.error("GitHub repo is not configured")
+        return None
     try:
         with open(image_path, "rb") as img_file:
             content_b64 = base64.b64encode(img_file.read()).decode("utf-8")
@@ -474,6 +565,8 @@ def upload_image_to_github(image_path, filename):
         return None
 
 def delete_image_from_github(filename):
+    if not github_repo:
+        return
     try:
         contents = github_repo.get_contents(f"{GITHUB_IMAGE_PATH}/{filename}", ref="main")
         github_repo.delete_file(contents.path, "delete image after posting", contents.sha, branch="main")
@@ -594,7 +687,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
         if mk == "none" or not mref:
             if not final_html.strip():
-                await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, "⚠️ Telegram: пусто (нет текста и медиа).")
+                await send_with_start_button(_approval_chat_id(), "⚠️ Telegram: пусто (нет текста и медиа).")
                 return False
             await channel_bot.send_message(
                 chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
@@ -621,7 +714,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         return True
     except Exception as e:
         log.error(f"Ошибка публикации в Telegram: {e}")
-        await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"❌ Ошибка публикации в Telegram: {e}")
+        await send_with_start_button(_approval_chat_id(), f"❌ Ошибка публикации в Telegram: {e}")
         lp = post_data.get("media_local_path")
         if lp:
             try: os.remove(lp)
@@ -631,6 +724,8 @@ async def publish_post_to_telegram(text: str | None) -> bool:
 
 async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
     try:
+        if not twitter_client_v2 or not twitter_api_v1:
+            raise RuntimeError("Twitter clients are not configured.")
         mk = post_data.get("media_kind", "none")
         msrc = post_data.get("media_src", "tg")
         mref = post_data.get("media_ref")
@@ -654,7 +749,7 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
         clean_text = (final_text_ready or "").strip()
         if not media_ids and not clean_text:
             asyncio.create_task(send_with_start_button(
-                TELEGRAM_APPROVAL_CHAT_ID, "⚠️ В Twitter нечего публиковать: нет ни текста, ни медиа."
+                _approval_chat_id(), "⚠️ В Twitter нечего публиковать: нет ни текста, ни медиа."
             ))
             return False
         if media_ids and not clean_text:
@@ -677,7 +772,7 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
     except tweepy.TweepyException as e:
         log.error(f"Twitter TweepyException: {e}")
         asyncio.create_task(send_with_start_button(
-            TELEGRAM_APPROVAL_CHAT_ID, "❌ Twitter: ошибка загрузки. Проверьте права app (Read+Write) и параметры видео."
+            _approval_chat_id(), "❌ Twitter: ошибка загрузки. Проверьте права app (Read+Write) и параметры видео."
         ))
         lp = post_data.get("media_local_path")
         if lp:
@@ -687,7 +782,7 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
         return False
     except Exception as e:
         log.error(f"Twitter general error: {e}")
-        asyncio.create_task(send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"❌ Twitter: {e}"))
+        asyncio.create_task(send_with_start_button(_approval_chat_id(), f"❌ Twitter: {e}"))
         lp = post_data.get("media_local_path")
         if lp:
             try: os.remove(lp)
@@ -710,32 +805,32 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
         if mk == "video" and mref:
             try:
                 await approval_bot.send_video(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID, video=mref, supports_streaming=True,
+                    chat_id=_approval_chat_id(), video=mref, supports_streaming=True,
                     caption=(caption_for_media if caption_for_media.strip() else None),
                     parse_mode="HTML", reply_markup=start_preview_keyboard()
                 )
             except Exception:
                 await safe_send_message(
-                    approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    approval_bot, chat_id=_approval_chat_id(),
                     text=text_message, parse_mode="HTML",
                     reply_markup=start_preview_keyboard()
                 )
         elif mk == "image" and mref:
             try:
                 await approval_bot.send_photo(
-                    chat_id=TELEGRAM_APPROVAL_CHAT_ID, photo=mref,
+                    chat_id=_approval_chat_id(), photo=mref,
                     caption=(caption_for_media if caption_for_media.strip() else None),
                     parse_mode="HTML", reply_markup=start_preview_keyboard()
                 )
             except Exception:
                 await safe_send_message(
-                    approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    approval_bot, chat_id=_approval_chat_id(),
                     text=text_message, parse_mode="HTML",
                     reply_markup=start_preview_keyboard()
                 )
         else:
             await safe_send_message(
-                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                approval_bot, chat_id=_approval_chat_id(),
                 text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
                 parse_mode="HTML", disable_web_page_preview=True,
                 reply_markup=start_preview_keyboard()
@@ -744,7 +839,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
     except Exception as e:
         log.warning(f"send_single_preview fallback: {e}")
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
@@ -864,7 +959,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = (raw_text or "").strip() or ai_get_last_topic(uid)
     if not topic:
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="⚠️ Отправьте тему поста (любой текст)."
         )
         return
@@ -890,7 +985,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Подходит ли текст?"
     )
     await safe_send_message(
-        approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        approval_bot, chat_id=_approval_chat_id(),
         text=msg, parse_mode="HTML",
         reply_markup=ai_text_confirm_keyboard()
     )
@@ -905,7 +1000,7 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
         return await open_planner(update, context)
     await safe_send_message(
-        approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+        approval_bot, chat_id=_approval_chat_id(),
         text="⚠️ Планировщик не подключён (planner.py). Работаем в ручном режиме.",
         reply_markup=get_start_menu()
     )
@@ -946,7 +1041,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ROUTE_TO_PLANNER.discard(uid)
             await safe_send_message(
                 approval_bot,
-                chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                chat_id=_approval_chat_id(),
                 text="Главное меню:",
                 reply_markup=get_start_menu()
             )
@@ -958,7 +1053,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         awaiting_hashtags_until = None
         ai_state_reset(uid)
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="Главное меню:", reply_markup=get_start_menu()
         )
         return
@@ -967,7 +1062,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         msg = f"🔴 Бот выключен.\nСледующий пост: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}"
-        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=msg, reply_markup=start_worker_keyboard())
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=msg, reply_markup=start_worker_keyboard())
         await asyncio.sleep(1)
         shutdown_bot_and_exit()
         return
@@ -977,7 +1072,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         awaiting_hashtags_until = None
         ai_state_reset(uid)
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото/видео одним сообщением:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
@@ -994,7 +1089,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "edit_hashtags":
         awaiting_hashtags_until = now + timedelta(minutes=3)
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="🔖 Пришлите строку с тегами. Пример: <code>#AiCoin #AI $Ai #crypto</code>",
             parse_mode="HTML"
         )
@@ -1005,7 +1100,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_state_set(uid, mode="ai_home")
         log_ai.info("AI|home | uid=%s", uid)
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="🤖 Режим ИИ. Пришлите тему (можно с медиа или URL). После текста спрошу, нужна ли картинка.",
             reply_markup=ai_home_keyboard()
         )
@@ -1015,7 +1110,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_state_set(uid, mode="await_topic", await_until=(now + timedelta(minutes=5)))
         log_ai.info("AI|await_topic | uid=%s | until=%s", uid, now + timedelta(minutes=5))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут."
         )
         return
@@ -1024,7 +1119,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ai_text_ok":
         ai_state_set(uid, mode="confirm_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="🖼 Нужна картинка к посту?",
             reply_markup=_image_confirm_keyboard_for_state()
         )
@@ -1034,7 +1129,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_topic = ai_get_last_topic(uid)
         if not last_topic:
             await safe_send_message(
-                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                approval_bot, chat_id=_approval_chat_id(),
                 text="⚠️ Ещё нет сохранённой темы. Нажмите «🧠 Сгенерировать текст по теме».",
                 reply_markup=ai_home_keyboard()
             )
@@ -1046,7 +1141,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if warn:
             hdr += f" — {warn}"
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text=f"<b>{html_escape(hdr)}</b>\n\n{build_telegram_preview(post_data['text_en'])}\n\nПодходит ли текст?",
             parse_mode="HTML", reply_markup=ai_text_confirm_keyboard()
         )
@@ -1055,7 +1150,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ai_text_edit":
         ai_state_set(uid, mode="await_text_edit", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="✏️ Пришлите новый текст поста (EN) одним сообщением (5 минут)."
         )
         return
@@ -1073,7 +1168,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ai_img_upload":
         ai_state_set(uid, mode="await_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text="📤 Пришлите фото/видео или URL на картинку/видео (5 минут)."
         )
         return
@@ -1092,7 +1187,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ai_img_back_to_text":
         ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text=f"<b>Возврат к тексту</b>\n\n{build_telegram_preview(post_data.get('text_en') or '')}\n\nПодходит ли текст?",
             parse_mode="HTML", reply_markup=ai_text_confirm_keyboard()
         )
@@ -1107,7 +1202,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         do_not_disturb["active"] = not do_not_disturb["active"]
         status = "включён" if do_not_disturb["active"] else "выключен"
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text=f"🌙 Режим «Не беспокоить» {status}.",
             reply_markup=get_start_menu()
         )
@@ -1117,7 +1212,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         do_not_disturb["active"] = True
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         await safe_send_message(
-            approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+            approval_bot, chat_id=_approval_chat_id(),
             text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML", reply_markup=get_start_menu()
         )
@@ -1146,7 +1241,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             ai_state_reset(uid)
             await safe_send_message(
-                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время ожидания темы истекло.",
                 reply_markup=get_start_menu()
             )
@@ -1162,17 +1257,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_data["text_en"] = new_text
                 ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
                 await safe_send_message(
-                    approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                    approval_bot, chat_id=_approval_chat_id(),
                     text=f"<b>Обновлённый текст</b>\n\n{build_telegram_preview(post_data['text_en'])}\n\nПодходит ли текст?",
                     parse_mode="HTML", reply_markup=ai_text_confirm_keyboard()
                 )
             else:
-                await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Пусто. Пришлите обновлённый текст.")
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Пусто. Пришлите обновлённый текст.")
             return
         else:
             ai_state_reset(uid)
             await safe_send_message(
-                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время редактирования текста истекло.",
                 reply_markup=get_start_menu()
             )
@@ -1206,12 +1301,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ai_state_set(uid, mode="ready_media")
                 await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр (медиа согласовано)")
             else:
-                await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Пришлите фото/видео или URL на изображение/видео.")
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Пришлите фото/видео или URL на изображение/видео.")
             return
         else:
             ai_state_reset(uid)
             await safe_send_message(
-                approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID,
+                approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время согласования медиа истекло.",
                 reply_markup=get_start_menu()
             )
@@ -1225,7 +1320,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_data["user_tags_override"] = True
         awaiting_hashtags_until = None
         cur = " ".join(tags) if tags else "—"
-        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: обязательные ссылки + твои теги (≤275).")
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"✅ Хэштеги обновлены: {cur}\nРежим Twitter: обязательные ссылки + твои теги (≤275).")
         return await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр")
 
     # ===== Ручной ввод «Сделай сам» (5 минут) =====
@@ -1237,7 +1332,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _route_to_planner(update, context)
 
     # иначе — показать меню
-    await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+    await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
 # Общая публикация
@@ -1252,7 +1347,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     telegram_text_preview = build_telegram_preview(base_text_en, None)
 
     if do_not_disturb["active"]:
-        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="🌙 Режим «Не беспокоить» активен. Публикация отменена.")
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="🌙 Режим «Не беспокоить» активен. Публикация отменена.")
         return
 
     media_hash = await compute_media_hash_from_state()
@@ -1260,7 +1355,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     if publish_tg:
         if await is_duplicate_post(telegram_text_preview, media_hash):
-            await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Дубликат для Telegram. Публикация пропущена.")
+            await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для Telegram. Публикация пропущена.")
             tg_status = False
         else:
             tg_status = await publish_post_to_telegram(text=base_text_en)
@@ -1270,7 +1365,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     if publish_tw:
         if await is_duplicate_post(twitter_final_text, media_hash):
-            await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="⚠️ Дубликат для Twitter. Публикация пропущена.")
+            await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для Twitter. Публикация пропущена.")
             tw_status = False
         else:
             tw_status = await publish_post_to_twitter(twitter_final_text)
@@ -1278,11 +1373,11 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
                 await save_post_to_history(twitter_final_text, media_hash)
 
     if publish_tg:
-        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=("✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram."))
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram."))
     if publish_tw:
-        await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text=("✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."))
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."))
 
-    await safe_send_message(approval_bot, chat_id=TELEGRAM_APPROVAL_CHAT_ID, text="Главное меню:", reply_markup=get_start_menu())
+    await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="Главное меню:", reply_markup=get_start_menu())
 
 # -----------------------------------------------------------------------------
 # STARTUP / SHUTDOWN / MAIN
@@ -1309,7 +1404,7 @@ async def check_inactivity_shutdown():
             idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
             if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
                 try:
-                    await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, "🔴 Нет активности 10 минут. Отключаюсь. Нажми «Старт воркера», чтобы перезапустить.")
+                    await send_with_start_button(_approval_chat_id(), "🔴 Нет активности 10 минут. Отключаюсь. Нажми «Старт воркера», чтобы перезапустить.")
                 except Exception:
                     pass
                 shutdown_bot_and_exit()
@@ -1318,14 +1413,14 @@ async def check_inactivity_shutdown():
         except Exception as e:
             log.warning(f"check_inactivity_shutdown error: {e}")
             try:
-                await send_with_start_button(TELEGRAM_APPROVAL_CHAT_ID, f"⚠️ Ошибка наблюдателя активности: {e}\nНажми «Старт воркера», чтобы перезапустить.")
+                await send_with_start_button(_approval_chat_id(), f"⚠️ Ошибка наблюдателя активности: {e}\nНажми «Старт воркера», чтобы перезапустить.")
             except Exception:
                 pass
 
 def shutdown_bot_and_exit():
     try:
         asyncio.create_task(send_with_start_button(
-            TELEGRAM_APPROVAL_CHAT_ID,
+            _approval_chat_id(),
             "🔴 Бот полностью выключен. Нажми «Старт воркера», чтобы перезапустить."
         ))
     except Exception:
@@ -1337,6 +1432,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"TG error: {context.error}")
 
 def main():
+    if not TELEGRAM_BOT_TOKEN_APPROVAL:
+        log.error("TELEGRAM_BOT_TOKEN_APPROVAL is not set. Exiting.")
+        sys.exit(1)
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)
