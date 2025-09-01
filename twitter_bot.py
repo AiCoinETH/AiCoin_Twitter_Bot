@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import tweepy
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, ForceReply
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 import aiosqlite
@@ -34,6 +34,10 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s")
 log = logging.getLogger("twitter_bot")
 log_ai = logging.getLogger("twitter_bot.ai")
+
+# Данные о самом боте (заполняем на старте)
+BOT_ID: Optional[int] = None
+BOT_USERNAME: Optional[str] = None
 
 # --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
 TELEGRAM_APPROVAL_CHAT_ID: Any = None  # может быть int (-100...) или '@username' (str)
@@ -87,7 +91,6 @@ if _raw_chat.startswith("@"):
     log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s (username)", TELEGRAM_APPROVAL_CHAT_ID)
 else:
     try:
-        # int может быть отрицательным для каналов. Ноль считаем некорректным.
         TELEGRAM_APPROVAL_CHAT_ID = int(_raw_chat) if _raw_chat else 0
         log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
     except Exception as _e:
@@ -102,12 +105,10 @@ def _approval_chat_id() -> Any:
     Возвращает кэшированный глобал или перечитывает из ENV, если пуст.
     """
     global TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_APPROVAL_CHAT_ID_STR
-    # уже установлено и не ноль/не пустая строка
     if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID != 0:
         return TELEGRAM_APPROVAL_CHAT_ID
     if isinstance(TELEGRAM_APPROVAL_CHAT_ID, str) and TELEGRAM_APPROVAL_CHAT_ID.strip():
         return TELEGRAM_APPROVAL_CHAT_ID.strip()
-
     raw = (os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or (TELEGRAM_APPROVAL_CHAT_ID_STR or "")).strip()
     if not raw:
         log.error("Approval chat id is not set (empty).")
@@ -224,6 +225,34 @@ def ai_set_last_topic(uid: int, topic: str):
 
 def ai_get_last_topic(uid: int) -> str:
     return AI_STATE.get(uid, {}).get("last_topic", "").strip()
+
+# -----------------------------------------------------------------------------
+# Адресовано ли сообщение нашему боту (для групп/форумов)?
+# -----------------------------------------------------------------------------
+def _message_addresses_bot(update: Update) -> bool:
+    msg = update.message
+    if not msg:
+        return False
+    chat = update.effective_chat
+    # 1) Личка
+    if getattr(chat, "type", "") == "private":
+        return True
+    # 2) Реплай на сообщение именно ЭТОГО бота
+    try:
+        if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
+            return (BOT_ID is None) or (msg.reply_to_message.from_user.id == BOT_ID)
+    except Exception:
+        pass
+    # 3) Упоминание @username в тексте/подписи
+    text = (msg.text or msg.caption or "")
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+    if BOT_USERNAME and entities:
+        for e in entities:
+            if e.type == "mention":
+                mention = text[e.offset:e.offset+e.length]
+                if mention.lstrip("@").lower() == (BOT_USERNAME or "").lower():
+                    return True
+    return False
 
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
@@ -1122,7 +1151,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_ai.info("AI|await_topic | uid=%s | until=%s", uid, now + timedelta(minutes=5))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
-            text="🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут."
+            text="🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут.",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Тема поста…")
         )
         return
 
@@ -1144,18 +1174,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ Ещё нет сохранённой темы. Нажмите «🧠 Сгенерировать текст по теме».",
                 reply_markup=ai_home_keyboard()
             )
-            return
-        txt, warn = ai_client.ai_generate_text(last_topic)
-        post_data["text_en"] = (txt or "").strip()
-        ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
-        hdr = "ИИ перегенерировал текст"
-        if warn:
-            hdr += f" — {warn}"
-        await safe_send_message(
-            approval_bot, chat_id=_approval_chat_id(),
-            text=f"<b>{html_escape(hdr)}</b>\n\n{build_telegram_preview(post_data['text_en'])}\n\nПодходит ли текст?",
-            parse_mode="HTML", reply_markup=ai_text_confirm_keyboard()
-        )
+        else:
+            txt, warn = ai_client.ai_generate_text(last_topic)
+            post_data["text_en"] = (txt or "").strip()
+            ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
+            hdr = "ИИ перегенерировал текст"
+            if warn:
+                hdr += f" — {warn}"
+            await safe_send_message(
+                approval_bot, chat_id=_approval_chat_id(),
+                text=f"<b>{html_escape(hdr)}</b>\n\n{build_telegram_preview(post_data['text_en'])}\n\nПодходит ли текст?",
+                parse_mode="HTML", reply_markup=ai_text_confirm_keyboard()
+            )
         return
 
     if data == "ai_text_edit":
@@ -1248,7 +1278,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
-            return await handle_ai_input(update, context)
+            # В группах/форумных темах работаем только с сообщениями, адресованными боту
+            if _message_addresses_bot(update):
+                return await handle_ai_input(update, context)
+            else:
+                return
         else:
             ai_state_reset(uid)
             await safe_send_message(
@@ -1342,7 +1376,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _planner_active_for(uid):
         return await _route_to_planner(update, context)
 
-    # ---- Раньше здесь форсился показ «Главное меню». Убрано по просьбе. ----
+    # ---- никаких автоменю по умолчанию ----
     return
 
 # -----------------------------------------------------------------------------
@@ -1388,7 +1422,6 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
     if publish_tw:
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в Twitter!" if tw_status else "❌ Не удалось отправить в Twitter."))
 
-    # ---- Раньше здесь форсилось «Главное меню». Убрано. ----
     return
 
 # -----------------------------------------------------------------------------
@@ -1452,6 +1485,7 @@ def main():
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)
         .post_init(on_start)
         .concurrent_updates(False)
+        .allowed_updates(["message", "callback_query"])
         .build()
     )
 
@@ -1470,6 +1504,20 @@ def main():
 
     app.add_error_handler(on_error)
     asyncio.get_event_loop().create_task(check_inactivity_shutdown())
+
+    # Перед стартом узнаём username/id бота (нужно для фильтра адресации)
+    async def _fetch_me():
+        global BOT_ID, BOT_USERNAME
+        try:
+            me = await approval_bot.get_me()
+            BOT_ID = me.id
+            BOT_USERNAME = me.username
+            log.info("BOT: id=%s username=@%s", BOT_ID, BOT_USERNAME)
+        except Exception as e:
+            log.warning("Could not fetch bot info: %s", e)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_fetch_me())
     app.run_polling(poll_interval=0.6, timeout=2)
 
 if __name__ == "__main__":
