@@ -1,24 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — согласование/публикация в Telegram и X (Twitter).
-
-НОВОЕ:
-- В режиме ИИ (ai_home/await_topic) любое входящее сообщение парсится как тема+медиа.
-- Сначала генерируется ТЕКСТ, затем бот СРАЗУ спрашивает: "Подходит ли текст?".
-- После подтверждения текста бот спрашивает: "Нужна картинка?" (сгенерировать / загрузить / без изображения / оставить текущую).
-- Автогенерация изображения ИИ по умолчанию отключена на первом шаге и запускается только по явному согласию (кнопка "Сгенерировать изображение").
-- Предпросмотр всегда показывает текущий текст/хэштеги/медиа и кнопки публикации.
-
-Совместимо с:
-- ai_client.ai_generate_text(topic) -> (text, warn_msg|None)
-- ai_client.ai_suggest_hashtags(text) -> List[str]
-- ai_client.ai_generate_image(topic) -> (local_image_path, warn_msg|None)
-
-Требуемые переменные окружения:
-TELEGRAM_BOT_TOKEN_APPROVAL, TELEGRAM_APPROVAL_CHAT_ID,
-TELEGRAM_BOT_TOKEN_CHANNEL, TELEGRAM_CHANNEL_USERNAME_ID,
-TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET,
-ACTION_PAT_GITHUB, ACTION_REPO_GITHUB
 """
 
 import os
@@ -79,45 +61,24 @@ GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
 GITHUB_IMAGE_PATH = "images_for_posts"
 
-AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
-PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
-FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
-
-need_env = [
-    "TELEGRAM_BOT_TOKEN_APPROVAL", "TELEGRAM_APPROVAL_CHAT_ID",
-    "TELEGRAM_BOT_TOKEN_CHANNEL", "TELEGRAM_CHANNEL_USERNAME_ID",
-    "TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET",
-    "ACTION_PAT_GITHUB", "ACTION_REPO_GITHUB"
-]
-missing = [k for k in need_env if not os.getenv(k)]
-if missing:
-    log.error(f"Не заданы обязательные переменные окружения: {missing}")
-    sys.exit(1)
-
-TELEGRAM_APPROVAL_CHAT_ID = int(TELEGRAM_APPROVAL_CHAT_ID_STR)
-
-# -----------------------------------------------------------------------------
-# ГЛОБАЛЫ
-# -----------------------------------------------------------------------------
 TZ = ZoneInfo("Europe/Kyiv")
 approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL)
 channel_bot = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL)
 
+# -----------------------------------------------------------------------------
+# ГЛОБАЛЫ
+# -----------------------------------------------------------------------------
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND = 600
 AUTO_SHUTDOWN_AFTER_SECONDS = 600
+VERBATIM_MODE = False
+AUTO_AI_IMAGE = False
 
-VERBATIM_MODE = False  # X: True = как написал; False = с хвостом
-AUTO_AI_IMAGE = False  # ВАЖНО: теперь изображение генерим ТОЛЬКО по явному согласию
-
-# -----------------------------------------------------------------------------
-# ХВОСТЫ
-# -----------------------------------------------------------------------------
 TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 🐺 https://t.me/AiCoin_ETH"
 TG_TAIL_HTML = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter X</a>'
 
 # -----------------------------------------------------------------------------
-# Twitter API клиенты
+# Twitter API
 # -----------------------------------------------------------------------------
 def get_twitter_clients():
     client_v2 = tweepy.Client(
@@ -135,7 +96,6 @@ def get_twitter_clients():
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
-# GitHub (для предпросмотра изображений из TG)
 github_client = Github(GITHUB_TOKEN)
 github_repo = github_client.get_repo(GITHUB_REPO)
 
@@ -145,11 +105,10 @@ github_repo = github_client.get_repo(GITHUB_REPO)
 post_data: Dict[str, Any] = {
     "text_en": "",
     "ai_hashtags": [],
-    "media_kind": "none",   # none|image|video
-    "media_src": "tg",      # tg|url
+    "media_kind": "none",
+    "media_src": "tg",
     "media_ref": None,
     "media_local_path": None,
-    "timestamp": None,
     "post_id": 0,
     "is_manual": False,
     "user_tags_override": False
@@ -158,13 +117,6 @@ prev_data = post_data.copy()
 
 pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
 do_not_disturb = {"active": False}
-last_action_time: Dict[int, datetime] = {}
-last_button_pressed_at: Optional[datetime] = None
-manual_expected_until: Optional[datetime] = None
-ROUTE_TO_PLANNER: set[int] = set()
-awaiting_hashtags_until: Optional[datetime] = None
-
-# ---- AI state ----
 AI_STATE: Dict[int, Dict[str, Any]] = {}
 
 def ai_state_reset(uid: int):
@@ -175,42 +127,19 @@ def ai_state_set(uid: int, **kwargs):
     st = AI_STATE.get(uid, {"mode": "idle"})
     st.update(kwargs)
     AI_STATE[uid] = st
-    log_ai.info("AI|state.set | uid=%s | %s", uid, " ".join([f"{k}={v}" for k,v in kwargs.items()]))
-
-def ai_state_get(uid: int) -> Dict[str, Any]:
-    return AI_STATE.get(uid, {"mode": "idle"})
-
-def ai_set_last_topic(uid: int, topic: str):
-    st = AI_STATE.get(uid, {"mode": "idle"})
-    st["last_topic"] = (topic or "").strip()
-    AI_STATE[uid] = st
-
-def ai_get_last_topic(uid: int) -> str:
-    return AI_STATE.get(uid, {}).get("last_topic", "").strip()
+    log_ai.info("AI|state.set | uid=%s | %s", uid, kwargs)
 
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
-def _worker_url_with_secret() -> str:
-    base = AICOIN_WORKER_URL or ""
-    sec = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
-    if not base:
-        return base
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}s={sec}" if sec else base
-
 def get_start_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🤖 ИИ", callback_data="ai_home")],
         [InlineKeyboardButton("✅ Предпросмотр", callback_data="approve")],
-        [InlineKeyboardButton("🔖 Хэштеги", callback_data="edit_hashtags")],
         [InlineKeyboardButton("✍️ Сделай сам", callback_data="self_post")],
-        [InlineKeyboardButton("🗓 План на день", callback_data="show_day_plan")],
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
-        [InlineKeyboardButton("⏳ Завершить на сегодня", callback_data="end_day")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
-
 def start_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
