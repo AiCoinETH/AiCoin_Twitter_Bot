@@ -1480,12 +1480,13 @@ def main():
     if not TELEGRAM_BOT_TOKEN_APPROVAL:
         log.error("TELEGRAM_BOT_TOKEN_APPROVAL is not set. Exiting.")
         sys.exit(1)
+
+    # builder без .allowed_updates (этого метода нет у ApplicationBuilder)
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)
         .post_init(on_start)
         .concurrent_updates(False)
-        .allowed_updates(["message", "callback_query"])
         .build()
     )
 
@@ -1518,7 +1519,13 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(_fetch_me())
-    app.run_polling(poll_interval=0.6, timeout=2)
+
+    # allowed_updates передаем в run_polling
+    app.run_polling(
+        poll_interval=0.6,
+        timeout=2,
+        allowed_updates=["message", "callback_query"]
+    )
 
 if __name__ == "__main__":
     main()
