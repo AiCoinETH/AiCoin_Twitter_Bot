@@ -1278,9 +1278,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
+            # Принимаем сообщения так же, как в "Сделай сам":
+            #  - в личке: всегда
+            #  - в чате согласования: всегда (без @упоминания)
+            #  - в других группах: только если адресовано боту (реплай/упоминание)
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
 
+            # Определяем, пришло ли из чата согласования (поддержка id и @username)
             aid = _approval_chat_id()
             from_approval_chat = False
             try:
@@ -1288,11 +1293,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     from_approval_chat = (chat.id == aid)
                 else:
                     uname = getattr(chat, "username", None)
-                    if uname:
-                        from_approval_chat = ("@" + uname.lower()) == str(aid).lower()
+                    from_approval_chat = (uname and ("@" + uname.lower()) == str(aid).lower())
             except Exception:
                 from_approval_chat = False
 
+            # В личке и в чате согласования — принимаем всё.
+            # В остальных чатах — только если адресовано боту (реплай/упоминание).
             if in_private or from_approval_chat or _message_addresses_bot(update):
                 return await handle_ai_input(update, context)
             else:
@@ -1305,7 +1311,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_start_menu()
             )
             return
-
     # ===== Этап правки текста =====
     if st.get("mode") == "await_text_edit":
         await_until = st.get("await_until")
