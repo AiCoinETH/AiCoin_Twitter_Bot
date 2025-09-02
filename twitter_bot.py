@@ -265,6 +265,7 @@ def get_start_menu():
         [InlineKeyboardButton("🔕 Не беспокоить", callback_data="do_not_disturb")],
         [InlineKeyboardButton("🔴 Выключить", callback_data="shutdown_bot")]
     ])
+
 def start_preview_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
@@ -1278,47 +1279,49 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
-            # Принимаем сообщения так же, как в "Сделай сам":
-            #  - в личке: всегда
-            #  - в чате согласования: всегда (без @упоминания)
-            #  - в других группах: только если адресовано боту (реплай/упоминание)
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
 
-# Определяем, пришло ли из чата согласования (поддержка id и @username, устойчиво для форумов)
-aid = _approval_chat_id()
-from_approval_chat = False
+            # Определяем, пришло ли из чата согласования (поддержка id и @username, устойчиво для форумов)
+            aid = _approval_chat_id()
+            from_approval_chat = False
 
-try:
-    if isinstance(aid, int) and aid != 0:
-        # В ENV задан числовой chat_id (-100...)
-        from_approval_chat = (update.effective_chat.id == aid)
-    elif isinstance(aid, str) and aid.strip().startswith("@"):
-        # В ENV задан @username — пробуем получить его реальный id
-        resolved_id = None
-        try:
-            chat_obj = await approval_bot.get_chat(aid.strip())
-            resolved_id = getattr(chat_obj, "id", None)
-        except Exception:
-            resolved_id = None
+            try:
+                if isinstance(aid, int) and aid != 0:
+                    from_approval_chat = (chat.id == aid)
+                elif isinstance(aid, str) and aid.strip().startswith("@"):
+                    resolved_id = None
+                    try:
+                        chat_obj = await approval_bot.get_chat(aid.strip())
+                        resolved_id = getattr(chat_obj, "id", None)
+                    except Exception:
+                        resolved_id = None
 
-        if resolved_id is not None:
-            from_approval_chat = (update.effective_chat.id == resolved_id)
+                    if resolved_id is not None:
+                        from_approval_chat = (chat.id == resolved_id)
+                    else:
+                        uname = getattr(chat, "username", None)
+                        from_approval_chat = bool(uname and ("@" + uname.lower()) == aid.strip().lower())
+                else:
+                    from_approval_chat = False
+            except Exception:
+                from_approval_chat = False
+
+            # В личке и в чате согласования — принимаем всё.
+            # В остальных чатах — только если адресовано боту (реплай/упоминание).
+            if in_private or from_approval_chat or _message_addresses_bot(update):
+                return await handle_ai_input(update, context)
+            else:
+                return
         else:
-            # Фолбэк: прямое сравнение по username, если у чата он есть
-            uname = getattr(update.effective_chat, "username", None)
-            from_approval_chat = bool(uname and ("@" + uname.lower()) == aid.strip().lower())
-    else:
-        from_approval_chat = False
-except Exception:
-    from_approval_chat = False
+            ai_state_reset(uid)
+            await safe_send_message(
+                approval_bot, chat_id=_approval_chat_id(),
+                text="⏰ Время ожидания темы истекло.",
+                reply_markup=get_start_menu()
+            )
+            return
 
-# В личке и в чате согласования — принимаем всё.
-# В остальных чатах — только если адресовано боту (реплай/упоминание).
-if in_private or from_approval_chat or _message_addresses_bot(update):
-    return await handle_ai_input(update, context)
-else:
-    return
     # ===== Этап правки текста =====
     if st.get("mode") == "await_text_edit":
         await_until = st.get("await_until")
