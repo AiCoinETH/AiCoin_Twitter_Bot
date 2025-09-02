@@ -23,7 +23,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, Fo
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 import aiosqlite
+
+# ИСПРАВЛЕНО: современная авторизация PyGithub (устранено DeprecationWarning)
 from github import Github
+try:
+    from github import Auth as _GhAuth
+except Exception:
+    _GhAuth = None
 
 import ai_client
 
@@ -187,7 +193,15 @@ def get_twitter_clients():
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
-github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+# ИСПРАВЛЕНО: современная авторизация PyGithub (устранено DeprecationWarning)
+try:
+    if _GhAuth and GITHUB_TOKEN:
+        _gh_auth = _GhAuth.Token(GITHUB_TOKEN)
+        github_client = Github(auth=_gh_auth)
+    else:
+        github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None  # fallback для старых версий
+except Exception:
+    github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None  # дополнительный fallback
 github_repo = github_client.get_repo(GITHUB_REPO) if (github_client and GITHUB_REPO) else None
 
 # -----------------------------------------------------------------------------
@@ -899,7 +913,6 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
-
 # -----------------------------------------------------------------------------
 # Генерация ИИ-изображения (по явному согласию)
 # -----------------------------------------------------------------------------
@@ -1324,7 +1337,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu()
         )
         return
-
 # -----------------------------------------------------------------------------
 # Ввод сообщений
 # -----------------------------------------------------------------------------
