@@ -42,6 +42,20 @@ BOT_USERNAME: Optional[str] = None
 # --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
 TELEGRAM_APPROVAL_CHAT_ID: Any = None  # может быть int (-100...) или '@username' (str)
 
+# (НОВОЕ) Разрешённый пользователь для ввода/кнопок (по желанию)
+try:
+    APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0") or "0")
+except Exception:
+    APPROVAL_USER_ID = 0
+
+def _is_approved_user(update: Update) -> bool:
+    """Если APPROVAL_USER_ID задан — принимаем сообщения/клики только от него."""
+    if not update or not getattr(update, "effective_user", None):
+        return False
+    if APPROVAL_USER_ID and update.effective_user and update.effective_user.id != APPROVAL_USER_ID:
+        return False
+    return True
+
 # === ПЛАНИРОВЩИК (опционально) ===
 try:
     from planner import register_planner_handlers, open_planner
@@ -921,6 +935,8 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
+    if not _is_approved_user(update):
+        return
     now = datetime.now(TZ)
     pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
     if pending_post.get("mode") == "placeholder":
@@ -931,21 +947,27 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if getattr(update.message, "photo", None):
         media_kind = "image"; media_ref = update.message.photo[-1].file_id
+        log_ai.info("SELF|recv photo | chat=%s", update.effective_chat.id)
     elif getattr(update.message, "video", None):
         media_kind = "video"; media_ref = update.message.video.file_id
+        log_ai.info("SELF|recv video | chat=%s", update.effective_chat.id)
     elif getattr(update.message, "document", None):
         mime = (update.message.document.mime_type or "")
         fid  = update.message.document.file_id
-        if mime.startswith("video/"): media_kind = "video"; media_ref = fid
-        elif mime.startswith("image/"): media_kind = "image"; media_ref = fid
+        if mime.startswith("video/"): media_kind = "video"; media_ref = fid; log_ai.info("SELF|recv doc.video | chat=%s", update.effective_chat.id)
+        elif mime.startswith("image/"): media_kind = "image"; media_ref = fid; log_ai.info("SELF|recv doc.image | chat=%s", update.effective_chat.id)
     elif text and text.startswith("http"):
         url = text.split()[0]
         if any(url.lower().endswith(ext) for ext in (".mp4", ".mov", ".m4v", ".webm")):
             media_kind = "video"; media_src = "url"; media_ref = url
             text = text[len(url):].strip()
+            log_ai.info("SELF|recv video_url | chat=%s", update.effective_chat.id)
         elif any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
             media_kind = "image"; media_src = "url"; media_ref = url
             text = text[len(url):].strip()
+            log_ai.info("SELF|recv image_url | chat=%s", update.effective_chat.id)
+    else:
+        log_ai.info("SELF|recv text | chat=%s | len=%s | head=%r", update.effective_chat.id, len(text), text[:120])
 
     post_data["text_en"] = text
     post_data["media_kind"] = media_kind
@@ -962,6 +984,8 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 # НОВОЕ: ВВОД ДЛЯ ИИ (двухэтапное согласование)
 # -----------------------------------------------------------------------------
 async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_approved_user(update):
+        return
     uid = update.effective_user.id
     now = datetime.now(TZ)
     pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
@@ -994,7 +1018,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_kind, media_src, media_ref = "image", "url", url
             raw_text = raw_text[len(url):].strip()
             kind_logged = "image_url"
-    log_ai.info("AI|recv | chat=%s | kind=%s", update.effective_chat.id, kind_logged)
+    log_ai.info("AI|recv | chat=%s | kind=%s | len=%s | head=%r", update.effective_chat.id, kind_logged, len(raw_text), raw_text[:120])
 
     # 2) тема = текст (или последняя)
     topic = (raw_text or "").strip() or ai_get_last_topic(uid)
@@ -1051,6 +1075,14 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CALLBACKS
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_approved_user(update):
+        # Вежливо игнорируем клики неавторизованных
+        try:
+            await safe_q_answer(update.callback_query)
+        except Exception:
+            pass
+        return
+
     global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
     q = update.callback_query
     data = q.data
@@ -1197,10 +1229,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== Доп. кнопки ИИ =====
+    if data == "ai_image_edit":
+        ai_state_set(uid, mode="confirm_image", await_until=(now + timedelta(minutes=5)))
+        await safe_send_message(
+            approval_bot, chat_id=_approval_chat_id(),
+            text="🖼 Что делаем с медиа?",
+            reply_markup=_image_confirm_keyboard_for_state()
+        )
+        return
+
+    if data == "ai_hashtags_suggest":
+        base_text = (post_data.get("text_en") or "").strip()
+        tags: List[str] = []
+        warn_note = ""
+        try:
+            if hasattr(ai_client, "ai_suggest_hashtags"):
+                tags = ai_client.ai_suggest_hashtags(base_text) or []
+            else:
+                warn_note = " (локальный подбор)"
+                # fallback: берём базовые и вычищаем
+                tags = [t for t in MY_HASHTAGS_STR.split() if t]
+        except Exception as e:
+            warn_note = f" (ошибка подбора: {e})"
+            tags = [t for t in MY_HASHTAGS_STR.split() if t]
+        post_data["ai_hashtags"] = tags
+        post_data["user_tags_override"] = False
+        await safe_send_message(
+            approval_bot, chat_id=_approval_chat_id(),
+            text=f"🔖 Хэштеги обновлены{warn_note}: {' '.join(tags) if tags else '—'}"
+        )
+        await send_single_preview(post_data.get("text_en") or "", tags, header="Предпросмотр (теги обновлены)")
+        return
+
     # ===== ЭТАП 2 (КАРТИНКА): генерация/загрузка/пропуск =====
     if data == "ai_img_gen":
         topic = ai_get_last_topic(uid) or (post_data.get("text_en") or "")[:200]
-        warn_img, filename = await _generate_ai_image_explicit(topic)
+        warn_img, _filename = await _generate_ai_image_explicit(topic)
         header = "Предпросмотр (текст согласован; изображение сгенерировано)"
         if warn_img:
             header += f" — {warn_img}"
@@ -1264,6 +1329,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Ввод сообщений
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_approved_user(update):
+        return
+
     global last_button_pressed_at, manual_expected_until, awaiting_hashtags_until
     uid = update.effective_user.id
     now = datetime.now(TZ)
@@ -1327,7 +1395,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await_until = st.get("await_until")
         if await_until and now <= await_until:
             new_text = (update.message.text or update.message.caption or "").strip()
-            log_ai.info("AI|text.edit.recv | uid=%s | len=%s", uid, len(new_text))
+            log_ai.info("AI|text.edit.recv | uid=%s | len=%s | head=%r", uid, len(new_text), (new_text or "")[:120])
             if new_text:
                 post_data["text_en"] = new_text
                 ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
@@ -1559,4 +1627,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
