@@ -1285,32 +1285,40 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
 
-            # Определяем, пришло ли из чата согласования (поддержка id и @username)
-            aid = _approval_chat_id()
-            from_approval_chat = False
-            try:
-                if isinstance(aid, int):
-                    from_approval_chat = (chat.id == aid)
-                else:
-                    uname = getattr(chat, "username", None)
-                    from_approval_chat = (uname and ("@" + uname.lower()) == str(aid).lower())
-            except Exception:
-                from_approval_chat = False
+# Определяем, пришло ли из чата согласования (поддержка id и @username, устойчиво для форумов)
+aid = _approval_chat_id()
+from_approval_chat = False
 
-            # В личке и в чате согласования — принимаем всё.
-            # В остальных чатах — только если адресовано боту (реплай/упоминание).
-            if in_private or from_approval_chat or _message_addresses_bot(update):
-                return await handle_ai_input(update, context)
-            else:
-                return
+try:
+    if isinstance(aid, int) and aid != 0:
+        # В ENV задан числовой chat_id (-100...)
+        from_approval_chat = (update.effective_chat.id == aid)
+    elif isinstance(aid, str) and aid.strip().startswith("@"):
+        # В ENV задан @username — пробуем получить его реальный id
+        resolved_id = None
+        try:
+            chat_obj = await approval_bot.get_chat(aid.strip())
+            resolved_id = getattr(chat_obj, "id", None)
+        except Exception:
+            resolved_id = None
+
+        if resolved_id is not None:
+            from_approval_chat = (update.effective_chat.id == resolved_id)
         else:
-            ai_state_reset(uid)
-            await safe_send_message(
-                approval_bot, chat_id=_approval_chat_id(),
-                text="⏰ Время ожидания темы истекло.",
-                reply_markup=get_start_menu()
-            )
-            return
+            # Фолбэк: прямое сравнение по username, если у чата он есть
+            uname = getattr(update.effective_chat, "username", None)
+            from_approval_chat = bool(uname and ("@" + uname.lower()) == aid.strip().lower())
+    else:
+        from_approval_chat = False
+except Exception:
+    from_approval_chat = False
+
+# В личке и в чате согласования — принимаем всё.
+# В остальных чатах — только если адресовано боту (реплай/упоминание).
+if in_private or from_approval_chat or _message_addresses_bot(update):
+    return await handle_ai_input(update, context)
+else:
+    return
     # ===== Этап правки текста =====
     if st.get("mode") == "await_text_edit":
         await_until = st.get("await_until")
