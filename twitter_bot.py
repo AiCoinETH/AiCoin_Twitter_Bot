@@ -1274,40 +1274,38 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = ai_state_get(uid)
 
-# === ИИ-режим: ожидание темы или дом-экран ===
-if st.get("mode") in {"ai_home", "await_topic"}:
-    await_until = st.get("await_until")
-    if (await_until is None) or (now <= await_until):
-        chat = update.effective_chat
-        in_private = (getattr(chat, "type", "") == "private")
+    # === ИИ-режим: ожидание темы или дом-экран ===
+    if st.get("mode") in {"ai_home", "await_topic"}:
+        await_until = st.get("await_until")
+        if (await_until is None) or (now <= await_until):
+            chat = update.effective_chat
+            in_private = (getattr(chat, "type", "") == "private")
 
-        # Определяем, пришло ли из чата согласования (поддержка id и @username)
-        aid = _approval_chat_id()
-        from_approval_chat = False
-        try:
-            if isinstance(aid, int):
-                from_approval_chat = (chat.id == aid)
-            else:
-                uname = getattr(chat, "username", None)
-                if uname:
-                    from_approval_chat = ("@" + uname.lower()) == str(aid).lower()
-        except Exception:
+            aid = _approval_chat_id()
             from_approval_chat = False
+            try:
+                if isinstance(aid, int):
+                    from_approval_chat = (chat.id == aid)
+                else:
+                    uname = getattr(chat, "username", None)
+                    if uname:
+                        from_approval_chat = ("@" + uname.lower()) == str(aid).lower()
+            except Exception:
+                from_approval_chat = False
 
-        # В личке и в чате согласования — принимаем всё.
-        # В остальных чатах — только если адресовано боту (реплай/упоминание).
-        if in_private or from_approval_chat or _message_addresses_bot(update):
-            return await handle_ai_input(update, context)
+            if in_private or from_approval_chat or _message_addresses_bot(update):
+                return await handle_ai_input(update, context)
+            else:
+                return
         else:
+            ai_state_reset(uid)
+            await safe_send_message(
+                approval_bot, chat_id=_approval_chat_id(),
+                text="⏰ Время ожидания темы истекло.",
+                reply_markup=get_start_menu()
+            )
             return
-    else:
-        ai_state_reset(uid)
-        await safe_send_message(
-            approval_bot, chat_id=_approval_chat_id(),
-            text="⏰ Время ожидания темы истекло.",
-            reply_markup=get_start_menu()
-        )
-        return
+
     # ===== Этап правки текста =====
     if st.get("mode") == "await_text_edit":
         await_until = st.get("await_until")
