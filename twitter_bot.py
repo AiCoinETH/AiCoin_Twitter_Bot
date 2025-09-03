@@ -742,15 +742,39 @@ def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
     return build_tg_final(text_en, for_photo_caption=False)
 
 # -----------------------------------------------------------------------------
-# GitHub helpers
+# GitHub helpers (ИСПРАВЛЕНО: выбираем расширение по фактическим байтам)
 # -----------------------------------------------------------------------------
-def upload_image_to_github(image_path, filename):
+def _sniff_ext_from_bytes(head: bytes, fallback: str = ".jpg") -> str:
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    # GIF87a/89a
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    # WebP: RIFF....WEBP
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    # MP4/ISOBMFF: ....ftyp
+    if head[4:8] == b"ftyp":
+        return ".mp4"
+    return fallback
+
+def upload_image_to_github(image_path, filename=None):
     if not github_repo:
         log.error("GitHub repo is not configured")
         return None
     try:
         with open(image_path, "rb") as img_file:
-            content_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+            data = img_file.read()
+        sniff_ext = _sniff_ext_from_bytes(data[:16], fallback=os.path.splitext(image_path)[1].lower() or ".jpg")
+        if filename is None:
+            filename = f"{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{sniff_ext}"
+        elif not filename.lower().endswith(sniff_ext):
+            # подменим расширение на корректное
+            root, _ = os.path.splitext(filename)
+            filename = root + sniff_ext
+        content_b64 = base64.b64encode(data).decode("utf-8")
         github_repo.create_file(
             f"{GITHUB_IMAGE_PATH}/{filename}",
             "upload image for post",
@@ -772,7 +796,7 @@ def delete_image_from_github(filename):
         log.error(f"Ошибка удаления файла на GitHub: {e}")
 
 # -----------------------------------------------------------------------------
-# Загрузка медиа (ИСПРАВЛЕНО: корректные расширения вместо .bin) + ЛОГИ
+# Загрузка медиа (ИСПРАВЛЕНО: корректные расширения вместо .bin) + ЛОГИ/СНИФФИНГ
 # -----------------------------------------------------------------------------
 def _guess_ext_from_headers_and_url(content_type: str, url_or_path: str, default_img_ext: str = ".jpg") -> str:
     ct = (content_type or "").lower()
@@ -783,11 +807,10 @@ def _guess_ext_from_headers_and_url(content_type: str, url_or_path: str, default
         return ".png"
     if "image/jpeg" in ct or up.endswith((".jpg", ".jpeg")):
         return ".jpg"
-    # иногда GitHub raw не отдаёт корректный CT → дефолт по URL
-    if up.endswith(".png"):
-        return ".png"
-    if up.endswith((".jpg", ".jpeg")):
-        return ".jpg"
+    if "image/gif" in ct or up.endswith(".gif"):
+        return ".gif"
+    if "image/webp" in ct or up.endswith(".webp"):
+        return ".webp"
     return default_img_ext
 
 def _log_media_file(path: str, origin: str):
@@ -805,20 +828,34 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
     if is_telegram:
         tg_file = await bot.get_file(path_or_file_id)
         fp = (tg_file.file_path or "")
-        ext = _guess_ext_from_headers_and_url("", fp, default_img_ext=".jpg")
-        log.info("MEDIA|tg.get_file | file_id=%s | file_path=%s | ext=%s", path_or_file_id, fp, ext)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-        await tg_file.download_to_drive(tmp.name)
-        _log_media_file(tmp.name, origin="telegram")
-        return tmp.name
+        ext_guess = _guess_ext_from_headers_and_url("", fp, default_img_ext=".jpg")
+        log.info("MEDIA|tg.get_file | file_id=%s | file_path=%s | ext_guess=%s", path_or_file_id, fp, ext_guess)
+        tmp_path = tempfile.NamedTemporaryFile(delete=False, suffix=ext_guess).name
+        await tg_file.download_to_drive(tmp_path)
+        # дополнительно «понюхаем» первые байты и при необходимости переименуем
+        try:
+            with open(tmp_path, "rb") as f:
+                head = f.read(16)
+            ext_sniff = _sniff_ext_from_bytes(head, fallback=ext_guess)
+            if ext_sniff != ext_guess:
+                new_path = tempfile.NamedTemporaryFile(delete=False, suffix=ext_sniff).name
+                os.replace(tmp_path, new_path)
+                tmp_path = new_path
+        except Exception as _e:
+            pass
+        _log_media_file(tmp_path, origin="telegram")
+        return tmp_path
     else:
         log.info("MEDIA|url.fetch | url=%s", path_or_file_id)
         r = requests.get(path_or_file_id, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
         r.raise_for_status()
         ctype = r.headers.get("Content-Type", "")
-        ext = _guess_ext_from_headers_and_url(ctype, path_or_file_id, default_img_ext=".jpg")
-        log.info("MEDIA|url.headers | content-type=%s | ext=%s", ctype, ext)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        ext_guess = _guess_ext_from_headers_and_url(ctype, path_or_file_id, default_img_ext=".jpg")
+        # используем сниффинг по контенту
+        head = r.content[:16]
+        ext_sniff = _sniff_ext_from_bytes(head, fallback=ext_guess)
+        log.info("MEDIA|url.headers | content-type=%s | ext_guess=%s | ext_sniff=%s", ctype, ext_guess, ext_sniff)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext_sniff)
         tmp.write(r.content); tmp.close()
         _log_media_file(tmp.name, origin="url")
         return tmp.name
@@ -897,26 +934,28 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.warning(f"save_post_to_history: возможно дубликат/ошибка вставки: {e}")
 
 # -----------------------------------------------------------------------------
-# Публикация (ИСПРАВЛЕНО: стабильные суффиксы, защита контента отключена на сообщениях)
+# Публикация (исправлено: корректные расширения, бинарь, protect_content=False)
 # -----------------------------------------------------------------------------
-def _download_to_temp_file(url: str, suffix: str = ".jpg") -> Optional[str]:
+def _download_to_temp_file(url: str, default_suffix: str = ".jpg") -> Optional[str]:
     """
-    Скачивание для X (Twitter). Дефолт — изображение .jpg.
-    Пишем подробные логи, фиксируем конечный размер.
+    Скачивает медиа по URL во временный файл с ПРАВИЛЬНЫМ расширением.
+    Определяем расширение по Content-Type и магическим байтам; логируем всё.
     """
     try:
-        log.info("X|media.fetch | url=%s | requested_suffix=%s", url, suffix)
+        log.info("X|media.fetch | url=%s", url)
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
         r.raise_for_status()
-        if suffix.lower() not in (".jpg", ".jpeg", ".png", ".mp4"):
-            suffix = ".jpg"
+        ctype = r.headers.get("Content-Type", "")
+        ext_guess = _guess_ext_from_headers_and_url(ctype, url, default_img_ext=default_suffix)
+        ext_sniff = _sniff_ext_from_bytes(r.content[:16], fallback=ext_guess)
+        suffix = ext_sniff or ext_guess or default_suffix
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(r.content); tmp.close()
         try:
             size = os.path.getsize(tmp.name)
         except Exception:
             size = -1
-        log.info("X|media.saved | file=%s | size=%s", tmp.name, size)
+        log.info("X|media.saved | file=%s | size=%s | ctype=%s | ext=%s", tmp.name, size, ctype, suffix)
         return tmp.name
     except Exception as e:
         log.warning(f"X|media.fetch.fail | url={url} | err={e}")
@@ -928,7 +967,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         msrc = post_data.get("media_src", "tg")
         mref = post_data.get("media_ref")
 
-        # контроль длины перед финальной сборкой
+        # подгонка к желаемой длине (если задана)
         text = adjust_text_to_target_length(text or "")
         final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
         log.info("TG|publish.start | kind=%s | src=%s | has_text=%s | text_len=%s",
@@ -947,7 +986,16 @@ async def publish_post_to_telegram(text: str | None) -> bool:
             log.info("TG|send_message.ok | msg_id=%s", getattr(msg, "message_id", None))
             return True
 
-        local_path = await download_to_temp_local(mref, is_telegram=(msrc == "tg"), bot=approval_bot)
+        # скачиваем (telegram -> бинарь, url -> корректный суффикс)
+        if msrc == "tg":
+            local_path = await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
+        else:
+            local_path = _download_to_temp_file(mref, default_suffix=(".mp4" if mk == "video" else ".jpg"))
+
+        if not local_path or not os.path.exists(local_path):
+            await send_with_start_button(_approval_chat_id(), "❌ Telegram: не удалось подготовить медиа (скачивание).")
+            return False
+
         post_data["media_local_path"] = local_path
         try:
             size = os.path.getsize(local_path)
@@ -1003,18 +1051,21 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
         media_ids = None
         local_path = None
 
-        # контроль длины до сборки хвоста (доп. диагностика)
+        # мягкая подгонка до нужной длины (если задана)
         final_text_ready = adjust_text_to_target_length(final_text_ready or "")
         log.info("X|publish.start | kind=%s | src=%s | base_text_len=%s", mk, msrc, len(final_text_ready))
 
         if mk in ("image", "video") and mref:
             if msrc == "url":
-                suf = ".mp4" if mk == "video" else ".jpg"
-                local_path = _download_to_temp_file(mref, suffix=suf)
+                local_path = _download_to_temp_file(mref, default_suffix=(".mp4" if mk == "video" else ".jpg"))
                 if not local_path:
                     raise RuntimeError("Не удалось получить медиа из URL для X")
             else:
                 local_path = await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
+
+            if not local_path or not os.path.exists(local_path):
+                raise RuntimeError("Локальный файл медиа не получен")
+
             post_data["media_local_path"] = local_path
             try:
                 size = os.path.getsize(local_path)
@@ -1107,7 +1158,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
     try:
         if mk == "video" and mref:
             local = (await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)) if (msrc == "tg") \
-                    else _download_to_temp_file(mref, suffix=".mp4")
+                    else _download_to_temp_file(mref, default_suffix=".mp4")
             if local:
                 try:
                     size = os.path.getsize(local)
@@ -1139,7 +1190,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
 
         elif mk == "image" and mref:
             local = (await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)) if (msrc == "tg") \
-                    else _download_to_temp_file(mref, suffix=".jpg")
+                    else _download_to_temp_file(mref, default_suffix=".jpg")
             if local:
                 try:
                     size = os.path.getsize(local)
@@ -1188,7 +1239,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
         )
 
 # -----------------------------------------------------------------------------
-# Генерация ИИ-изображения (по явному согласию)
+# Генерация ИИ-изображения (по явному согласию) — ИСПРАВЛЕНО: без жёсткого .jpg
 # -----------------------------------------------------------------------------
 async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Optional[str]]:
     if not hasattr(ai_client, "ai_generate_image"):
@@ -1199,8 +1250,9 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
         if not img_path or not os.path.exists(img_path):
             log_ai.info("AI|image.fail | генерация не вернула файл.")
             return (warn_img or "⚠️ Не удалось сгенерировать изображение ИИ."), None
-        filename = f"{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
-        raw_url = upload_image_to_github(img_path, filename)
+
+        # Загрузка на GitHub с автоопределением расширения
+        raw_url = upload_image_to_github(img_path, filename=None)
         try:
             os.remove(img_path)
         except Exception:
@@ -1208,11 +1260,12 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
         if not raw_url:
             log_ai.info("AI|image.fail | upload to GitHub failed.")
             return (warn_img or "⚠️ Upload image failed."), None
+
         post_data["media_kind"] = "image"
         post_data["media_src"] = "url"
         post_data["media_ref"] = raw_url
         log_ai.info("AI|image.ok | %s", raw_url)
-        return (warn_img or ""), filename
+        return (warn_img or ""), os.path.basename(raw_url)
     except Exception as e:
         log_ai.warning("AI|image.exception: %s", e)
         return "⚠️ Ошибка генерации изображения.", None
@@ -1750,6 +1803,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
+
+    # Мягкая подгонка длины перед сборкой хвостов
+    base_text_en = adjust_text_to_target_length(base_text_en)
+
     twitter_final_text = (
         build_tweet_user_hashtags_275(base_text_en, post_data.get("ai_hashtags") or [])
         if post_data.get("user_tags_override") else
