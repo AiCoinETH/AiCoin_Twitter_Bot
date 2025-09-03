@@ -1,366 +1,276 @@
-# -*- coding: utf-8 -*-
-"""
-ai_client.py — генерация текста/картинок для twitter_bot.py
-
-Приоритет:
-1) Gemini (новый SDK google-genai) — если установлен и есть ключ (GEMINI_API_KEY).
-2) Старый пакет google-generativeai — если установлен.
-3) Локальный фолбэк — всегда.
-
-Функции:
-- ai_generate_text(topic) -> (text: str, warn: str|None)
-- ai_generate_image(topic) -> (image_path: str, warn: str|None)
-- ai_suggest_hashtags(text) -> List[str]
-
-Длина текста:
-- По умолчанию TARGET_CHAR_LEN=757 и TARGET_CHAR_TOL=20 (можно переопределить через ENV).
-- Также можно задать в теме: "len=757" / "len:757" / "#len=757".
-"""
-
-from __future__ import annotations
+# twitter_bot.py
 import os
-import re
 import io
+import re
+import sys
 import time
-import uuid
-import base64
-import random
+import json
+import hashlib
 import logging
 import tempfile
-from typing import Tuple, List, Optional
+import mimetypes
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-log = logging.getLogger("ai_client")
-if not log.handlers:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+import requests
+from PIL import Image
 
-# -----------------------------------------------------------------------------
-# Конфиг длины: по умолчанию 757 ± 20
-# -----------------------------------------------------------------------------
-_LEN_RE = re.compile(r"(?:^|\b)(?:len\s*[:=]\s*|#len\s*=\s*)(\d{2,5})\b", re.I)
+import tweepy
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
-def _get_target_len_cfg() -> Tuple[int, int]:
-    def _int(env, default):
-        try:
-            return int(os.getenv(env, str(default)) or str(default))
-        except Exception:
-            return default
-    # Значения по умолчанию: 757 символов ± 20
-    return max(0, _int("TARGET_CHAR_LEN", 757)), max(0, _int("TARGET_CHAR_TOL", 20))
+import ai_client  # наш модуль выше
 
-def _extract_len_from_topic(topic: str) -> Tuple[str, Optional[int]]:
-    m = _LEN_RE.search(topic or "")
-    desired = None
-    if m:
-        try:
-            desired = int(m.group(1))
-        except Exception:
-            desired = None
-        topic = _LEN_RE.sub("", topic).strip()
-    return topic, desired
+# --- ЛОГГЕРЫ ---
+log = logging.getLogger("twitter_bot")
+logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 
-# -----------------------------------------------------------------------------
-# SDK detection / ключи
-# -----------------------------------------------------------------------------
-# Приоритет ключей: GEMINI_API_KEY -> GOOGLE_API_KEY -> GOOGLE_GENAI_API_KEY
-_API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
-    or os.getenv("GOOGLE_GENAI_API_KEY")
-)
+# --- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ---
+STATE = {
+    "last_text": None,
+    "last_image_url": None,
+    "last_image_bytes": None,
+}
 
-# Новый SDK: google-genai
-_GENAI_NEW = False
-try:
-    from google import genai as genai_new
-    from google.genai import types as genai_types  # может пригодиться, не обязателен
-    _GENAI_NEW = True
-except Exception as _e:
-    log.info("google-genai not available: %s", _e)
+# --- ТWITTER AUTH ---
+def _twitter_client():
+    api_key = os.getenv("TWITTER_API_KEY")
+    api_secret = os.getenv("TWITTER_API_SECRET")
+    access_token = os.getenv("TWITTER_ACCESS_TOKEN")
+    access_secret = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
+    auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
+    return tweepy.API(auth)
 
-# Старый SDK: google-generativeai (fallback)
-_GENAI_OLD = False
-try:
-    import google.generativeai as genai_old
-    _GENAI_OLD = True
-except Exception as _e:
-    log.info("google-generativeai not available: %s", _e)
+# --- УТИЛИТЫ ИЗОБРАЖЕНИЙ ---
 
-_client_new = None
-if _GENAI_NEW and _API_KEY:
+SIGS = {
+    b"\x89PNG\r\n\x1a\n": "image/png",
+    b"\xff\xd8\xff": "image/jpeg",
+    b"GIF87a": "image/gif",
+    b"GIF89a": "image/gif",
+    b"RIFF": "image/webp",  # с доп.проверкой "WEBP" на байтах 8:12
+}
+
+def _looks_like_image(b: bytes) -> bool:
+    if not b or len(b) < 64:
+        return False
+    for sig, ctype in SIGS.items():
+        if b.startswith(sig):
+            return True
+    if b.startswith(b"RIFF") and b[8:12] == b"WEBP":
+        return True
+    return False
+
+def _pil_probe(b: bytes) -> Tuple[bool, Optional[str], Optional[Tuple[int,int]]]:
     try:
-        _client_new = genai_new.Client(api_key=_API_KEY)
-        log.info("Gemini (google-genai) client initialized (key from env).")
-    except Exception as e:
-        log.warning("Failed to init google-genai client: %s", e)
-        _client_new = None
+        with Image.open(io.BytesIO(b)) as im:
+            im.verify()
+        with Image.open(io.BytesIO(b)) as im2:
+            return True, Image.MIME.get(im2.format), im2.size
+    except Exception:
+        return False, None, None
 
-if _GENAI_OLD and _API_KEY:
-    try:
-        genai_old.configure(api_key=_API_KEY)
-        log.info("Gemini (google-generativeai) configured.")
-    except Exception as e:
-        log.warning("Failed to configure google-generativeai: %s", e)
-
-# -----------------------------------------------------------------------------
-# Локальный синтетический генератор текста (фолбэк)
-# -----------------------------------------------------------------------------
-_SENTENCE_BANK = [
-    "Here’s a quick take on the topic.",
-    "Let’s keep it concise and actionable.",
-    "Key point:",
-    "What this means in practice:",
-    "In short,",
-    "The upside:",
-    "The downside:",
-    "A practical example:",
-    "Pro tip:",
-    "Bottom line:",
-    "TL;DR:",
-]
-
-def _local_synthesize(topic: str, target_len: int, tol: int) -> Tuple[str, Optional[str]]:
-    random.seed(hash((topic, target_len, tol, int(time.time() // 60))) & 0xFFFFFFFF)
-    bullets = [
-        f"{topic} matters because it aligns incentives and improves measurable outcomes.",
-        f"The trend around {topic} is shifting from hype to practical delivery.",
-        "Focus on fundamentals, track real metrics, and iterate quickly.",
-        "Avoid over-engineering. Ship small increments and learn fast.",
-        "Define a metric to move in 7 days and report progress.",
-    ]
-    spice = random.choice([
-        "No magic — just compounding small wins.",
-        "Data first, narrative later.",
-        "Edge comes from consistency.",
-        "Simple beats complex when stakes are high.",
-        "If it’s not measured, it didn’t happen.",
-    ])
-    text = topic.strip().rstrip(".") + ": " + bullets[0]
-    for b in bullets[1:]:
-        text += " " + random.choice(_SENTENCE_BANK) + " " + b
-    text += " " + spice
-
-    if target_len > 0:
-        low, high = max(0, target_len - tol), target_len + tol
-        if len(text) < low:
-            filler = (" Keep it human-centric, verify with real users, and document the path."
-                      " Small experiments reduce risk and reveal compounding effects over time.")
-            while len(text) + len(filler) <= high:
-                text += filler
-            if len(text) < low:
-                text += " Iterate, measure, improve."
-        elif len(text) > high:
-            text = text[:high].rstrip()
-        warn = None if (low <= len(text) <= high) else f"target_len={target_len}±{tol}, got={len(text)}"
-        return text.strip(), warn
-    return text.strip(), None
-
-# -----------------------------------------------------------------------------
-# Текст: Gemini -> фолбэк
-# -----------------------------------------------------------------------------
-def _gemini_generate_text(topic: str, target_len: int, tol: int) -> Tuple[str, Optional[str]]:
-    """
-    Новый SDK: client.models.generate_content(model="gemini-2.5-flash", contents="...").
-    Старый SDK: GenerativeModel(...).generate_content(prompt).
-    """
-    # Если цель не задана, всё равно просим близи 757±20 по умолчанию
-    if target_len <= 0:
-        target_len, tol = _get_target_len_cfg()
-
-    prompt = (
-        f"Write an English social-media post about: {topic!s}.\n"
-        f"Requirements:\n"
-        f" - Target length: around {target_len} characters (±{tol}).\n"
-        f" - Plain text only (no markdown, no hashtags, no links).\n"
-        f" - 1–3 short paragraphs, energetic but factual.\n"
-        f"Return ONLY the post text."
-    ).strip()
-
-    # Новый SDK
-    if _client_new:
+def robust_fetch_image(url: str, timeout: int = 20, max_tries: int = 3) -> Optional[bytes]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AiCoinBot/1.0)",
+        "Accept": "image/*,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+    }
+    last_exc = None
+    for i in range(max_tries):
         try:
-            resp = _client_new.models.generate_content(
-                model=os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"),
-                contents=prompt,
-            )
-            text = (getattr(resp, "text", None) or "").strip()
-            if text:
-                return text, None
-            # Попытка собрать из частей
-            try:
-                parts = resp.candidates[0].content.parts
-                buf = []
-                for p in parts:
-                    if getattr(p, "text", None):
-                        buf.append(p.text)
-                text = " ".join(buf).strip()
-                if text:
-                    return text, None
-            except Exception:
-                pass
-            return "", "empty_text_from_gemini"
+            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            if r.status_code != 200:
+                time.sleep(0.8)
+                continue
+            b = r.content or b""
+            # Бывает, что raw.githubusercontent.com отдаёт text/plain (120 байт) до прогрева.
+            if not _looks_like_image(b):
+                ok, mime, sz = _pil_probe(b)
+                if not ok:
+                    time.sleep(0.8)
+                    continue
+            return b
         except Exception as e:
-            log.warning("Gemini(new SDK) text fail: %s", e)
+            last_exc = e
+            time.sleep(0.8)
+    log.warning("Failed to fetch image from url=%s err=%s", url, last_exc)
+    return None
 
-    # Старый SDK
-    if _GENAI_OLD and _API_KEY:
+def save_temp_image(image_bytes: bytes, suffix: str = ".png") -> str:
+    fd, path = tempfile.mkstemp(prefix="aicoin_", suffix=suffix)
+    os.close(fd)
+    with open(path, "wb") as f:
+        f.write(image_bytes)
+    return path
+
+async def send_photo_safely(bot, chat_id: int, *, raw_bytes: Optional[bytes] = None, url: Optional[str] = None, caption: Optional[str] = None):
+    """
+    Сначала пытаемся использовать байты, если нет — пытаемся скачать URL, потом шлём файл.
+    """
+    b = raw_bytes
+    if not b and url:
+        b = robust_fetch_image(url)
+    if not b:
+        # фолбэк — текстом
+        await bot.send_message(chat_id, text=f"{caption or ''}\n\n(image_fallback_local)".strip())
+        return
+
+    ok, mime, sz = _pil_probe(b)
+    if not ok:
+        # последняя попытка — дать PIL декодировать и пересохранить как PNG
         try:
-            model_name = os.getenv("GEMINI_TEXT_MODEL_OLD", "gemini-1.5-flash")
-            model = genai_old.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
-            text = (getattr(resp, "text", None) or "").strip()
-            if text:
-                return text, None
-            return "", "empty_text_from_old_sdk"
-        except Exception as e:
-            log.warning("Gemini(old SDK) text fail: %s", e)
-
-    # Фолбэк локальный
-    return _local_synthesize(topic, target_len, tol)
-
-def ai_generate_text(topic: str) -> Tuple[str, Optional[str]]:
-    topic = (topic or "").strip()
-    topic, inline_len = _extract_len_from_topic(topic)
-    env_len, env_tol = _get_target_len_cfg()
-    target_len = inline_len or env_len
-    tol = env_tol
-
-    if not topic:
-        return "Draft post.", "empty_topic_autofill"
-
-    text, warn = _gemini_generate_text(topic, target_len, tol)
-
-    # Мягкая доводка до коридора (757±20 по умолчанию, либо inline/env)
-    if target_len > 0 and text:
-        low, high = max(0, target_len - tol), target_len + tol
-        if len(text) < low:
-            pad = " Iterate, measure, improve."
-            while len(text) + len(pad) <= high:
-                text += pad
-        elif len(text) > high:
-            text = text[:high].rstrip()
-        if not (low <= len(text) <= high):
-            warn = (warn or "") + (f" (post={len(text)} chars, target {target_len}±{tol})")
-    return text, (warn or None)
-
-# -----------------------------------------------------------------------------
-# Изображение: Gemini (image preview) -> локальный фолбэк
-# -----------------------------------------------------------------------------
-_TRY_PIL = True
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception:
-    _TRY_PIL = False
-
-_RED_DOT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAHklEQVR4nO3BMQEAAADCoPVPbQhPoAAAAAAAAAAAwE8G1gAAeQy1NwAAAABJRU5ErkJggg=="
-)
-
-def _save_bytes_to_temp_png(data: bytes) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    with open(tmp.name, "wb") as f:
-        f.write(data)
-    return tmp.name
-
-def _local_placeholder_png(topic: str) -> str:
-    if _TRY_PIL:
-        try:
-            W, H = 1200, 675
-            img = Image.new("RGB", (W, H), (24, 26, 32))
-            d = ImageDraw.Draw(img)
-            for y in range(H):
-                shade = int(24 + (y / H) * 56)
-                d.line([(0, y), (W, y)], fill=(shade, shade, shade))
-            d.rectangle([(8, 8), (W-8, H-8)], outline=(90, 180, 255), width=3)
-            title = (topic or "AiCoin").strip()[:160]
-            try:
-                font = ImageFont.truetype("DejaVuSans-Bold.ttf", 46)
-                font2 = ImageFont.truetype("DejaVuSans.ttf", 28)
-            except Exception:
-                font = ImageFont.load_default(); font2 = ImageFont.load_default()
-            tw, th = d.textsize(title, font=font)
-            d.text(((W - tw)//2, (H - th)//2 - 20), title, fill=(240, 240, 240), font=font)
-            sw, sh = d.textsize("placeholder", font=font2)
-            d.text(((W - sw)//2, (H - sh)//2 + 36), "placeholder", fill=(160, 200, 255), font=font2)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            img.save(tmp.name, format="PNG"); tmp.close()
-            return tmp.name
+            with Image.open(io.BytesIO(b)) as im:
+                bio = io.BytesIO()
+                im.convert("RGB").save(bio, format="PNG")
+                b = bio.getvalue()
         except Exception:
-            pass
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    with open(tmp.name, "wb") as f:
-        f.write(_RED_DOT_PNG)
-    return tmp.name
+            await bot.send_message(chat_id, text=f"{caption or ''}\n\n(image_fallback_local)".strip())
+            return
 
-def _gemini_generate_image(topic: str) -> Tuple[str, Optional[str]]:
-    """
-    Новый SDK: client.models.generate_content(model="gemini-2.5-flash-image-preview", contents=[prompt]).
-    Возвращаем первый part с inline_data (bytes/base64).
-    """
-    prompt = (
-        f"Create a clean, brand-safe illustration related to: {topic}. "
-        f"Neutral background, no text overlay, suitable for social post. "
-        f"Prefer 16:9 composition."
+    filename = "preview.png"
+    await bot.send_photo(chat_id, photo=InputFile(io.BytesIO(b), filename), caption=caption)
+
+# --- UI / TELEGRAM ---
+
+APPROVAL_CHAT_ID = int(os.getenv("TELEGRAM_APPROVAL_CHAT_ID", "0"))
+BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+
+def _kb_main():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("ПОСТ!", callback_data="post_both")],
+            [InlineKeyboardButton("Пост в Twitter", callback_data="post_twitter"),
+             InlineKeyboardButton("Пост в Telegram", callback_data="post_telegram")],
+            [InlineKeyboardButton("✏️ Править текст", callback_data="ai_text_edit"),
+             InlineKeyboardButton("🖼️ Изменить медиа", callback_data="ai_image_edit")],
+        ]
     )
 
-    if _client_new:
-        try:
-            resp = _client_new.models.generate_content(
-                model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image-preview"),
-                contents=[prompt],
-            )
-            try:
-                parts = resp.candidates[0].content.parts
-                for p in parts:
-                    if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
-                        data = p.inline_data.data
-                        if isinstance(data, str):
-                            data = base64.b64decode(data)
-                        return _save_bytes_to_temp_png(data), None
-            except Exception as pe:
-                log.warning("Gemini image parse parts failed: %s", pe)
-            return "", "empty_image_from_gemini"
-        except Exception as e:
-            log.warning("Gemini(new SDK) image fail: %s", e)
+# -- Генерация текста
+async def on_ai_generate_text(app, chat_id: int, topic: str):
+    text = ai_client.generate_text_for_topic(topic)
+    STATE["last_text"] = text
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Текст ок", callback_data="ai_text_ok"),
+             InlineKeyboardButton("🔁 Ещё вариант", callback_data="ai_text_regen")],
+            [InlineKeyboardButton("✏️ Править текст", callback_data="ai_text_edit")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")],
+        ]
+    )
+    await app.bot.send_message(
+        chat_id,
+        text=f"ИИ сгенерировал текст\n\n{text}\n\nWebsite | Twitter X\n\nПодходит ли текст?",
+        reply_markup=kb,
+        disable_web_page_preview=False,
+    )
 
-    # Старый SDK не генерит изображение напрямую — фолбэк локальный
-    return _local_placeholder_png(topic), "image_fallback_local"
+# -- Генерация картинки
+async def on_ai_generate_image(app, chat_id: int, topic: str):
+    gen = ai_client.generate_image_for_topic(topic)
+    STATE["last_image_url"] = gen.url
+    STATE["last_image_bytes"] = gen.png_bytes
+    await send_photo_safely(app.bot, chat_id, raw_bytes=gen.png_bytes, url=gen.url, caption=None)
 
-def ai_generate_image(topic: str) -> Tuple[str, Optional[str]]:
-    path, warn = _gemini_generate_image(topic)
-    if not path:
-        path = _local_placeholder_png(topic)
-        warn = (warn or "image_fallback_local")
-    return path, warn
+# --- ПУБЛИКАЦИЯ ---
+async def publish_to_twitter(text: str, image_url: Optional[str], image_bytes: Optional[bytes]) -> Tuple[bool, str]:
+    try:
+        api = _twitter_client()
+        media_path = None
+        b = image_bytes
+        if not b and image_url:
+            b = robust_fetch_image(image_url)
+        if b:
+            media_path = save_temp_image(b)
+        if media_path:
+            media = api.media_upload(media_path)
+            api.update_status(status=text, media_ids=[media.media_id_string])
+            os.remove(media_path)
+        else:
+            api.update_status(status=text)
+        return True, "OK"
+    except Exception as e:
+        log.error("TW|publish failed: %s", e)
+        return False, str(e)
 
-# -----------------------------------------------------------------------------
-# Хэштеги — локальная эвристика
-# -----------------------------------------------------------------------------
-def _tok(s: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9$#]{2,32}", s or "")
+async def publish_to_telegram(app, text: str, image_url: Optional[str], image_bytes: Optional[bytes]) -> Tuple[bool, str]:
+    try:
+        if image_url or image_bytes:
+            await send_photo_safely(app.bot, APPROVAL_CHAT_ID, raw_bytes=image_bytes, url=image_url, caption=text)
+        else:
+            await app.bot.send_message(APPROVAL_CHAT_ID, text=text)
+        return True, "OK"
+    except Exception as e:
+        log.error("TG|publish failed: %s", e)
+        return False, str(e)
 
-def ai_suggest_hashtags(text: str) -> List[str]:
-    base = ["#AiCoin", "#AI", "$Ai", "#crypto"]
-    extra = []
-    tl = (text or "").lower()
-    if "eth" in tl or "ethereum" in tl:
-        extra += ["#Ethereum"]
-    if "btc" in tl or "bitcoin" in tl:
-        extra += ["#Bitcoin"]
-    if "nft" in tl:
-        extra += ["#NFT"]
+# --- ХЕНДЛЕРЫ КНОПОК (минимум для примера) ---
 
-    for w in _tok(text)[:6]:
-        if w.lower() in ("http", "https"):
-            continue
-        if not (w.startswith("#") or w.startswith("$")):
-            w = "#" + w
-        extra.append(w)
+async def cb_ai_text_ok(update, context):
+    await update.callback_query.answer()
+    # спросим про картинку
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="ai_img_gen")],
+            [InlineKeyboardButton("📤 Загрузить свою картинку/видео", callback_data="ai_img_upload")],
+            [InlineKeyboardButton("🚫 Без изображения", callback_data="ai_img_skip")],
+            [InlineKeyboardButton("↩️ Назад к тексту", callback_data="ai_img_back_to_text")],
+        ]
+    )
+    await context.bot.send_message(APPROVAL_CHAT_ID, "🖼 Нужна картинка к посту?", reply_markup=kb)
 
-    seen, out = set(), []
-    for t in base + extra:
-        k = t.lower()
-        if k in seen:
-            continue
-        seen.add(k); out.append(t)
-    return out[:12]
+async def cb_ai_img_gen(update, context):
+    await update.callback_query.answer()
+    topic = STATE.get("last_text") or "AiCoin"
+    await on_ai_generate_image(context.application, APPROVAL_CHAT_ID, topic)
+    # показать превью с кнопками
+    await context.bot.send_message(APPROVAL_CHAT_ID, "Предпросмотр (текст согласован; изображение сгенерировано)", reply_markup=_kb_main())
+
+async def cb_post_twitter(update, context):
+    await update.callback_query.answer()
+    ok, msg = await publish_to_twitter(STATE.get("last_text") or "", STATE.get("last_image_url"), STATE.get("last_image_bytes"))
+    if not ok:
+        await context.bot.send_message(APPROVAL_CHAT_ID, "❌ Не удалось отправить в X (Twitter).")
+        await context.bot.send_message(APPROVAL_CHAT_ID, "❌ X/Twitter: ошибка загрузки. Проверь права app (Read+Write) и соответствие медиа требованиям.",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Старт воркера", url=os.getenv("TRIGGER_URL","https://example.com"))]]))
+
+async def cb_post_telegram(update, context):
+    await update.callback_query.answer()
+    ok, msg = await publish_to_telegram(context.application, STATE.get("last_text") or "", STATE.get("last_image_url"), STATE.get("last_image_bytes"))
+    if not ok:
+        await context.bot.send_message(APPROVAL_CHAT_ID, f"❌ Ошибка публикации в Telegram: {msg}")
+        await context.bot.send_message(APPROVAL_CHAT_ID, "❌ Не удалось отправить в Telegram.")
+
+# --- БАЗОВЫЙ РОУТИНГ (минимальный) ---
+async def start(update, context):
+    await context.bot.send_message(APPROVAL_CHAT_ID, "Предпросмотр (ручной режим)\nWebsite | Twitter X\n\nХэштеги: —")
+
+async def cb_ai_generate(update, context):
+    await update.callback_query.answer()
+    await context.bot.send_message(APPROVAL_CHAT_ID, "🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут.")
+
+async def on_message(update, context):
+    # считаем это темой
+    topic = (update.message.text or "").strip()
+    if not topic:
+        return
+    await on_ai_generate_text(context.application, APPROVAL_CHAT_ID, topic)
+
+def main():
+    token = BOT_TOKEN_APPROVAL or os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL") or os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(cb_ai_text_ok, pattern=r"^ai_text_ok$"))
+    app.add_handler(CallbackQueryHandler(cb_ai_img_gen, pattern=r"^ai_img_gen$"))
+    app.add_handler(CallbackQueryHandler(cb_post_twitter, pattern=r"^post_twitter$"))
+    app.add_handler(CallbackQueryHandler(cb_post_telegram, pattern=r"^post_telegram$"))
+    app.add_handler(CallbackQueryHandler(cb_ai_generate, pattern=r"^ai_generate$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    log.info("Planner module loaded")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
