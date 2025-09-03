@@ -36,10 +36,17 @@ import ai_client
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()  # DEBUG по умолчанию для детальной диагностики
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
+)
 log = logging.getLogger("twitter_bot")
 log_ai = logging.getLogger("twitter_bot.ai")
+# шум внешних библиотек — разумный уровень
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("telegram").setLevel(logging.DEBUG)
+logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
 
 # Данные о самом боте (заполняем на старте)
 BOT_ID: Optional[int] = None
@@ -281,6 +288,83 @@ def _message_addresses_bot(update: Update) -> bool:
                 if mention.lstrip("@").lower() == (BOT_USERNAME or "").lower():
                     return True
     return False
+
+# -----------------------------------------------------------------------------
+# DEBUG helpers: сводка апдейта и устойчивый резолв "это чат согласования?"
+# -----------------------------------------------------------------------------
+def _dbg_update_summary(update: Update) -> Dict[str, Any]:
+    """Компактная сводка входящего апдейта — кто, откуда, что прислал."""
+    try:
+        msg = update.message
+        chat = update.effective_chat
+        user = update.effective_user
+        text = (msg.text or msg.caption) if msg else None
+        ent = (msg.entities or []) + (msg.caption_entities or []) if msg else []
+        media = None
+        if msg:
+            if getattr(msg, "photo", None):
+                media = f"photo[{len(msg.photo)}]"
+            elif getattr(msg, "video", None):
+                media = "video"
+            elif getattr(msg, "document", None):
+                media = f"doc:{msg.document.mime_type}"
+        return {
+            "chat_id": getattr(chat, "id", None),
+            "chat_type": getattr(chat, "type", None),
+            "chat_username": getattr(chat, "username", None),
+            "from_user_id": getattr(user, "id", None),
+            "from_username": getattr(user, "username", None),
+            "has_text": bool(text),
+            "text_head": (text[:120] if text else None),
+            "entities": [getattr(e, "type", None) for e in ent] if ent else [],
+            "media": media,
+        }
+    except Exception as e:
+        return {"error": f"dbg_summary_fail:{e}"}
+
+async def _resolve_from_approval_chat(update: Update) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Возвращает (is_from_approval_chat, debug_info).
+    Учитывает, что TELEGRAM_APPROVAL_CHAT_ID может быть int(-100...) или '@username'.
+    """
+    info = {}
+    chat = update.effective_chat
+    aid = _approval_chat_id()
+    is_from = False
+    try:
+        if isinstance(aid, int) and aid != 0:
+            is_from = (chat.id == aid)
+            info["mode"] = "id"
+            info["aid"] = aid
+            info["chat_id"] = getattr(chat, "id", None)
+        elif isinstance(aid, str) and aid.strip().startswith("@"):
+            wanted = aid.strip().lower()
+            info["mode"] = "username"
+            info["aid"] = wanted
+            # пробуем явный get_chat (если username)
+            try:
+                chat_obj = await approval_bot.get_chat(wanted)
+                resolved_id = getattr(chat_obj, "id", None)
+                info["resolved_id"] = resolved_id
+                is_from = (chat.id == resolved_id) if resolved_id is not None else False
+                if resolved_id is None:
+                    # fallback: сравнение по текущему username чата
+                    uname = getattr(chat, "username", None)
+                    info["chat_username"] = uname
+                    is_from = bool(uname and ("@" + uname.lower()) == wanted)
+            except Exception as e:
+                info["resolve_error"] = str(e)
+                uname = getattr(chat, "username", None)
+                info["chat_username"] = uname
+                is_from = bool(uname and ("@" + uname.lower()) == wanted)
+        else:
+            info["mode"] = "unknown"
+            is_from = False
+    except Exception as e:
+        info["exception"] = str(e)
+        is_from = False
+    info["result"] = is_from
+    return is_from, info
 
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
@@ -1088,6 +1172,12 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CALLBACKS
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # подробный входной лог для диагностики нажатий
+    try:
+        log.debug("CBQ|in %s", _dbg_update_summary(update))
+    except Exception:
+        pass
+
     if not _is_approved_user(update):
         # Вежливо игнорируем клики неавторизованных
         try:
@@ -1341,6 +1431,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Ввод сообщений
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # подробный входной лог для диагностики входящих сообщений
+    try:
+        log.debug("MSG|in %s", _dbg_update_summary(update))
+    except Exception:
+        pass
+
     if not _is_approved_user(update):
         return
 
@@ -1359,39 +1455,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
+            # устойчивое определение источника (личка/чат согласования/упоминание)
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
+            from_approval_chat, resolve_info = await _resolve_from_approval_chat(update)
+            log.debug("MSG|resolve_approval_chat %s", resolve_info)
 
-            # Определяем, пришло ли из чата согласования (поддержка id и @username, устойчиво для форумов)
-            aid = _approval_chat_id()
-            from_approval_chat = False
-
-            try:
-                if isinstance(aid, int) and aid != 0:
-                    from_approval_chat = (chat.id == aid)
-                elif isinstance(aid, str) and aid.strip().startswith("@"):
-                    resolved_id = None
-                    try:
-                        chat_obj = await approval_bot.get_chat(aid.strip())
-                        resolved_id = getattr(chat_obj, "id", None)
-                    except Exception:
-                        resolved_id = None
-
-                    if resolved_id is not None:
-                        from_approval_chat = (chat.id == resolved_id)
-                    else:
-                        uname = getattr(chat, "username", None)
-                        from_approval_chat = bool(uname and ("@" + uname.lower()) == aid.strip().lower())
-                else:
-                    from_approval_chat = False
-            except Exception:
-                from_approval_chat = False
-
-            # В личке и в чате согласования — принимаем всё.
-            # В остальных чатах — только если адресовано боту (реплай/упоминание).
             if in_private or from_approval_chat or _message_addresses_bot(update):
+                log.debug("AI|route_to_handle_ai_input")
                 return await handle_ai_input(update, context)
             else:
+                log.debug("AI|skip_not_addressed")
                 return
         else:
             ai_state_reset(uid)
