@@ -55,14 +55,18 @@ BOT_USERNAME: Optional[str] = None
 # --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
 TELEGRAM_APPROVAL_CHAT_ID: Any = None  # может быть int (-100...) или '@username' (str)
 
-# (НОВОЕ) Разрешённый пользователь для ввода/кнопок (по желанию)
+# (ОСТАВЛЕНО ДЛЯ СОВМЕСТИМОСТИ, НО НЕ ИСПОЛЬЗУЕТСЯ ДЛЯ ИИ)
 try:
     APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0") or "0")
 except Exception:
     APPROVAL_USER_ID = 0
 
 def _is_approved_user(update: Update) -> bool:
-    """Если APPROVAL_USER_ID задан — принимаем сообщения/клики только от него."""
+    """
+    Если APPROVAL_USER_ID задан — принимаем сообщения/клики только от него.
+    ВАЖНО: логика ИИ теперь НЕ опирается на user_id, а смотрит на источник чата.
+    Эта функция используется лишь как «доп. замок» для некоторых действий по желанию.
+    """
     if not update or not getattr(update, "effective_user", None):
         return False
     if APPROVAL_USER_ID and update.effective_user and update.effective_user.id != APPROVAL_USER_ID:
@@ -237,29 +241,26 @@ manual_expected_until: Optional[datetime] = None
 ROUTE_TO_PLANNER: set[int] = set()
 awaiting_hashtags_until: Optional[datetime] = None
 
-# ---- AI state ----
-AI_STATE: Dict[int, Dict[str, Any]] = {}
+# ---- ИИ состояние (ГЛОБАЛЬНОЕ, БЕЗ ПРИВЯЗКИ К UID) ----
+AI_STATE_G: Dict[str, Any] = {"mode": "idle"}  # keys: mode, await_until, last_topic
 
-def ai_state_reset(uid: int):
-    AI_STATE[uid] = {"mode": "idle"}
-    log_ai.info("AI|state.reset | uid=%s | mode=idle", uid)
+def ai_state_reset():
+    AI_STATE_G.clear()
+    AI_STATE_G.update({"mode": "idle"})
+    log_ai.info("AI|state.reset | mode=idle")
 
-def ai_state_set(uid: int, **kwargs):
-    st = AI_STATE.get(uid, {"mode": "idle"})
-    st.update(kwargs)
-    AI_STATE[uid] = st
-    log_ai.info("AI|state.set | uid=%s | %s", uid, " ".join([f"{k}={v}" for k, v in kwargs.items()]))
+def ai_state_set(**kwargs):
+    AI_STATE_G.update(kwargs)
+    log_ai.info("AI|state.set | %s", " ".join([f"{k}={v}" for k, v in kwargs.items()]))
 
-def ai_state_get(uid: int) -> Dict[str, Any]:
-    return AI_STATE.get(uid, {"mode": "idle"})
+def ai_state_get() -> Dict[str, Any]:
+    return AI_STATE_G
 
-def ai_set_last_topic(uid: int, topic: str):
-    st = AI_STATE.get(uid, {"mode": "idle"})
-    st["last_topic"] = (topic or "").strip()
-    AI_STATE[uid] = st
+def ai_set_last_topic(topic: str):
+    AI_STATE_G["last_topic"] = (topic or "").strip()
 
-def ai_get_last_topic(uid: int) -> str:
-    return AI_STATE.get(uid, {}).get("last_topic", "").strip()
+def ai_get_last_topic() -> str:
+    return AI_STATE_G.get("last_topic", "").strip()
 
 # -----------------------------------------------------------------------------
 # Адресовано ли сообщение нашему боту (для групп/форумов)?
@@ -365,7 +366,6 @@ async def _resolve_from_approval_chat(update: Update) -> Tuple[bool, Dict[str, A
         is_from = False
     info["result"] = is_from
     return is_from, info
-
 # -----------------------------------------------------------------------------
 # КНОПКИ / МЕНЮ
 # -----------------------------------------------------------------------------
@@ -997,6 +997,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
+
 # -----------------------------------------------------------------------------
 # Генерация ИИ-изображения (по явному согласию)
 # -----------------------------------------------------------------------------
@@ -1078,12 +1079,11 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     manual_expected_until = None
 
 # -----------------------------------------------------------------------------
-# НОВОЕ: ВВОД ДЛЯ ИИ (двухэтапное согласование)
+# НОВОЕ: ВВОД ДЛЯ ИИ (без привязки к user_id)
 # -----------------------------------------------------------------------------
 async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
         return
-    uid = update.effective_user.id
     now = datetime.now(TZ)
     pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
     if pending_post.get("mode") == "placeholder":
@@ -1118,7 +1118,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_ai.info("AI|recv | chat=%s | kind=%s | len=%s | head=%r", update.effective_chat.id, kind_logged, len(raw_text), raw_text[:120])
 
     # 2) тема = текст (или последняя)
-    topic = (raw_text or "").strip() or ai_get_last_topic(uid)
+    topic = (raw_text or "").strip() or ai_get_last_topic()
     if not topic:
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
@@ -1129,7 +1129,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) генерим текст
     txt, warn_t = ai_client.ai_generate_text(topic)
     post_data["text_en"] = (txt or "").strip()
-    ai_set_last_topic(uid, topic)
+    ai_set_last_topic(topic)
 
     # сохраняем медиа, если было прислано
     post_data["media_kind"] = media_kind
@@ -1137,7 +1137,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post_data["media_ref"]  = media_ref
 
     # 4) ЭТАП 1: "Подходит ли текст?"
-    ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
+    ai_state_set(mode="confirm_text", await_until=(now + timedelta(minutes=5)))
     header = "ИИ сгенерировал текст"
     if warn_t:
         header += f" — {warn_t}"
@@ -1151,12 +1151,11 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=msg, parse_mode="HTML",
         reply_markup=ai_text_confirm_keyboard()
     )
-
 # -----------------------------------------------------------------------------
-# Планировщик — роутинг
+# Планировщик — роутинг (без привязки к user_id)
 # -----------------------------------------------------------------------------
-def _planner_active_for(uid: int) -> bool:
-    return uid in ROUTE_TO_PLANNER
+def _planner_active() -> bool:
+    return True if ROUTE_TO_PLANNER else False
 
 async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if open_planner:
@@ -1169,17 +1168,15 @@ async def _route_to_planner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 # -----------------------------------------------------------------------------
-# CALLBACKS
+# CALLBACKS (без привязки к user_id)
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подробный входной лог для диагностики нажатий
     try:
         log.debug("CBQ|in %s", _dbg_update_summary(update))
     except Exception:
         pass
 
     if not _is_approved_user(update):
-        # Вежливо игнорируем клики неавторизованных
         try:
             await safe_q_answer(update.callback_query)
         except Exception:
@@ -1189,7 +1186,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
     q = update.callback_query
     data = q.data
-    uid = update.effective_user.id
     await safe_q_answer(q)
 
     now = datetime.now(TZ)
@@ -1198,9 +1194,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    if uid in last_action_time and (now - last_action_time[uid]).seconds < 1:
+    # глобальная антидребезг-кнопок
+    if 0 in last_action_time and (now - last_action_time[0]).seconds < 1:
         return
-    last_action_time[uid] = now
+    last_action_time[0] = now
 
     # --- Планировщик ---
     planner_any = data.startswith((
@@ -1210,11 +1207,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     planner_exit = data in {"BACK_MAIN_MENU", "PLAN_DONE", "GEN_DONE"}
 
     if data == "show_day_plan" or planner_any or planner_exit:
-        ROUTE_TO_PLANNER.add(uid)
+        ROUTE_TO_PLANNER.add(0)
         awaiting_hashtags_until = None
         await _route_to_planner(update, context)
         if planner_exit or data == "BACK_MAIN_MENU":
-            ROUTE_TO_PLANNER.discard(uid)
+            ROUTE_TO_PLANNER.clear()
             await safe_send_message(
                 approval_bot,
                 chat_id=_approval_chat_id(),
@@ -1225,9 +1222,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Главное меню/базовые действия ---
     if data == "cancel_to_main":
-        ROUTE_TO_PLANNER.discard(uid)
+        ROUTE_TO_PLANNER.clear()
         awaiting_hashtags_until = None
-        ai_state_reset(uid)
+        ai_state_set(mode="idle")
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="Главное меню:", reply_markup=get_start_menu()
@@ -1244,9 +1241,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "self_post":
-        ROUTE_TO_PLANNER.discard(uid)
+        ROUTE_TO_PLANNER.clear()
         awaiting_hashtags_until = None
-        ai_state_reset(uid)
+        ai_state_set(mode="idle")
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="✍️ Введите текст поста (EN) и (опционально) приложите фото/видео одним сообщением:",
@@ -1273,8 +1270,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ИИ: главное меню ====
     if data == "ai_home":
-        ai_state_set(uid, mode="ai_home")
-        log_ai.info("AI|home | uid=%s", uid)
+        ai_state_set(mode="ai_home")
+        log_ai.info("AI|home | global")
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="🤖 Режим ИИ. Пришлите тему (можно с медиа или URL). После текста спрошу, нужна ли картинка.",
@@ -1283,8 +1280,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_generate":
-        ai_state_set(uid, mode="await_topic", await_until=(now + timedelta(minutes=5)))
-        log_ai.info("AI|await_topic | uid=%s | until=%s", uid, now + timedelta(minutes=5))
+        ai_state_set(mode="await_topic", await_until=(now + timedelta(minutes=5)))
+        log_ai.info("AI|await_topic | until=%s", now + timedelta(minutes=5))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут.",
@@ -1294,7 +1291,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ЭТАП 1 (ТЕКСТ): подтверждение/перегенерация/правка =====
     if data == "ai_text_ok":
-        ai_state_set(uid, mode="confirm_image", await_until=(now + timedelta(minutes=5)))
+        ai_state_set(mode="confirm_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="🖼 Нужна картинка к посту?",
@@ -1303,7 +1300,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_text_regen":
-        last_topic = ai_get_last_topic(uid)
+        last_topic = ai_get_last_topic()
         if not last_topic:
             await safe_send_message(
                 approval_bot, chat_id=_approval_chat_id(),
@@ -1313,7 +1310,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             txt, warn = ai_client.ai_generate_text(last_topic)
             post_data["text_en"] = (txt or "").strip()
-            ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
+            ai_state_set(mode="confirm_text", await_until=(now + timedelta(minutes=5)))
             hdr = "ИИ перегенерировал текст"
             if warn:
                 hdr += f" — {warn}"
@@ -1325,7 +1322,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_text_edit":
-        ai_state_set(uid, mode="await_text_edit", await_until=(now + timedelta(minutes=5)))
+        ai_state_set(mode="await_text_edit", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="✏️ Пришлите новый текст поста (EN) одним сообщением (5 минут)."
@@ -1334,7 +1331,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Доп. кнопки ИИ =====
     if data == "ai_image_edit":
-        ai_state_set(uid, mode="confirm_image", await_until=(now + timedelta(minutes=5)))
+        ai_state_set(mode="confirm_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="🖼 Что делаем с медиа?",
@@ -1351,7 +1348,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tags = ai_client.ai_suggest_hashtags(base_text) or []
             else:
                 warn_note = " (локальный подбор)"
-                # fallback: берём базовые и вычищаем
                 tags = [t for t in MY_HASHTAGS_STR.split() if t]
         except Exception as e:
             warn_note = f" (ошибка подбора: {e})"
@@ -1367,7 +1363,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ЭТАП 2 (КАРТИНКА): генерация/загрузка/пропуск =====
     if data == "ai_img_gen":
-        topic = ai_get_last_topic(uid) or (post_data.get("text_en") or "")[:200]
+        topic = ai_get_last_topic() or (post_data.get("text_en") or "")[:200]
         warn_img, _filename = await _generate_ai_image_explicit(topic)
         header = "Предпросмотр (текст согласован; изображение сгенерировано)"
         if warn_img:
@@ -1376,7 +1372,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_img_upload":
-        ai_state_set(uid, mode="await_image", await_until=(now + timedelta(minutes=5)))
+        ai_state_set(mode="await_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text="📤 Пришлите фото/видео или URL на картинку/видео (5 минут)."
@@ -1395,7 +1391,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_img_back_to_text":
-        ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
+        ai_state_set(mode="confirm_text", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
             text=f"<b>Возврат к тексту</b>\n\n{build_telegram_preview(post_data.get('text_en') or '')}\n\nПодходит ли текст?",
@@ -1427,11 +1423,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=get_start_menu()
         )
         return
+
 # -----------------------------------------------------------------------------
-# Ввод сообщений
+# Ввод сообщений (без привязки к user_id)
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подробный входной лог для диагностики входящих сообщений
     try:
         log.debug("MSG|in %s", _dbg_update_summary(update))
     except Exception:
@@ -1441,7 +1437,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global last_button_pressed_at, manual_expected_until, awaiting_hashtags_until
-    uid = update.effective_user.id
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
@@ -1449,13 +1444,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
-    st = ai_state_get(uid)
+    st = ai_state_get()
 
     # === ИИ-режим: ожидание темы или дом-экран ===
     if st.get("mode") in {"ai_home", "await_topic"}:
         await_until = st.get("await_until")
         if (await_until is None) or (now <= await_until):
-            # устойчивое определение источника (личка/чат согласования/упоминание)
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
             from_approval_chat, resolve_info = await _resolve_from_approval_chat(update)
@@ -1468,7 +1462,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.debug("AI|skip_not_addressed")
                 return
         else:
-            ai_state_reset(uid)
+            ai_state_set(mode="idle")
             await safe_send_message(
                 approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время ожидания темы истекло.",
@@ -1481,10 +1475,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await_until = st.get("await_until")
         if await_until and now <= await_until:
             new_text = (update.message.text or update.message.caption or "").strip()
-            log_ai.info("AI|text.edit.recv | uid=%s | len=%s | head=%r", uid, len(new_text), (new_text or "")[:120])
+            log_ai.info("AI|text.edit.recv | len=%s | head=%r", len(new_text), (new_text or "")[:120])
             if new_text:
                 post_data["text_en"] = new_text
-                ai_state_set(uid, mode="confirm_text", await_until=(now + timedelta(minutes=5)))
+                ai_state_set(mode="confirm_text", await_until=(now + timedelta(minutes=5)))
                 await safe_send_message(
                     approval_bot, chat_id=_approval_chat_id(),
                     text=f"<b>Обновлённый текст</b>\n\n{build_telegram_preview(post_data['text_en'])}\n\nПодходит ли текст?",
@@ -1494,7 +1488,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Пусто. Пришлите обновлённый текст.")
             return
         else:
-            ai_state_reset(uid)
+            ai_state_set(mode="idle")
             await safe_send_message(
                 approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время редактирования текста истекло.",
@@ -1527,13 +1521,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_data["media_kind"] = mk
                 post_data["media_src"]  = msrc
                 post_data["media_ref"]  = mref
-                ai_state_set(uid, mode="ready_media")
+                ai_state_set(mode="ready_media")
                 await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр (медиа согласовано)")
             else:
                 await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Пришлите фото/видео или URL на изображение/видео.")
             return
         else:
-            ai_state_reset(uid)
+            ai_state_set(mode="idle")
             await safe_send_message(
                 approval_bot, chat_id=_approval_chat_id(),
                 text="⏰ Время согласования медиа истекло.",
@@ -1557,10 +1551,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_manual_input(update, context)
 
     # ===== Планировщик =====
-    if _planner_active_for(uid):
+    if _planner_active():
         return await _route_to_planner(update, context)
 
-    # ---- никаких автоменю по умолчанию ----
     return
 
 # -----------------------------------------------------------------------------
@@ -1619,7 +1612,6 @@ async def on_start(app: Application):
     post_data["media_src"] = "tg"
     post_data["media_ref"] = None
 
-    # стартовый предпросмотр
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], header="Предпросмотр (ручной режим)")
     log.info("Бот запущен. Предпросмотр отправлен. Планировщик — в planner.py (если подключено).")
 
@@ -1665,7 +1657,6 @@ def main():
         log.error("TELEGRAM_BOT_TOKEN_APPROVAL is not set. Exiting.")
         sys.exit(1)
 
-    # builder без .allowed_updates (этого метода нет у ApplicationBuilder)
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN_APPROVAL)
@@ -1674,7 +1665,6 @@ def main():
         .build()
     )
 
-    # наши хэндлеры (роутинг ИИ/планировщика/ручного ввода)
     app.add_handler(CallbackQueryHandler(callback_handler), group=0)
     app.add_handler(
         MessageHandler(
@@ -1684,13 +1674,11 @@ def main():
         group=0,
     )
 
-    # планировщик
     register_planner_handlers(app)
 
     app.add_error_handler(on_error)
     asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
-    # Перед стартом узнаём username/id бота (нужно для фильтра адресации)
     async def _fetch_me():
         global BOT_ID, BOT_USERNAME
         try:
@@ -1704,7 +1692,6 @@ def main():
     loop = asyncio.get_event_loop()
     loop.run_until_complete(_fetch_me())
 
-    # allowed_updates передаем в run_polling
     app.run_polling(
         poll_interval=0.6,
         timeout=2,
