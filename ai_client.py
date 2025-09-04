@@ -1,259 +1,505 @@
 # ai_client.py
-import os, io, re, json, base64, time, hashlib, logging
-from typing import Optional, Dict, Any, Tuple
+# -*- coding: utf-8 -*-
 
-log = logging.getLogger("ai_client")
-log.setLevel(logging.INFO)
+import os
+import io
+import re
+import json
+import time
+import math
+import base64
+import queue
+import hashlib
+import random
+import logging
+import sqlite3
+import datetime as dt
+from typing import Dict, List, Optional, Tuple
 
-# === Настройки длины ===
+import requests
+
+# Pillow cover generator (fallback & default)
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+# Trends (both are optional at runtime)
+try:
+    from pytrends.request import TrendReq  # type: ignore
+    _pytrends_ok = True
+except Exception:
+    _pytrends_ok = False
+
+try:
+    # lightweight scraping of public tweets; no API key needed
+    import snscrape.modules.twitter as sntwitter  # type: ignore
+    _sns_ok = True
+except Exception:
+    _sns_ok = False
+
+# Gemini text
+_genai_ok = False
+try:
+    import google.generativeai as genai  # type: ignore
+    _genai_ok = True
+except Exception:
+    _genai_ok = False
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
+
+# Длина поста под Twitter/Telegram
 TARGET_CHAR_LEN = int(os.getenv("TARGET_CHAR_LEN", "666"))
 TARGET_CHAR_TOL = int(os.getenv("TARGET_CHAR_TOL", "20"))
-MIN_LEN = max(140, TARGET_CHAR_LEN - TARGET_CHAR_TOL)
-MAX_LEN = TARGET_CHAR_LEN + TARGET_CHAR_TOL
 
-# === Gemini (google-generativeai) ===
-USE_GEMINI = True
-try:
-    import google.generativeai as genai
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-flash")
-    # (для рисования у многих аккаунтов пока нет стабильной имедж-модели, поэтому ниже будет фолбэк на Pillow)
-    log.info("Gemini (google-generativeai) configured.")
-except Exception as e:
-    USE_GEMINI = False
-    log.info("google-genai not available: %s", e)
+# GitHub upload
+ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB", "")
+ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB", "")  # owner/repo
+ACTION_BRANCH = os.getenv("ACTION_BRANCH", "main")
 
-# === Доп. либы для трендов и изображений ===
-try:
-    from pytrends.request import TrendReq
-except Exception:
-    TrendReq = None
+# Папка для медиа в репозитории
+GH_IMAGES_DIR = os.getenv("GH_IMAGES_DIR", "images_for_posts")
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception:
-    Image = ImageDraw = ImageFont = None
+# Локальные пути
+LOCAL_MEDIA_DIR = os.getenv("LOCAL_MEDIA_DIR", "./images_for_posts")
+os.makedirs(LOCAL_MEDIA_DIR, exist_ok=True)
 
-# === GitHub upload ===
-from github import Github
+# База для дедупликации
+DEDUP_DB_PATH = os.getenv("DEDUP_DB_PATH", "./history.db")
+DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "15"))
 
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# Логирование
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("ai_client")
 
-def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _sha_short(data: bytes, n: int = 12) -> str:
+    return hashlib.sha256(data).hexdigest()[:n]
 
-def upload_image_to_github(png_bytes: bytes,
-                           *, repo_full: Optional[str] = None,
-                           branch: str = "main",
-                           topic: Optional[str] = None,
-                           text_hash: Optional[str] = None) -> str:
-    """Загружаем PNG в images_for_posts/... + дописываем manifest.jsonl."""
-    repo_full = repo_full or os.getenv("ACTION_REPO_GITHUB")
-    token = os.getenv("ACTION_PAT_GITHUB")
-    if not repo_full or not token:
-        raise RuntimeError("Missing ACTION_REPO_GITHUB/ACTION_PAT_GITHUB")
+def _sha_text(text: str, n: int = 12) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:n]
 
-    g = Github(token)
-    repo = g.get_repo(repo_full)
+def _now_ts() -> int:
+    return int(time.time())
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    sh8 = _sha256_hex(png_bytes)[:8]
-    path = f"images_for_posts/{ts}_{sh8}.png"
+def _clean_bracket_hints(text: str) -> str:
+    # убираем [скобочные подсказки] и лишние хвосты
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    # двойные пробелы, хвостовые переводы строк
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    # Убираем заголовки типа "Website | Twitter X" если вдруг появятся в ответе
+    text = re.sub(r"(Website\s*\|\s*Twitter\s*X)\s*", "", text, flags=re.I)
+    return text.strip()
 
-    # создаём файл
-    try:
-        repo.create_file(path, f"bot: add {path}", png_bytes, branch=branch)
-    except Exception as e:
-        # Если вдруг файл уже есть (крайне маловероятно) — обновим
+def _clamp_to_len(text: str, target: int, tol: int) -> str:
+    min_len, max_len = target - tol, target + tol
+    if len(text) <= max_len and len(text) >= min_len:
+        return text
+    # если длиннее — аккуратно режем по границе предложения/строки
+    if len(text) > max_len:
+        cut = text[:max_len]
+        # ищем последнее окончание предложения
+        m = re.search(r"[.!?…]\s+\S*$", cut)
+        if m:
+            cut = cut[:m.start()+1]
+        return cut.strip()
+    # если короче — просто возвращаем (лучше недобор, чем вода)
+    return text.strip()
+
+def _detect_lang(s: str) -> str:
+    # грубая эвристика — если есть кириллица, берём ru
+    if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", s):
+        return "ru"
+    return "en"
+
+# -----------------------------------------------------------------------------
+# Dedup storage (SQLite)
+# -----------------------------------------------------------------------------
+class Deduper:
+    def __init__(self, path: str):
+        self.path = path
+        self._ensure()
+
+    def _ensure(self):
+        conn = sqlite3.connect(self.path)
         try:
-            cur = repo.get_contents(path, ref=branch)
-            repo.update_file(path, f"bot: update {path}", png_bytes, cur.sha, branch=branch)
-        except Exception as e2:
-            raise RuntimeError(f"GitHub upload failed: {e}; fallback update failed: {e2}")
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text_hash TEXT,
+                    img_hash  TEXT,
+                    created_at INTEGER
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_created ON posts(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_text ON posts(text_hash)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_img ON posts(img_hash)")
+            conn.commit()
+        finally:
+            conn.close()
 
-    raw_url = f"https://raw.githubusercontent.com/{repo_full}/{branch}/{path}"
-
-    # обновим/создадим манифест для NFT-пайплайна
-    manifest_path = "images_for_posts/manifest.jsonl"
-    meta = {
-        "path": path,
-        "raw_url": raw_url,
-        "sha256": _sha256_hex(png_bytes),
-        "text_hash": text_hash,
-        "topic": topic,
-        "created_at": _now_iso(),
-    }
-    meta_line = (json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8")
-
-    try:
+    def purge_old(self, ttl_days: int = DEDUP_TTL_DAYS):
+        cutoff = _now_ts() - ttl_days * 86400
+        conn = sqlite3.connect(self.path)
         try:
-            mf = repo.get_contents(manifest_path, ref=branch)
-            # декодим base64 -> bytes -> str и аппендим
-            current = base64.b64decode(mf.content)
-            updated = current + meta_line
-            repo.update_file(manifest_path, f"bot: append manifest {path}", updated, mf.sha, branch=branch)
-        except Exception:
-            repo.create_file(manifest_path, "bot: create manifest", meta_line, branch=branch)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def is_duplicate(self, text: Optional[str], img_bytes: Optional[bytes]) -> bool:
+        self.purge_old()
+        th = _sha_text(text) if text else None
+        ih = _sha_short(img_bytes) if img_bytes else None
+        conn = sqlite3.connect(self.path)
+        try:
+            cur = conn.cursor()
+            if th and ih:
+                cur.execute("SELECT 1 FROM posts WHERE text_hash=? OR img_hash=? LIMIT 1", (th, ih))
+            elif th:
+                cur.execute("SELECT 1 FROM posts WHERE text_hash=? LIMIT 1", (th,))
+            elif ih:
+                cur.execute("SELECT 1 FROM posts WHERE img_hash=? LIMIT 1", (ih,))
+            else:
+                return False
+            row = cur.fetchone()
+            return bool(row)
+        finally:
+            conn.close()
+
+    def record(self, text: Optional[str], img_bytes: Optional[bytes]):
+        th = _sha_text(text) if text else None
+        ih = _sha_short(img_bytes) if img_bytes else None
+        conn = sqlite3.connect(self.path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO posts(text_hash, img_hash, created_at) VALUES(?,?,?)",
+                (th, ih, _now_ts()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+DEDUP = Deduper(DEDUP_DB_PATH)
+
+# -----------------------------------------------------------------------------
+# Trends
+# -----------------------------------------------------------------------------
+_DEFAULT_TOPICS = ["AI", "Bitcoin", "Ethereum", "Solana", "DeFi", "OpenAI", "Gemini", "Web3", "L2", "NFT"]
+
+def get_google_trends(limit: int = 7) -> List[str]:
+    if not _pytrends_ok:
+        log.info("Trends|pytrends not available")
+        return _DEFAULT_TOPICS[:limit]
+    try:
+        # простой трюк: берём rising related queries по общим ключам
+        pytrends = TrendReq(hl='ru-RU', tz=180)
+        seeds = ["AI", "криптовалюта", "биткоин", "эфириум", "солана", "нейросеть", "web3"]
+        seen = []
+        for kw in seeds:
+            pytrends.build_payload([kw], timeframe="now 7-d", geo="")
+            rel = pytrends.related_topics()
+            for v in rel.values():
+                try:
+                    rising = v["rising"]
+                    for _, row in rising.head(5).iterrows():
+                        q = str(row["topic_title"] or row.get("query") or "").strip()
+                        if q and q.lower() not in {x.lower() for x in seen}:
+                            seen.append(q)
+                            if len(seen) >= limit:
+                                return seen
+                except Exception:
+                    continue
+        return seen[:limit] or _DEFAULT_TOPICS[:limit]
     except Exception as e:
-        log.debug("manifest update failed: %s", e)
+        log.info("Trends|pytrends fallback: %s", e)
+        return _DEFAULT_TOPICS[:limit]
 
-    return raw_url
-
-# === Тренды (по возможности) ===
-def _get_google_trends_top(n: int = 8, pn: str = "united_states") -> list:
-    if not TrendReq:
+def get_x_hashtags(limit: int = 7) -> List[str]:
+    if not _sns_ok:
+        log.info("Trends|snscrape not available")
         return []
     try:
-        tr = TrendReq(hl="en-US", tz=0)
-        df = tr.trending_searches(pn=pn)
-        if df is not None and not df.empty:
-            return [str(x) for x in df[0].head(n).tolist()]
+        query = '(AI OR crypto OR bitcoin OR ethereum OR solana OR web3) lang:ru OR lang:en since:%s' % (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        tags: Dict[str, int] = {}
+        cnt = 0
+        for tw in sntwitter.TwitterSearchScraper(query).get_items():
+            txt = getattr(tw, "rawContent", "") or getattr(tw, "content", "")
+            for tag in re.findall(r"#\w{3,30}", txt):
+                tags[tag.lower()] = tags.get(tag.lower(), 0) + 1
+            cnt += 1
+            if cnt >= 200:
+                break
+        top = sorted(tags.items(), key=lambda x: x[1], reverse=True)
+        return [k for k, _ in top[:limit]]
     except Exception as e:
-        log.debug("pytrends failed: %s", e)
-    return []
+        log.info("Trends|snscrape fallback: %s", e)
+        return []
 
-# === Утилиты текста ===
-def _strip_bracket_tips(s: str) -> str:
-    # Убираем любые подсказки в квадратных скобках
-    return re.sub(r"\[[^\]]{0,200}\]", "", s)
+# -----------------------------------------------------------------------------
+# Gemini text
+# -----------------------------------------------------------------------------
+if _genai_ok and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        _model = genai.GenerativeModel(GEMINI_TEXT_MODEL)
+        log.info("Gemini configured: %s", GEMINI_TEXT_MODEL)
+    except Exception as e:
+        log.warning("Gemini init failed: %s", e)
+        _model = None
+else:
+    _model = None
+    log.info("Gemini not available (package or key missing)")
 
-def _clean_text(s: str) -> str:
-    s = s.replace("\u200b", "").strip()
-    s = _strip_bracket_tips(s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
-
-def _trim_to_bounds(s: str, min_len: int = MIN_LEN, max_len: int = MAX_LEN) -> str:
-    s = s.strip()
-    if len(s) <= max_len and len(s) >= min_len:
-        return s
-    if len(s) > max_len:
-        # режем по предложению/слову
-        cut = s[:max_len]
-        # попробуем обрубить по последней точке/восклиц/вопрос
-        m = re.search(r"[\.!\?](?!.*[\.!\?])", cut)
-        if m and m.end() >= min_len:
-            return cut[:m.end()].strip()
-        # иначе — до последнего пробела
-        sp = cut.rfind(" ")
-        if sp >= min_len:
-            return cut[:sp].strip()
-        return cut.strip()
-    # слишком коротко — просто вернём как есть (лучше недобрать, чем добавлять «воды»)
-    return s
-
-# === Генерация текста ===
-def generate_post_text(topic: str, lang: str = "ru") -> str:
-    trends = []
-    # Попробуем подобрать Google Trends (регионально)
-    pn = {"ru": "russia", "uk": "ukraine", "en": "united_states"}.get(lang.lower(), "united_states")
-    trends = _get_google_trends_top(8, pn=pn)
+def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
+    lang = locale_hint or _detect_lang(topic)
+    trends = get_google_trends()
+    tags = get_x_hashtags()
+    trend_bits = ", ".join(trends[:5])
+    tag_bits = " ".join(tags[:5])
 
     prompt = f"""
-Сгенерируй краткий пост для X/Twitter на {lang}.
-Требования:
-- Никаких комментариев, ремарок или подсказок в квадратных скобках.
-- Содержание должно быть полезным и актуальным.
-- Опирайся на популярные темы из Twitter и Google (если тренды ниже есть — учитывай их).
-- Без эмодзи-спама, без хэштегов внутри текста.
+Сгенерируй короткий пост для соцсетей на языке "{'Русский' if lang=='ru' else 'English'}".
+Тема: {topic}
+
+Обязательные требования:
 - Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TOL} символов.
-- Ясный, разговорный тон, без клише «восторга ради восторга».
+- Никаких подсказок в квадратных скобках и без служебных пометок.
+- Без хештегов, без вопросов к читателю, без "подпишись", без ссылок.
+- Фактура и актуальность: опирайся на популярные темы и формулировки из трендов Google и X(Twitter).
+- Пиши как инфо-пост/наблюдение, польза и конкретика.
+- Тон: бодрый, уверенный, без кликбейта, без эмодзи.
 
-Тема от пользователя: {topic}
-
-Тренды для ориентира (можно выборочно, не перечисляй списком):
-{", ".join(trends) if trends else "—"}
-""".strip()
-
+Подсказки по трендам (не вставляй дословно как список, используй смысл): {trend_bits} {tag_bits}
+"""
     text = ""
-    if USE_GEMINI:
+    if _model:
         try:
-            model = genai.GenerativeModel(GEMINI_TEXT_MODEL)
-            resp = model.generate_content(prompt)
+            resp = _model.generate_content(prompt)
             text = (resp.text or "").strip()
         except Exception as e:
-            log.debug("gemini text failed: %s", e)
+            log.warning("Gemini text error: %s", e)
 
     if not text:
-        # Фолбэк, если Gemini недоступен
-        text = f"{topic.strip().capitalize()} — краткий пост о том, что сейчас обсуждают чаще всего: влияние ИИ на ежедневные сервисы, ускорение выхода новых моделей и прикладные кейсы. Компактная версия без воды и лишних деталей."
+        # минимальный резерв: нейтральный текст на основе темы
+        text = f"{topic.strip().capitalize()}: ключевые мысли и актуальные наблюдения в сфере ИИ и крипто. Коротко о динамике, рисках и возможностях. Практическая польза — без воды."
 
-    text = _clean_text(text)
-    text = _trim_to_bounds(text, MIN_LEN, MAX_LEN)
+    text = _clean_bracket_hints(text)
+    text = _clamp_to_len(text, TARGET_CHAR_LEN, TARGET_CHAR_TOL)
     return text
 
-# === Генерация изображения ===
-def _pillow_share_card(title: str, width: int = 1024, height: int = 576) -> bytes:
-    if not Image:
-        raise RuntimeError("Pillow not installed")
-    img = Image.new("RGB", (width, height), (10, 12, 20))
-    d = ImageDraw.Draw(img)
-    # простая «подложка»
-    for y in range(height):
-        shade = int(20 + (y / height) * 80)
-        d.line([(0, y), (width, y)], fill=(shade, shade, shade))
-    # текст
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
-    except Exception:
-        font = ImageFont.load_default()
-    margin = 60
-    max_w = width - margin * 2
-    # перенос строк
-    words = title.strip().split()
-    lines, cur = [], ""
-    for w in words:
-        test = (cur + " " + w).strip()
-        if d.textlength(test, font=font) <= max_w:
-            cur = test
-        else:
-            if cur: lines.append(cur); cur = w
-            else: lines.append(w)
-    if cur: lines.append(cur)
-    y = height//2 - (len(lines)*56)//2
-    for line in lines:
-        d.text((margin, y), line, font=font, fill=(240, 240, 240))
-        y += 56
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    return bio.getvalue()
+# -----------------------------------------------------------------------------
+# Image generation (default: Pillow neon cover). Optional hook for real T2I later.
+# -----------------------------------------------------------------------------
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    # стараемся найти системный жирный шрифт
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size=size)
+    return ImageFont.load_default()
 
-def generate_post_image(topic: str, text: str) -> Dict[str, Any]:
+def _neon_bg(w: int, h: int) -> Image:
+    img = Image.new("RGB", (w, h), (10, 12, 20))
+    draw = ImageDraw.Draw(img)
+    # радиальные вспышки
+    for _ in range(6):
+        cx, cy = random.randint(0, w), random.randint(0, h)
+        r = random.randint(int(min(w, h)*0.15), int(min(w, h)*0.45))
+        col = random.choice([(30,180,255), (80,255,200), (0,255,130), (130,160,255)])
+        grad = Image.new("L", (r*2, r*2), 0)
+        gd = ImageDraw.Draw(grad)
+        for i in range(r, 0, -1):
+            a = int(255 * (i/r)**2)
+            gd.ellipse((r-i, r-i, r+i, r+i), fill=a)
+        glow = Image.new("RGB", (r*2, r*2), col)
+        img.paste(glow, (cx-r, cy-r), grad)
+    return img.filter(ImageFilter.GaussianBlur(2))
+
+def _draw_circuit(draw: ImageDraw.ImageDraw, w: int, h: int):
+    # простая «плата»: линии и узлы
+    for _ in range(55):
+        x1 = random.randint(40, w-40)
+        y1 = random.randint(40, h-40)
+        x2 = x1 + random.randint(-220, 220)
+        y2 = y1 + random.randint(-120, 120)
+        col = (random.randint(60,120), random.randint(200,255), random.randint(200,255))
+        draw.line((x1,y1,x2,y2), fill=col, width=random.randint(1,3))
+        for (cx, cy) in [(x1,y1),(x2,y2)]:
+            r = random.randint(2,4)
+            draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=col)
+
+def _draw_tokens(draw: ImageDraw.ImageDraw, w: int, h: int, font: ImageFont.FreeTypeFont):
+    tokens = ["AI", "BTC", "Ξ", "SOL", "L2", "DeFi"]
+    for _ in range(10):
+        t = random.choice(tokens)
+        fs = random.randint(24, 56)
+        f = _load_font(fs)
+        x = random.randint(30, w-150)
+        y = random.randint(30, h-100)
+        fill = random.choice([(240,240,255), (180,255,230), (130,200,255)])
+        draw.text((x, y), t, font=f, fill=fill)
+
+def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
+    w, h = size
+    img = _neon_bg(w, h)
+    draw = ImageDraw.Draw(img)
+    _draw_circuit(draw, w, h)
+    _draw_tokens(draw, w, h, _load_font(32))
+
+    # центральный «мозг» — круги/контур
+    cx, cy = w//2, int(h*0.42)
+    for r, col, wd in [
+        (210, (255, 210, 60), 5),
+        (170, (255, 240, 120), 3),
+        (120, (255, 255, 190), 2),
+    ]:
+        draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline=col, width=wd)
+
+    # заголовок (укороченная тема)
+    head = re.sub(r"\s+", " ", topic).strip()
+    head = head[:64]
+    title_font = _load_font(72)
+    tw, th = draw.textsize(head, font=title_font)
+    draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
+
+    # сглаживание и лёгкое свечение
+    img = img.filter(ImageFilter.GaussianBlur(0.6))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     """
-    Возвращает dict: {"bytes": png_bytes, "url": url_or_None, "sha256": hex}
-    - Всегда стараемся вернуть bytes (их шлём в ТГ/X).
-    - Если есть GitHub креды — заливаем файл и отдаём url.
+    Возвращает: {
+      'url': <raw github url or None>,
+      'local_path': <path to local png>,
+      'sha': <short sha>,
+    }
     """
-    png_bytes = None
+    # Пока используем Pillow-обложку (быстро и бесплатно).
+    png_bytes = _cover_from_topic(topic, text)
+    sha = _sha_short(png_bytes)
 
-    # Попытка Gemini-имиджа (у некоторых аккаунтов может быть недоступна — будет фолбэк на Pillow)
-    if USE_GEMINI:
-        try:
-            # У разных аккаунтов имидж-эндпоинт может называться по-разному; для надёжности сразу фолбэк ниже
-            # Здесь можно попробовать применить text->image модель, если доступна.
-            pass
-        except Exception as e:
-            log.debug("gemini image failed: %s", e)
+    # локально кладём (полезно для телеграм превью)
+    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname = f"{ts}_{sha}.png"
+    local_path = os.path.join(LOCAL_MEDIA_DIR, fname)
+    with open(local_path, "wb") as f:
+        f.write(png_bytes)
 
-    if png_bytes is None:
-        title = re.sub(r"\s+", " ", text).strip()
-        title = title[:160]
-        try:
-            png_bytes = _pillow_share_card(title or topic)
-        except Exception as e:
-            raise RuntimeError(f"image fallback failed: {e}")
+    # аплоад в GitHub
+    url = upload_file_to_github(png_bytes, fname)
 
-    sha = _sha256_hex(png_bytes)
-    # Заливаем в GitHub (для NFT-пайплайна) — но публиковать в ТГ/X будем БАЙТАМИ
-    url = None
+    # записываем в дедуп-базу
     try:
-        url = upload_image_to_github(
-            png_bytes,
-            topic=topic,
-            text_hash=hashlib.sha256((" ".join((text or "").lower().split())).encode("utf-8")).hexdigest()
-        )
+        DEDUP.record(text, png_bytes)
     except Exception as e:
-        log.debug("upload_image_to_github failed: %s", e)
+        log.warning("Dedup record failed: %s", e)
 
-    return {"bytes": png_bytes, "url": url, "sha256": sha}
+    return {"url": url, "local_path": local_path, "sha": sha}
+
+# -----------------------------------------------------------------------------
+# GitHub upload
+# -----------------------------------------------------------------------------
+def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
+    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+        log.info("GitHub upload skipped: no creds")
+        return None
+    try:
+        owner, repo = ACTION_REPO_GITHUB.split("/", 1)
+    except ValueError:
+        log.error("ACTION_REPO_GITHUB must be 'owner/repo'")
+        return None
+
+    rel_path = f"{GH_IMAGES_DIR}/{filename}"
+    api = f"https://api.github.com/repos/{owner}/{repo}/contents/{rel_path}"
+    headers = {
+        "Authorization": f"token {ACTION_PAT_GITHUB}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    # создаём или обновляем (на случай коллизии)
+    msg = f"Add image {filename}"
+    data = {
+        "message": msg,
+        "branch": ACTION_BRANCH,
+        "content": base64.b64encode(file_bytes).decode("ascii"),
+    }
+
+    # Нужно проверить, не существует ли уже файл (тогда надо передать sha)
+    r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH})
+    if r_get.status_code == 200:
+        try:
+            sha_existing = r_get.json().get("sha")
+            if sha_existing:
+                data["sha"] = sha_existing
+        except Exception:
+            pass
+
+    r = requests.put(api, headers=headers, data=json.dumps(data))
+    if r.status_code not in (200, 201):
+        log.error("GitHub upload failed: %s %s", r.status_code, r.text[:200])
+        return None
+
+    # надёжный raw-URL с анти-кешем
+    raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
+    log.info("GitHub uploaded: %s", raw)
+    return raw
+
+# -----------------------------------------------------------------------------
+# Public API used by bot
+# -----------------------------------------------------------------------------
+def make_post(topic: str) -> Dict[str, Optional[str]]:
+    """
+    Полный цикл для бота:
+    1) генерим текст (666±20, без скобочных подсказок, полезно и по трендам)
+    2) проверяем дубль текста
+    3) делаем картинку (неон-крипто), сохраняем и грузим в GitHub
+    4) укладываем в дедуп-базу
+    """
+    text = generate_text(topic)
+    is_dup_text = False
+    try:
+        is_dup_text = DEDUP.is_duplicate(text, None)
+    except Exception as e:
+        log.warning("Dedup check(text) failed: %s", e)
+
+    if is_dup_text:
+        # лёгкая мутация — перестановка фраз и обрезка
+        parts = re.split(r"(?<=[.!?…])\s+", text)
+        random.shuffle(parts)
+        text = " ".join(parts)
+        text = _clamp_to_len(_clean_bracket_hints(text), TARGET_CHAR_LEN, TARGET_CHAR_TOL)
+
+    img = generate_image(topic, text)
+    return {
+        "text": text,
+        "image_url": img.get("url"),
+        "image_local_path": img.get("local_path"),
+        "image_sha": img.get("sha"),
+    }
+
+# -----------------------------------------------------------------------------
+# If run directly
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    t = "Горячие ИИ-тренды и крипто-сигналы недели"
+    post = make_post(t)
+    print("TEXT:\n", post["text"])
+    print("IMG URL:", post["image_url"])
+    print("IMG FILE:", post["image_local_path"])
