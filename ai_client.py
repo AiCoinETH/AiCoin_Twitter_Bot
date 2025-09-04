@@ -13,6 +13,7 @@ import hashlib
 import random
 import logging
 import sqlite3
+import tempfile
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
 
@@ -89,31 +90,35 @@ def _now_ts() -> int:
     return int(time.time())
 
 def _clean_bracket_hints(text: str) -> str:
-    # убираем [скобочные подсказки] и лишние хвосты
+    # убираем [скобочные подсказки] и любые подсказки в круглых <> <...>
     text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"\<[^\>]*\>", "", text)
+    # убираем маркдаун-подсказки вида (**рекомендация**)
+    text = re.sub(r"\(\*{1,2}[^)]*\*{1,2}\)", "", text)
+    # никаких ссылок
+    text = re.sub(r"https?://\S+", "", text)
     # двойные пробелы, хвостовые переводы строк
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
-    # Убираем заголовки типа "Website | Twitter X" если вдруг появятся в ответе
+    # Убираем возможные заголовки-шаблоны
     text = re.sub(r"(Website\s*\|\s*Twitter\s*X)\s*", "", text, flags=re.I)
     return text.strip()
 
 def _clamp_to_len(text: str, target: int, tol: int) -> str:
     min_len, max_len = target - tol, target + tol
-    if len(text) <= max_len and len(text) >= min_len:
-        return text
-    # если длиннее — аккуратно режем по границе предложения/строки
-    if len(text) > max_len:
-        cut = text[:max_len]
-        # ищем последнее окончание предложения
-        m = re.search(r"[.!?…]\s+\S*$", cut)
+    s = text.strip()
+    if len(s) <= max_len and len(s) >= min_len:
+        return s
+    if len(s) > max_len:
+        cut = s[:max_len]
+        # завершить на границе предложения
+        m = re.search(r"(?s)[.!?…](?!.*[.!?…]).*", cut)
         if m:
-            cut = cut[:m.start()+1]
+            cut = cut[:m.end()].strip()
         return cut.strip()
-    # если короче — просто возвращаем (лучше недобор, чем вода)
-    return text.strip()
+    # короче — возвращаем как есть (лучше недобор, чем вода)
+    return s
 
 def _detect_lang(s: str) -> str:
-    # грубая эвристика — если есть кириллица, берём ru
     if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", s):
         return "ru"
     return "en"
@@ -201,10 +206,10 @@ def get_google_trends(limit: int = 7) -> List[str]:
         log.info("Trends|pytrends not available")
         return _DEFAULT_TOPICS[:limit]
     try:
-        # простой трюк: берём rising related queries по общим ключам
         pytrends = TrendReq(hl='ru-RU', tz=180)
         seeds = ["AI", "криптовалюта", "биткоин", "эфириум", "солана", "нейросеть", "web3"]
-        seen = []
+        seen: List[str] = []
+        seenset = set()
         for kw in seeds:
             pytrends.build_payload([kw], timeframe="now 7-d", geo="")
             rel = pytrends.related_topics()
@@ -212,8 +217,12 @@ def get_google_trends(limit: int = 7) -> List[str]:
                 try:
                     rising = v["rising"]
                     for _, row in rising.head(5).iterrows():
-                        q = str(row["topic_title"] or row.get("query") or "").strip()
-                        if q and q.lower() not in {x.lower() for x in seen}:
+                        q = str(row.get("topic_title") or row.get("query") or "").strip()
+                        if not q:
+                            continue
+                        ql = q.lower()
+                        if ql not in seenset:
+                            seenset.add(ql)
                             seen.append(q)
                             if len(seen) >= limit:
                                 return seen
@@ -229,7 +238,9 @@ def get_x_hashtags(limit: int = 7) -> List[str]:
         log.info("Trends|snscrape not available")
         return []
     try:
-        query = '(AI OR crypto OR bitcoin OR ethereum OR solana OR web3) lang:ru OR lang:en since:%s' % (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        query = '(AI OR crypto OR bitcoin OR ethereum OR solana OR web3) lang:ru OR lang:en since:%s' % (
+            (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        )
         tags: Dict[str, int] = {}
         cnt = 0
         for tw in sntwitter.TwitterSearchScraper(query).get_items():
@@ -291,7 +302,8 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 
     if not text:
         # минимальный резерв: нейтральный текст на основе темы
-        text = f"{topic.strip().capitalize()}: ключевые мысли и актуальные наблюдения в сфере ИИ и крипто. Коротко о динамике, рисках и возможностях. Практическая польза — без воды."
+        base = f"{topic.strip().capitalize()}: актуальные наблюдения без воды. "
+        text = base + "Фокус на практической пользе, рисках и возможностях, чтобы принимать быстрые решения."
 
     text = _clean_bracket_hints(text)
     text = _clamp_to_len(text, TARGET_CHAR_LEN, TARGET_CHAR_TOL)
@@ -301,7 +313,6 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 # Image generation (default: Pillow neon cover). Optional hook for real T2I later.
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    # стараемся найти системный жирный шрифт
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
@@ -312,7 +323,7 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
             return ImageFont.truetype(p, size=size)
     return ImageFont.load_default()
 
-def _neon_bg(w: int, h: int) -> Image:
+def _neon_bg(w: int, h: int) -> Image.Image:
     img = Image.new("RGB", (w, h), (10, 12, 20))
     draw = ImageDraw.Draw(img)
     # радиальные вспышки
@@ -330,7 +341,6 @@ def _neon_bg(w: int, h: int) -> Image:
     return img.filter(ImageFilter.GaussianBlur(2))
 
 def _draw_circuit(draw: ImageDraw.ImageDraw, w: int, h: int):
-    # простая «плата»: линии и узлы
     for _ in range(55):
         x1 = random.randint(40, w-40)
         y1 = random.randint(40, h-40)
@@ -342,7 +352,7 @@ def _draw_circuit(draw: ImageDraw.ImageDraw, w: int, h: int):
             r = random.randint(2,4)
             draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=col)
 
-def _draw_tokens(draw: ImageDraw.ImageDraw, w: int, h: int, font: ImageFont.FreeTypeFont):
+def _draw_tokens(draw: ImageDraw.ImageDraw, w: int, h: int):
     tokens = ["AI", "BTC", "Ξ", "SOL", "L2", "DeFi"]
     for _ in range(10):
         t = random.choice(tokens)
@@ -358,9 +368,9 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     img = _neon_bg(w, h)
     draw = ImageDraw.Draw(img)
     _draw_circuit(draw, w, h)
-    _draw_tokens(draw, w, h, _load_font(32))
+    _draw_tokens(draw, w, h)
 
-    # центральный «мозг» — круги/контур
+    # центральные кольца
     cx, cy = w//2, int(h*0.42)
     for r, col, wd in [
         (210, (255, 210, 60), 5),
@@ -370,13 +380,11 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
         draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline=col, width=wd)
 
     # заголовок (укороченная тема)
-    head = re.sub(r"\s+", " ", topic).strip()
-    head = head[:64]
+    head = re.sub(r"\s+", " ", topic).strip()[:64]
     title_font = _load_font(72)
     tw, th = draw.textsize(head, font=title_font)
     draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
 
-    # сглаживание и лёгкое свечение
     img = img.filter(ImageFilter.GaussianBlur(0.6))
 
     buf = io.BytesIO()
@@ -391,21 +399,17 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
       'sha': <short sha>,
     }
     """
-    # Пока используем Pillow-обложку (быстро и бесплатно).
     png_bytes = _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
 
-    # локально кладём (полезно для телеграм превью)
     ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"{ts}_{sha}.png"
     local_path = os.path.join(LOCAL_MEDIA_DIR, fname)
     with open(local_path, "wb") as f:
         f.write(png_bytes)
 
-    # аплоад в GitHub
     url = upload_file_to_github(png_bytes, fname)
 
-    # записываем в дедуп-базу
     try:
         DEDUP.record(text, png_bytes)
     except Exception as e:
@@ -433,15 +437,12 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         "Accept": "application/vnd.github+json",
     }
 
-    # создаём или обновляем (на случай коллизии)
-    msg = f"Add image {filename}"
     data = {
-        "message": msg,
+        "message": f"Add image {filename}",
         "branch": ACTION_BRANCH,
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
 
-    # Нужно проверить, не существует ли уже файл (тогда надо передать sha)
     r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH})
     if r_get.status_code == 200:
         try:
@@ -456,20 +457,19 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         log.error("GitHub upload failed: %s %s", r.status_code, r.text[:200])
         return None
 
-    # надёжный raw-URL с анти-кешем
     raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
     log.info("GitHub uploaded: %s", raw)
     return raw
 
 # -----------------------------------------------------------------------------
-# Public API used by bot
+# Public API (high-level)
 # -----------------------------------------------------------------------------
 def make_post(topic: str) -> Dict[str, Optional[str]]:
     """
-    Полный цикл для бота:
+    Полный цикл для автономного использования (не обязательно боту):
     1) генерим текст (666±20, без скобочных подсказок, полезно и по трендам)
     2) проверяем дубль текста
-    3) делаем картинку (неон-крипто), сохраняем и грузим в GitHub
+    3) делаем картинку (неон-крипто), сохраняем и при желании грузим в GitHub
     4) укладываем в дедуп-базу
     """
     text = generate_text(topic)
@@ -480,7 +480,6 @@ def make_post(topic: str) -> Dict[str, Optional[str]]:
         log.warning("Dedup check(text) failed: %s", e)
 
     if is_dup_text:
-        # лёгкая мутация — перестановка фраз и обрезка
         parts = re.split(r"(?<=[.!?…])\s+", text)
         random.shuffle(parts)
         text = " ".join(parts)
@@ -493,6 +492,77 @@ def make_post(topic: str) -> Dict[str, Optional[str]]:
         "image_local_path": img.get("local_path"),
         "image_sha": img.get("sha"),
     }
+
+# -----------------------------------------------------------------------------
+# Compatibility wrappers for twitter_bot.py
+# -----------------------------------------------------------------------------
+def ai_generate_text(topic: str) -> Tuple[str, Optional[str]]:
+    """
+    Expected by twitter_bot.py
+    Returns: (text, warn_message_or_None)
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return ("", "empty topic")
+
+    warn_parts: List[str] = []
+    if not _model:
+        warn_parts.append("Gemini not available")
+    if not _pytrends_ok:
+        warn_parts.append("pytrends missing")
+    if not _sns_ok:
+        warn_parts.append("snscrape missing")
+
+    text = generate_text(topic)
+    warn = " | ".join(warn_parts) if warn_parts else None
+    return text, (warn or None)
+
+def ai_suggest_hashtags(text: str) -> List[str]:
+    """
+    Простая эвристика: популярные теги из X (если доступно) + дефолты проекта.
+    """
+    defaults = ["#AiCoin", "#AI", "$Ai", "#crypto"]
+    dynamic = get_x_hashtags(limit=6)
+    # умные добавки
+    low = (text or "").lower()
+    if "ethereum" in low or " eth " in f" {low} ":
+        dynamic.append("#ETH")
+    if "solana" in low or " sol " in f" {low} ":
+        dynamic.append("#SOL")
+    if "defi" in low:
+        dynamic.append("#DeFi")
+    if "trading" in low:
+        dynamic.append("#trading")
+
+    out: List[str] = []
+    seen = set()
+    for h in defaults + dynamic:
+        if not h:
+            continue
+        k = h.lower()
+        if k not in seen:
+            seen.add(k); out.append(h)
+        if len(out) >= 8:
+            break
+    return out
+
+def ai_generate_image(topic: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Expected by twitter_bot.py
+    Returns: (local_png_path, warn_or_none)
+    Бот сам загрузит на GitHub и удалит временный файл.
+    """
+    try:
+        # Генерация только локального файла (без аплоада), чтобы избежать двойной загрузки
+        text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
+        png_bytes = _cover_from_topic(topic, text_for_cover)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        with open(tmp.name, "wb") as f:
+            f.write(png_bytes)
+        return tmp.name, None
+    except Exception as e:
+        log.warning("Image gen error: %s", e)
+        return None, "image generation failed"
 
 # -----------------------------------------------------------------------------
 # If run directly
