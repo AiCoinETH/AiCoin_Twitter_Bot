@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import tempfile
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import requests
 
@@ -121,7 +121,13 @@ def _clamp_to_len(text: str, target: int, tol: int) -> str:
     return s
 
 def _detect_lang(s: str) -> str:
-    if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", s):
+    """Грубый авто-детект + уважение явных подсказок."""
+    txt = (s or "").strip()
+    if re.search(r"\[(en|eng|english)\]|\b(en|english)\b|на\s+англ", txt, re.I):
+        return "en"
+    if re.search(r"\[(ru|rus|russian)\]|\b(ru|russian|по-русски|на\s+русском)\b", txt, re.I):
+        return "ru"
+    if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt):
         return "ru"
     return "en"
 
@@ -306,7 +312,6 @@ def build_prices_context() -> str:
         v = data.get(key, {}).get("usd")
         if v is None:
             return None
-        # аккуратное форматирование
         if v >= 1000:
             s = f"${v:,.0f}"
         elif v >= 1:
@@ -416,7 +421,7 @@ else:
     log.info("Gemini not available (package or key missing)")
 
 def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
-    lang = locale_hint or _detect_lang(topic)
+    lang = (locale_hint or _detect_lang(topic)).lower()
 
     # контексты: тренды/тэги (могут пустить fallback), цены, новости
     trends = get_google_trends()
@@ -462,12 +467,26 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
         text = base + "Фокус на практической пользе, рисках и возможностях, чтобы принимать быстрые решения."
 
     text = _clean_bracket_hints(text)
+
+    # если модель сорвалась не на тот язык — мини-фикс
+    if lang == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", text):
+        try:
+            if _model:
+                resp2 = _model.generate_content(
+                    "Rewrite in concise English (no hashtags, no links, no questions):\n" + text
+                )
+                text2 = (getattr(resp2, "text", "") or "").strip()
+                if text2:
+                    text = text2
+        except Exception:
+            pass
+
     text = _clamp_to_len(text, TARGET_CHAR_LEN, TARGET_CHAR_TOL)
     log.info("Text|len=%d lang=%s", len(text), lang)
     return text
 
 # -----------------------------------------------------------------------------
-# Image generation (default: Pillow neon cover). Optional hook for real T2I later.
+# Image generation (default: Pillow neon cover)
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -483,7 +502,6 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 def _neon_bg(w: int, h: int) -> Image.Image:
     img = Image.new("RGB", (w, h), (10, 12, 20))
     draw = ImageDraw.Draw(img)
-    # радиальные вспышки
     for _ in range(6):
         cx, cy = random.randint(0, w), random.randint(0, h)
         r = random.randint(int(min(w, h)*0.15), int(min(w, h)*0.45))
@@ -527,7 +545,6 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     _draw_circuit(draw, w, h)
     _draw_tokens(draw, w, h)
 
-    # центральные кольца
     cx, cy = w//2, int(h*0.42)
     for r, col, wd in [
         (210, (255, 210, 60), 5),
@@ -536,26 +553,17 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     ]:
         draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline=col, width=wd)
 
-    # заголовок (укороченная тема)
     head = re.sub(r"\s+", " ", topic).strip()[:64]
     title_font = _load_font(72)
     tw, th = _measure_text(draw, head, title_font)
     draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
 
     img = img.filter(ImageFilter.GaussianBlur(0.6))
-
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
-    """
-    Возвращает: {
-      'url': <raw github url or None>,
-      'local_path': <path to local png>,
-      'sha': <short sha>,
-    }
-    """
     png_bytes = _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
@@ -567,7 +575,6 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
         f.write(png_bytes)
     log.info("Image|saved local: %s", local_path)
 
-    # гарантируем наличие каталога в репо (если есть доступ)
     try:
         ensure_github_dir()
     except Exception as e:
@@ -601,7 +608,6 @@ def _gh_headers() -> Dict[str, str]:
     }
 
 def ensure_github_dir() -> None:
-    """Проверяет, что GH_IMAGES_DIR существует; если 404 — создаёт {dir}/.gitkeep."""
     if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
         return
     owner, repo = _split_repo(ACTION_REPO_GITHUB)
@@ -614,7 +620,6 @@ def ensure_github_dir() -> None:
     if r.status_code != 404:
         log_gh.warning("Dir check unexpected: %s %s", r.status_code, r.text[:200])
         return
-    # создаём .gitkeep
     api_put = f"https://api.github.com/repos/{owner}/{repo}/contents/{GH_IMAGES_DIR}/.gitkeep"
     data = {
         "message": f"Create {GH_IMAGES_DIR}/ (bootstrap .gitkeep)",
@@ -644,7 +649,6 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
 
-    # если файл есть — подставим текущий sha
     try:
         r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
         log_gh.info("GET %s -> %s", rel_path, r_get.status_code)
@@ -655,7 +659,6 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     except Exception as e:
         log_gh.warning("GET existing failed: %s", e)
 
-    # PUT с ретраями
     for attempt in range(1, 4):
         try:
             r = requests.put(api, headers=headers, data=json.dumps(data), timeout=30)
@@ -664,7 +667,6 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
                 raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
                 log_gh.info("Uploaded OK: %s", raw)
                 return raw
-            # конфликт версии — попробуем обновить sha и повторить
             if r.status_code in (409, 422):
                 try:
                     r_get2 = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
@@ -681,22 +683,36 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     return None
 
 # -----------------------------------------------------------------------------
-# Public API (high-level)
+# Public API (high-level) + progress hook
 # -----------------------------------------------------------------------------
-def make_post(topic: str) -> Dict[str, Optional[str]]:
+ProgressFn = Optional[Callable[[str], None]]
+
+def _report(progress: ProgressFn, msg: str) -> None:
+    try:
+        if progress:
+            progress(msg)
+    except Exception:
+        pass
+
+def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str]]:
     """
     Полный цикл:
-    1) генерим текст (666±20, без скобочных подсказок; факты — из цен/новостей)
-    2) проверяем дубль текста
-    3) делаем картинку (неон-крипто), сохраняем и при желании грузим в GitHub
-    4) укладываем в дедуп-базу
+    1) прогресс "typing": начало генерации
+    2) генерим текст (666±20, факты — из цен/новостей)
+    3) проверяем дубль текста
+    4) прогресс "upload_photo": генерация изображения (по кнопке можно не вызывать здесь)
+    5) делаем картинку, сохраняем/загружаем
+    6) укладываем в дедуп-базу
     """
+    _report(progress, "typing:start_text")      # для Telegram: send_chat_action('typing')
     text = generate_text(topic)
-    is_dup_text = False
+    _report(progress, "typing:text_ready")
+
     try:
         is_dup_text = DEDUP.is_duplicate(text, None)
     except Exception as e:
         log.warning("Dedup check(text) failed: %s", e)
+        is_dup_text = False
 
     if is_dup_text:
         parts = re.split(r"(?<=[.!?…])\s+", text)
@@ -704,7 +720,10 @@ def make_post(topic: str) -> Dict[str, Optional[str]]:
         text = " ".join(parts)
         text = _clamp_to_len(_clean_bracket_hints(text), TARGET_CHAR_LEN, TARGET_CHAR_TOL)
 
+    _report(progress, "upload_photo:start_image")
     img = generate_image(topic, text)
+    _report(progress, "upload_photo:image_ready")
+
     return {
         "text": text,
         "image_url": img.get("url"),
@@ -713,12 +732,14 @@ def make_post(topic: str) -> Dict[str, Optional[str]]:
     }
 
 # -----------------------------------------------------------------------------
-# Compatibility wrappers for twitter_bot.py
+# Compatibility wrappers for twitter_bot.py (с прогрессом)
 # -----------------------------------------------------------------------------
-def ai_generate_text(topic: str) -> Tuple[str, Optional[str]]:
+def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Optional[str]]:
     """
-    Expected by twitter_bot.py
     Returns: (text, warn_message_or_None)
+    progress(msg):
+      'typing:start_text'  -> показать "печатает..."
+      'typing:text_ready'  -> убрать индикацию/написать "черновик готов"
     """
     topic = (topic or "").strip()
     if not topic:
@@ -732,14 +753,14 @@ def ai_generate_text(topic: str) -> Tuple[str, Optional[str]]:
     if not _sns_ok:
         warn_parts.append("snscrape missing")
 
+    _report(progress, "typing:start_text")
     text = generate_text(topic)
+    _report(progress, "typing:text_ready")
+
     warn = " | ".join(warn_parts) if warn_parts else None
     return text, (warn or None)
 
 def ai_suggest_hashtags(text: str) -> List[str]:
-    """
-    Простая эвристика: популярные теги из X (если доступно) + дефолты проекта.
-    """
     defaults = ["#AiCoin", "#AI", "$Ai", "#crypto"]
     dynamic = get_x_hashtags(limit=6)
     low = (text or "").lower()
@@ -764,22 +785,26 @@ def ai_suggest_hashtags(text: str) -> List[str]:
             break
     return out
 
-def ai_generate_image(topic: str) -> Tuple[Optional[str], Optional[str]]:
+def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str]]:
     """
-    Expected by twitter_bot.py
     Returns: (local_png_path, warn_or_none)
-    Бот сам загрузит на GitHub и удалит временный файл.
+    progress(msg):
+      'upload_photo:start_image' -> показать "отправляет фото..."
+      'upload_photo:image_ready' -> убрать индикацию
     """
     try:
+        _report(progress, "upload_photo:start_image")
         text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
         png_bytes = _cover_from_topic(topic, text_for_cover)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         with open(tmp.name, "wb") as f:
             f.write(png_bytes)
         log.info("Image(tmp) saved: %s (%d bytes)", tmp.name, len(png_bytes))
+        _report(progress, "upload_photo:image_ready")
         return tmp.name, None
     except Exception as e:
         log.warning("Image gen error: %s", e)
+        _report(progress, "upload_photo:image_ready")
         return None, "image generation failed"
 
 # -----------------------------------------------------------------------------
