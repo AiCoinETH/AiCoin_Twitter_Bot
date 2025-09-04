@@ -76,6 +76,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("ai_client")
+log_http = logging.getLogger("ai_client.http")
+log_gh = logging.getLogger("ai_client.github")
+
+_RAW_GH = "https://raw.githubusercontent.com"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -206,6 +210,7 @@ def get_google_trends(limit: int = 7) -> List[str]:
         log.info("Trends|pytrends not available")
         return _DEFAULT_TOPICS[:limit]
     try:
+        t0 = time.time()
         pytrends = TrendReq(hl='ru-RU', tz=180)
         seeds = ["AI", "криптовалюта", "биткоин", "эфириум", "солана", "нейросеть", "web3"]
         seen: List[str] = []
@@ -225,9 +230,11 @@ def get_google_trends(limit: int = 7) -> List[str]:
                             seenset.add(ql)
                             seen.append(q)
                             if len(seen) >= limit:
+                                log.info("Trends|pytrends ok: %d items in %.2fs", len(seen), time.time()-t0)
                                 return seen
                 except Exception:
                     continue
+        log.info("Trends|pytrends ok: %d items in %.2fs", len(seen), time.time()-t0)
         return seen[:limit] or _DEFAULT_TOPICS[:limit]
     except Exception as e:
         log.info("Trends|pytrends fallback: %s", e)
@@ -238,9 +245,9 @@ def get_x_hashtags(limit: int = 7) -> List[str]:
         log.info("Trends|snscrape not available")
         return []
     try:
-        query = '(AI OR crypto OR bitcoin OR ethereum OR solana OR web3) lang:ru OR lang:en since:%s' % (
-            (dt.date.today() - dt.timedelta(days=2)).isoformat()
-        )
+        since = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        query = f'(AI OR crypto OR bitcoin OR ethereum OR solana OR web3) lang:ru OR lang:en since:{since}'
+        log.info("X|query: %s", query)
         tags: Dict[str, int] = {}
         cnt = 0
         for tw in sntwitter.TwitterSearchScraper(query).get_items():
@@ -251,7 +258,9 @@ def get_x_hashtags(limit: int = 7) -> List[str]:
             if cnt >= 200:
                 break
         top = sorted(tags.items(), key=lambda x: x[1], reverse=True)
-        return [k for k, _ in top[:limit]]
+        res = [k for k, _ in top[:limit]]
+        log.info("X|scanned=%d, unique_tags=%d, top=%s", cnt, len(tags), " ".join(res))
+        return res
     except Exception as e:
         log.info("Trends|snscrape fallback: %s", e)
         return []
@@ -307,6 +316,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 
     text = _clean_bracket_hints(text)
     text = _clamp_to_len(text, TARGET_CHAR_LEN, TARGET_CHAR_TOL)
+    log.info("Text|len=%d lang=%s", len(text), lang)
     return text
 
 # -----------------------------------------------------------------------------
@@ -401,12 +411,20 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     """
     png_bytes = _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
+    log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
 
     ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"{ts}_{sha}.png"
     local_path = os.path.join(LOCAL_MEDIA_DIR, fname)
     with open(local_path, "wb") as f:
         f.write(png_bytes)
+    log.info("Image|saved local: %s", local_path)
+
+    # гарантируем наличие каталога в репо (если есть доступ)
+    try:
+        ensure_github_dir()
+    except Exception as e:
+        log_gh.warning("ensure_github_dir failed: %s", e)
 
     url = upload_file_to_github(png_bytes, fname)
 
@@ -420,22 +438,58 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
 # -----------------------------------------------------------------------------
 # GitHub upload
 # -----------------------------------------------------------------------------
+def _split_repo(repo: str) -> Tuple[str, str]:
+    try:
+        owner, name = repo.split("/", 1)
+        return owner, name
+    except Exception:
+        raise ValueError("ACTION_REPO_GITHUB must be 'owner/repo'")
+
+def _gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {ACTION_PAT_GITHUB}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "aicoin-twitter-bot",
+    }
+
+def ensure_github_dir() -> None:
+    """Проверяет, что GH_IMAGES_DIR существует; если 404 — создаёт {dir}/.gitkeep."""
+    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+        return
+    owner, repo = _split_repo(ACTION_REPO_GITHUB)
+    api_dir = f"https://api.github.com/repos/{owner}/{repo}/contents/{GH_IMAGES_DIR}"
+    params = {"ref": ACTION_BRANCH}
+    r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
+    log_gh.info("Check dir %s -> %s", GH_IMAGES_DIR, r.status_code)
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        log_gh.warning("Dir check unexpected: %s %s", r.status_code, r.text[:200])
+        return
+    # создаём .gitkeep
+    api_put = f"https://api.github.com/repos/{owner}/{repo}/contents/{GH_IMAGES_DIR}/.gitkeep"
+    data = {
+        "message": f"Create {GH_IMAGES_DIR}/ (bootstrap .gitkeep)",
+        "branch": ACTION_BRANCH,
+        "content": base64.b64encode(b"").decode("ascii"),
+    }
+    r2 = requests.put(api_put, headers=_gh_headers(), data=json.dumps(data), timeout=30)
+    log_gh.info("Create dir .gitkeep -> %s", r2.status_code)
+
 def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
         log.info("GitHub upload skipped: no creds")
         return None
     try:
-        owner, repo = ACTION_REPO_GITHUB.split("/", 1)
-    except ValueError:
-        log.error("ACTION_REPO_GITHUB must be 'owner/repo'")
+        owner, repo = _split_repo(ACTION_REPO_GITHUB)
+    except ValueError as e:
+        log.error(str(e))
         return None
 
     rel_path = f"{GH_IMAGES_DIR}/{filename}"
     api = f"https://api.github.com/repos/{owner}/{repo}/contents/{rel_path}"
-    headers = {
-        "Authorization": f"token {ACTION_PAT_GITHUB}",
-        "Accept": "application/vnd.github+json",
-    }
+    headers = _gh_headers()
 
     data = {
         "message": f"Add image {filename}",
@@ -443,23 +497,42 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
 
-    r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH})
-    if r_get.status_code == 200:
-        try:
-            sha_existing = r_get.json().get("sha")
+    # если файл есть — подставим текущий sha
+    try:
+        r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
+        log_gh.info("GET %s -> %s", rel_path, r_get.status_code)
+        if r_get.status_code == 200:
+            sha_existing = (r_get.json() or {}).get("sha")
             if sha_existing:
                 data["sha"] = sha_existing
-        except Exception:
-            pass
+    except Exception as e:
+        log_gh.warning("GET existing failed: %s", e)
 
-    r = requests.put(api, headers=headers, data=json.dumps(data))
-    if r.status_code not in (200, 201):
-        log.error("GitHub upload failed: %s %s", r.status_code, r.text[:200])
-        return None
-
-    raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
-    log.info("GitHub uploaded: %s", raw)
-    return raw
+    # PUT с ретраями
+    for attempt in range(1, 4):
+        try:
+            r = requests.put(api, headers=headers, data=json.dumps(data), timeout=30)
+            log_gh.info("PUT %s (try %d) -> %s", rel_path, attempt, r.status_code)
+            if r.status_code in (200, 201):
+                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
+                log_gh.info("Uploaded OK: %s", raw)
+                return raw
+            # конфликт версии — попробуем обновить sha и повторить
+            if r.status_code in (409, 422):
+                try:
+                    r_get2 = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
+                    if r_get2.status_code == 200:
+                        data["sha"] = (r_get2.json() or {}).get("sha")
+                        log_gh.info("Resolved sha, retrying…")
+                        continue
+                except Exception:
+                    pass
+            # иные ошибки — лог и, возможно, ещё попытка
+            log_gh.error("PUT failed: %s %s", r.status_code, r.text[:300])
+        except Exception as e:
+            log_gh.error("PUT exception (try %d): %s", attempt, e)
+        time.sleep(1.5 * attempt)
+    return None
 
 # -----------------------------------------------------------------------------
 # Public API (high-level)
@@ -559,6 +632,7 @@ def ai_generate_image(topic: str) -> Tuple[Optional[str], Optional[str]]:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         with open(tmp.name, "wb") as f:
             f.write(png_bytes)
+        log.info("Image(tmp) saved: %s (%d bytes)", tmp.name, len(png_bytes))
         return tmp.name, None
     except Exception as e:
         log.warning("Image gen error: %s", e)
