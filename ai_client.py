@@ -6,9 +6,7 @@ import io
 import re
 import json
 import time
-import math
 import base64
-import queue
 import hashlib
 import random
 import logging
@@ -30,7 +28,7 @@ except Exception:
     _pytrends_ok = False
 
 try:
-    # lightweight scraping of public tweets; no API key needed
+    # lightweight scraping of public tweets; no API key needed (может ломаться)
     import snscrape.modules.twitter as sntwitter  # type: ignore
     _sns_ok = True
 except Exception:
@@ -80,6 +78,7 @@ log_http = logging.getLogger("ai_client.http")
 log_gh = logging.getLogger("ai_client.github")
 
 _RAW_GH = "https://raw.githubusercontent.com"
+_UA = {"User-Agent": "AiCoinBot/1.0 (+https://x.com/AiCoin_ETH)"}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -114,18 +113,24 @@ def _clamp_to_len(text: str, target: int, tol: int) -> str:
         return s
     if len(s) > max_len:
         cut = s[:max_len]
-        # завершить на границе предложения
+        # завершить на последней точке/восклиц/вопросе в диапазоне
         m = re.search(r"(?s)[.!?…](?!.*[.!?…]).*", cut)
         if m:
             cut = cut[:m.end()].strip()
         return cut.strip()
-    # короче — возвращаем как есть (лучше недобор, чем вода)
     return s
 
 def _detect_lang(s: str) -> str:
     if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", s):
         return "ru"
     return "en"
+
+# Pillow ≥10 — используем textbbox
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w = max(0, bbox[2] - bbox[0])
+    h = max(0, bbox[3] - bbox[1])
+    return w, h
 
 # -----------------------------------------------------------------------------
 # Dedup storage (SQLite)
@@ -266,6 +271,136 @@ def get_x_hashtags(limit: int = 7) -> List[str]:
         return []
 
 # -----------------------------------------------------------------------------
+# Prices (CoinGecko, no key)
+# -----------------------------------------------------------------------------
+def fetch_prices_coingecko_simple(vs: str = "usd") -> Dict[str, Dict[str, float]]:
+    """
+    Без ключа: /simple/price. Возвращает {'bitcoin': {'usd': 000}, 'ethereum': ...}
+    """
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": "bitcoin,ethereum,solana",
+        "vs_currencies": vs,
+    }
+    try:
+        r = requests.get(url, params=params, headers=_UA, timeout=12)
+        if r.status_code == 429:
+            log.info("CG|rate limited, backing off")
+            time.sleep(1.2)
+            r = requests.get(url, params=params, headers=_UA, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        log.info("CG|error: %s", e)
+        return {}
+
+def build_prices_context() -> str:
+    data = fetch_prices_coingecko_simple("usd")
+    if not data:
+        return ""
+    parts = []
+    def fmt(sym: str, key: str):
+        v = data.get(key, {}).get("usd")
+        if v is None:
+            return None
+        # аккуратное форматирование
+        if v >= 1000:
+            s = f"${v:,.0f}"
+        elif v >= 1:
+            s = f"${v:,.2f}"
+        else:
+            s = f"${v:.4f}"
+        return f"{sym} {s}"
+    for sym, key in [("BTC", "bitcoin"), ("ETH", "ethereum"), ("SOL", "solana")]:
+        t = fmt(sym, key)
+        if t:
+            parts.append(t)
+    return "; ".join(parts)
+
+# -----------------------------------------------------------------------------
+# News (Google News + crypto RSS, no keys)
+# -----------------------------------------------------------------------------
+from xml.etree import ElementTree as ET
+from urllib.parse import quote_plus
+
+def _fetch_rss(url: str, timeout: int = 12) -> List[Dict[str, str]]:
+    try:
+        r = requests.get(url, headers=_UA, timeout=timeout)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        out: List[Dict[str, str]] = []
+        # RSS 2.0
+        for item in root.findall(".//item"):
+            t = (item.findtext("title") or "").strip()
+            l = (item.findtext("link") or "").strip()
+            p = (item.findtext("pubDate") or "").strip()
+            if t and l:
+                out.append({"title": t, "link": l, "published": p})
+        # Atom
+        if not out:
+            ns = {"a": "http://www.w3.org/2005/Atom"}
+            for e in root.findall(".//a:entry", ns):
+                t = (e.findtext("a:title", default="", namespaces=ns) or "").strip()
+                link_el = e.find("a:link", ns)
+                l = (link_el.get("href") if link_el is not None else "").strip()
+                p = (e.findtext("a:updated", default="", namespaces=ns) or "").strip()
+                if t and l:
+                    out.append({"title": t, "link": l, "published": p})
+        return out
+    except Exception as e:
+        log.info("RSS|error: %s", e)
+        return []
+
+def fetch_google_news(query: str, lang="ru", country="UA", n: int = 5) -> List[Dict[str, str]]:
+    base = "https://news.google.com/rss/search"
+    q = quote_plus(query)
+    url = f"{base}?q={q}&hl={lang}&gl={country}&ceid={country}:{lang}"
+    items = _fetch_rss(url)
+    return items[:n]
+
+def fetch_crypto_feeds(n: int = 5) -> List[Dict[str, str]]:
+    feeds = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://www.theblock.co/rss",
+        "https://decrypt.co/feed",
+        "https://www.reuters.com/markets/crypto/rss",
+    ]
+    items: List[Dict[str, str]] = []
+    for u in feeds:
+        items.extend(_fetch_rss(u))
+        if len(items) >= n:
+            break
+    # дедуп по заголовку
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for it in items:
+        k = it["title"].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(it)
+        if len(out) >= n:
+            break
+    return out
+
+def build_news_context(max_items: int = 3, user_query: Optional[str] = None) -> str:
+    items: List[Dict[str, str]] = []
+    if user_query:
+        items = fetch_google_news(user_query, n=max_items)
+    if not items:
+        items = fetch_crypto_feeds(n=max_items)
+    lines = []
+    for it in items[:max_items]:
+        title = it["title"].strip()
+        link  = it["link"].strip()
+        pub   = it.get("published", "").strip()
+        lines.append(f"- {title} (источник: {link}; время: {pub})")
+    return "\n".join(lines)
+
+# -----------------------------------------------------------------------------
 # Gemini text
 # -----------------------------------------------------------------------------
 if _genai_ok and GEMINI_API_KEY:
@@ -282,14 +417,25 @@ else:
 
 def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     lang = locale_hint or _detect_lang(topic)
+
+    # контексты: тренды/тэги (могут пустить fallback), цены, новости
     trends = get_google_trends()
     tags = get_x_hashtags()
-    trend_bits = ", ".join(trends[:5])
-    tag_bits = " ".join(tags[:5])
+    trend_bits = ", ".join(trends[:5]) if trends else ""
+    tag_bits = " ".join(tags[:5]) if tags else ""
+
+    prices_ctx = build_prices_context()
+    news_ctx = build_news_context(max_items=3, user_query=topic)
+
+    prices_block = f"\nАктуальные цены (CoinGecko, USD): {prices_ctx}\n" if prices_ctx else "\nАктуальные цены недоступны — не указывай конкретные числа.\n"
+    news_block = f"\nНовости для контекста (используй факты только отсюда, ссылки НЕ вставляй в итог):\n{news_ctx}\n" if news_ctx else "\nНовости недоступны — не упоминай конкретные события/даты.\n"
 
     prompt = f"""
 Сгенерируй короткий пост для соцсетей на языке "{'Русский' if lang=='ru' else 'English'}".
 Тема: {topic}
+
+{prices_block}
+{news_block}
 
 Обязательные требования:
 - Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TOL} символов.
@@ -298,6 +444,8 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 - Фактура и актуальность: опирайся на популярные темы и формулировки из трендов Google и X(Twitter).
 - Пиши как инфо-пост/наблюдение, польза и конкретика.
 - Тон: бодрый, уверенный, без кликбейта, без эмодзи.
+- Факты, события и ЧИСЛА бери только из блоков «Актуальные цены» и «Новости». Не выдумывай новые цифры.
+- Ссылки из контекста НЕ вставляй в итоговый текст.
 
 Подсказки по трендам (не вставляй дословно как список, используй смысл): {trend_bits} {tag_bits}
 """
@@ -305,12 +453,11 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     if _model:
         try:
             resp = _model.generate_content(prompt)
-            text = (resp.text or "").strip()
+            text = (getattr(resp, "text", "") or "").strip()
         except Exception as e:
             log.warning("Gemini text error: %s", e)
 
     if not text:
-        # минимальный резерв: нейтральный текст на основе темы
         base = f"{topic.strip().capitalize()}: актуальные наблюдения без воды. "
         text = base + "Фокус на практической пользе, рисках и возможностях, чтобы принимать быстрые решения."
 
@@ -392,7 +539,7 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     # заголовок (укороченная тема)
     head = re.sub(r"\s+", " ", topic).strip()[:64]
     title_font = _load_font(72)
-    tw, th = draw.textsize(head, font=title_font)
+    tw, th = _measure_text(draw, head, title_font)
     draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
 
     img = img.filter(ImageFilter.GaussianBlur(0.6))
@@ -527,7 +674,6 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
                         continue
                 except Exception:
                     pass
-            # иные ошибки — лог и, возможно, ещё попытка
             log_gh.error("PUT failed: %s %s", r.status_code, r.text[:300])
         except Exception as e:
             log_gh.error("PUT exception (try %d): %s", attempt, e)
@@ -539,8 +685,8 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
 # -----------------------------------------------------------------------------
 def make_post(topic: str) -> Dict[str, Optional[str]]:
     """
-    Полный цикл для автономного использования (не обязательно боту):
-    1) генерим текст (666±20, без скобочных подсказок, полезно и по трендам)
+    Полный цикл:
+    1) генерим текст (666±20, без скобочных подсказок; факты — из цен/новостей)
     2) проверяем дубль текста
     3) делаем картинку (неон-крипто), сохраняем и при желании грузим в GitHub
     4) укладываем в дедуп-базу
@@ -596,7 +742,6 @@ def ai_suggest_hashtags(text: str) -> List[str]:
     """
     defaults = ["#AiCoin", "#AI", "$Ai", "#crypto"]
     dynamic = get_x_hashtags(limit=6)
-    # умные добавки
     low = (text or "").lower()
     if "ethereum" in low or " eth " in f" {low} ":
         dynamic.append("#ETH")
@@ -626,7 +771,6 @@ def ai_generate_image(topic: str) -> Tuple[Optional[str], Optional[str]]:
     Бот сам загрузит на GitHub и удалит временный файл.
     """
     try:
-        # Генерация только локального файла (без аплоада), чтобы избежать двойной загрузки
         text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
         png_bytes = _cover_from_topic(topic, text_for_cover)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
