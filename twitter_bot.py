@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 twitter_bot.py — согласование/публикация в Telegram и X (Twitter).
-Добавлено:
-- статусы «генерирую текст/изображение»
-- явное принуждение английского, если пользователь просит EN
-- совместимость с обновлённым ai_client.py
-- безопасный watchdog (по умолчанию выключен) и расширенное стартовое уведомление
+
+Ключевые правки:
+- Надёжный watchdog (выключен по умолчанию; включается через ENV AUTO_SHUTDOWN_AFTER_SECONDS>0)
+- Инициализация "последней активности" на старте, чтобы бот не вырубался сам
+- Аккуратный обработчик старых callback'ов (Query is too old)
+- Безопасные отправки в TG (ретраи) и корректные уведомления
+- Обработчики для "подобрать хэштеги" и "план на день" (если planner подключён)
+- Дедуп публикаций с TTL, хэши медиа, обрезка текста, обязательные хвосты
 """
 
 import os
@@ -29,7 +32,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 import aiosqlite
 
-# ИСПРАВЛЕНО: современная авторизация PyGithub (устранено DeprecationWarning)
+# GitHub (устранён DeprecationWarning по Auth)
 from github import Github
 try:
     from github import Auth as _GhAuth
@@ -41,7 +44,7 @@ import ai_client
 # -----------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
 # -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
@@ -49,37 +52,8 @@ logging.basicConfig(
 log = logging.getLogger("twitter_bot")
 log_ai = logging.getLogger("twitter_bot.ai")
 logging.getLogger("httpx").setLevel(logging.INFO)
-logging.getLogger("telegram").setLevel(logging.DEBUG)
-logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
-
-# Данные о самом боте (заполняем на старте)
-BOT_ID: Optional[int] = None
-BOT_USERNAME: Optional[str] = None
-
-# --- Предобъявление глобала, чтобы имя точно существовало в модуле ---
-TELEGRAM_APPROVAL_CHAT_ID: Any = None  # может быть int (-100...) или '@username' (str)
-
-# (ОСТАВЛЕНО ДЛЯ СОВМЕСТИМОСТИ)
-try:
-    APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0") or "0")
-except Exception:
-    APPROVAL_USER_ID = 0
-
-def _is_approved_user(update: Update) -> bool:
-    if not update or not getattr(update, "effective_user", None):
-        return False
-    if APPROVAL_USER_ID and update.effective_user and update.effective_user.id != APPROVAL_USER_ID:
-        return False
-    return True
-
-# === ПЛАНИРОВЩИК (опционально) ===
-try:
-    from planner import register_planner_handlers, open_planner
-    log.info("Planner module loaded")
-except Exception as _e:
-    log.warning("Planner module not available: %s", _e)
-    register_planner_handlers = lambda app: None
-    open_planner = None
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 # -----------------------------------------------------------------------------
 # ENV
@@ -94,11 +68,13 @@ TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
 TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
 
+# Не обязателен для tweet’ов, но может быть в CI окружении
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+
 GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
-GITHUB_IMAGE_PATH = "images_for_posts"
+GITHUB_IMAGE_PATH = os.getenv("GH_IMAGES_DIR", "images_for_posts")
 
-# Публичный триггер воркера (опционально)
 AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
 PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
 FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
@@ -113,6 +89,19 @@ _missing = [k for k in _need_env if not os.getenv(k)]
 if _missing:
     log.error("Не заданы обязательные переменные окружения: %s", _missing)
 
+# -----------------------------------------------------------------------------
+# БОТ/ЧАТ/ЧАСОВОЙ ПОЯС
+# -----------------------------------------------------------------------------
+TZ = ZoneInfo("Europe/Kyiv")
+
+approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL) if TELEGRAM_BOT_TOKEN_APPROVAL else None
+channel_bot  = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL) if TELEGRAM_BOT_TOKEN_CHANNEL else None
+
+BOT_ID: Optional[int] = None
+BOT_USERNAME: Optional[str] = None
+
+# Чат согласования: может быть int (-100...) или '@username'
+TELEGRAM_APPROVAL_CHAT_ID: Any = None
 _raw_chat = (TELEGRAM_APPROVAL_CHAT_ID_STR or os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "").strip()
 if _raw_chat.startswith("@"):
     TELEGRAM_APPROVAL_CHAT_ID = _raw_chat
@@ -126,7 +115,6 @@ else:
         log.error("ENV TELEGRAM_APPROVAL_CHAT_ID некорректен: %s", _e)
 
 def _approval_chat_id() -> Any:
-    """Надёжно вернуть chat_id/username чата согласования из ENV (с кэшированием)."""
     global TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_APPROVAL_CHAT_ID_STR
     if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID != 0:
         return TELEGRAM_APPROVAL_CHAT_ID
@@ -147,28 +135,42 @@ def _approval_chat_id() -> Any:
         log.error("Approval chat id is invalid (cannot parse).")
         return 0
 
-# -----------------------------------------------------------------------------
-# ГЛОБАЛЫ/БОТЫ/ЧАСОВОЙ ПОЯС
-# -----------------------------------------------------------------------------
-TZ = ZoneInfo("Europe/Kyiv")
-approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL) if TELEGRAM_BOT_TOKEN_APPROVAL else None
-channel_bot  = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL) if TELEGRAM_BOT_TOKEN_CHANNEL else None
+# (Оставлено для совместимости: опционально ограничить пользователя)
+try:
+    APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0") or "0")
+except Exception:
+    APPROVAL_USER_ID = 0
+
+def _is_approved_user(update: Update) -> bool:
+    if not update or not getattr(update, "effective_user", None):
+        return False
+    if APPROVAL_USER_ID and update.effective_user and update.effective_user.id != APPROVAL_USER_ID:
+        return False
+    return True
+
+# Планировщик (опционально)
+try:
+    from planner import register_planner_handlers, open_planner
+    log.info("Planner module loaded")
+except Exception as _e:
+    log.warning("Planner module not available: %s", _e)
+    register_planner_handlers = lambda app: None
+    open_planner = None
 
 # -----------------------------------------------------------------------------
-# ГЛОБАЛЫ ДЛЯ ПОСТА/СОСТОЯНИЯ
+# ВОТЧДОГ (по умолчанию ВЫКЛЮЧЕН)
 # -----------------------------------------------------------------------------
-TIMER_PUBLISH_DEFAULT = 180
-TIMER_PUBLISH_EXTEND  = 600
-
-# Watchdog: по умолчанию ОТКЛЮЧЁН (0). Включи через ENV AUTO_SHUTDOWN_AFTER_SECONDS, например 600.
 try:
     AUTO_SHUTDOWN_AFTER_SECONDS = int(os.getenv("AUTO_SHUTDOWN_AFTER_SECONDS", "0") or "0")
 except Exception:
     AUTO_SHUTDOWN_AFTER_SECONDS = 0
 ENABLE_WATCHDOG = AUTO_SHUTDOWN_AFTER_SECONDS > 0
 
-VERBATIM_MODE = False  # если True — твит без «хвоста»
-AUTO_AI_IMAGE = False  # авто-добавление картинки (оставляем False — только по кнопке)
+# -----------------------------------------------------------------------------
+# СТЕЙТЫ/НАСТРОЙКИ ПУБЛИКАЦИЙ
+# -----------------------------------------------------------------------------
+VERBATIM_MODE = False
+AUTO_AI_IMAGE = False
 
 TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 🐺 https://t.me/AiCoin_ETH"
 TG_TAIL_HTML     = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter X</a>'
@@ -176,23 +178,21 @@ TG_TAIL_HTML     = '<a href="https://getaicoin.com/">Website</a> | <a href="http
 def _worker_url_with_secret() -> str:
     base = AICOIN_WORKER_URL or ""
     sec  = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
-    if not base:
-        return base
+    if not base: return base
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}s={sec}" if sec else base
 
-# -----------------------------------------------------------------------------
 # Twitter API
-# -----------------------------------------------------------------------------
 def get_twitter_clients():
     if not (TWITTER_API_KEY and TWITTER_API_SECRET and TWITTER_ACCESS_TOKEN and TWITTER_ACCESS_TOKEN_SECRET):
-        log.warning("Twitter ENV переменные не заданы полностью — клиенты не будут созданы.")
+        log.warning("Twitter ENV переменные заданы не полностью — клиенты не будут созданы.")
         return None, None
     client_v2 = tweepy.Client(
         consumer_key=TWITTER_API_KEY,
         consumer_secret=TWITTER_API_SECRET,
         access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET,
+        bearer_token=TWITTER_BEARER_TOKEN
     )
     api_v1 = tweepy.API(
         tweepy.OAuth1UserHandler(
@@ -203,9 +203,7 @@ def get_twitter_clients():
 
 twitter_client_v2, twitter_api_v1 = get_twitter_clients()
 
-# -----------------------------------------------------------------------------
-# GitHub (современная авторизация)
-# -----------------------------------------------------------------------------
+# GitHub
 try:
     if _GhAuth and GITHUB_TOKEN:
         _gh_auth = _GhAuth.Token(GITHUB_TOKEN)
@@ -216,7 +214,6 @@ except Exception:
     github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 github_repo = github_client.get_repo(GITHUB_REPO) if (github_client and GITHUB_REPO) else None
-GITHUB_IMAGE_PATH = "images_for_posts"
 
 # -----------------------------------------------------------------------------
 # СТЕЙТ ПО ПОСТУ
@@ -227,33 +224,30 @@ post_data: Dict[str, Any] = {
     "media_kind": "none",     # none | image | video
     "media_src":  "tg",       # tg | url
     "media_ref":  None,       # file_id (tg) или url (url)
-    "media_local_path": None, # временный путь скачанного файла
+    "media_local_path": None, # путь временного файла
     "post_id": 0,
     "is_manual": False,
     "user_tags_override": False
 }
-prev_data = post_data.copy()
 
-pending_post = {"active": False, "timer": None, "timeout": TIMER_PUBLISH_DEFAULT, "mode": "normal"}
+pending_post = {"active": False, "timer": None, "timeout": 180, "mode": "normal"}
 do_not_disturb = {"active": False}
 
 last_action_time: Dict[int, datetime] = {}
 last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None
-ROUTE_TO_PLANNER: set[int] = set()
 awaiting_hashtags_until: Optional[datetime] = None
+ROUTE_TO_PLANNER: set[int] = set()
 
-# ---- ИИ состояние (ГЛОБАЛЬНОЕ) ----
+# AI стейт
 AI_STATE_G: Dict[str, Any] = {"mode": "idle"}
-
 def ai_state_reset():
-    AI_STATE_G.clear()
-    AI_STATE_G.update({"mode": "idle"})
+    AI_STATE_G.clear(); AI_STATE_G.update({"mode": "idle"})
     log_ai.info("AI|state.reset | mode=idle")
 
 def ai_state_set(**kwargs):
     AI_STATE_G.update(kwargs)
-    log_ai.info("AI|state.set | %s", " ".join([f"{k}={v}" for k, v in kwargs.items()]))
+    log_ai.info("AI|state.set | %s", " ".join(f"{k}={v}" for k, v in kwargs.items()))
 
 def ai_state_get() -> Dict[str, Any]:
     return AI_STATE_G
@@ -264,7 +258,7 @@ def ai_set_last_topic(topic: str):
 def ai_get_last_topic() -> str:
     return AI_STATE_G.get("last_topic", "").strip()
 # -----------------------------------------------------------------------------
-# Адресовано ли сообщение нашему боту?
+# Адресовано ли сообщение нашему боту? (для групп)
 # -----------------------------------------------------------------------------
 def _message_addresses_bot(update: Update) -> bool:
     msg = update.message
@@ -289,72 +283,7 @@ def _message_addresses_bot(update: Update) -> bool:
     return False
 
 # -----------------------------------------------------------------------------
-# DEBUG helpers
-# -----------------------------------------------------------------------------
-def _dbg_update_summary(update: Update) -> Dict[str, Any]:
-    try:
-        msg = update.message
-        chat = update.effective_chat
-        user = update.effective_user
-        text = (msg.text or msg.caption) if msg else None
-        ent = (msg.entities or []) + (msg.caption_entities or []) if msg else []
-        media = None
-        if msg:
-            if getattr(msg, "photo", None):
-                media = f"photo[{len(msg.photo)}]"
-            elif getattr(msg, "video", None):
-                media = "video"
-            elif getattr(msg, "document", None):
-                media = f"doc:{msg.document.mime_type}"
-        return {
-            "chat_id": getattr(chat, "id", None),
-            "chat_type": getattr(chat, "type", None),
-            "chat_username": getattr(chat, "username", None),
-            "from_user_id": getattr(user, "id", None),
-            "from_username": getattr(user, "username", None),
-            "has_text": bool(text),
-            "text_head": (text[:120] if text else None),
-            "entities": [getattr(e, "type", None) for e in ent] if ent else [],
-            "media": media,
-        }
-    except Exception as e:
-        return {"error": f"dbg_summary_fail:{e}"}
-
-async def _resolve_from_approval_chat(update: Update) -> Tuple[bool, Dict[str, Any]]:
-    info = {}
-    chat = update.effective_chat
-    aid = _approval_chat_id()
-    is_from = False
-    try:
-        if isinstance(aid, int) and aid != 0:
-            is_from = (chat.id == aid)
-            info["mode"] = "id"; info["aid"] = aid; info["chat_id"] = getattr(chat, "id", None)
-        elif isinstance(aid, str) and aid.strip().startswith("@"):
-            wanted = aid.strip().lower()
-            info["mode"] = "username"; info["aid"] = wanted
-            try:
-                chat_obj = await approval_bot.get_chat(wanted)
-                resolved_id = getattr(chat_obj, "id", None)
-                info["resolved_id"] = resolved_id
-                is_from = (chat.id == resolved_id) if resolved_id is not None else False
-                if resolved_id is None:
-                    uname = getattr(chat, "username", None)
-                    info["chat_username"] = uname
-                    is_from = bool(uname and ("@" + uname.lower()) == wanted)
-            except Exception as e:
-                info["resolve_error"] = str(e)
-                uname = getattr(chat, "username", None)
-                info["chat_username"] = uname
-                is_from = bool(uname and ("@" + uname.lower()) == wanted)
-        else:
-            info["mode"] = "unknown"; is_from = False
-    except Exception as e:
-        info["exception"] = str(e); is_from = False
-    info["result"] = is_from
-    return is_from, info
-
-# -----------------------------------------------------------------------------
-# КНОПКИ / МЕНЮ
+# Безопасные отправки и вспомогательные UI
 # -----------------------------------------------------------------------------
 def get_start_menu():
     return InlineKeyboardMarkup([
@@ -417,9 +346,6 @@ def _image_confirm_keyboard_for_state() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("↩️ Назад к тексту", callback_data="ai_img_back_to_text")]
         ])
 
-# -----------------------------------------------------------------------------
-# БЕЗОПАСНЫЕ ОТПРАВКИ / КНОПКИ
-# -----------------------------------------------------------------------------
 async def safe_q_answer(q) -> bool:
     try:
         await q.answer()
@@ -461,58 +387,40 @@ async def send_with_start_button(chat_id: Any, text: str):
         await safe_send_message(approval_bot, chat_id=chat_id, text=text)
 
 # -----------------------------------------------------------------------------
-# ДЕТЕКТОР «НА АНГЛИЙСКОМ»
+# ДЕТЕКТОР языка «на английском»
 # -----------------------------------------------------------------------------
 _EN_PATTERNS = [
     r"\benglish\b", r"\bin\s+english\b", r"\bwrite\s+in\s+english\b",
     r"\bEN\b", r"\bENG\b",
     r"на\s+английск(ом|ий|ом языке)", r"по-английски", r"английском\s+языке"
 ]
-
-def english_requested(s: str) -> bool:
-    txt = (s or "").lower()
-    for p in _EN_PATTERNS:
-        if re.search(p, txt):
-            return True
-    return False
-
-def strip_language_directives(s: str) -> str:
-    """Убираем из темы явные указания языка, чтобы не мешать генерации."""
-    if not s:
-        return s
-    out = s
-    for p in _EN_PATTERNS:
-        out = re.sub(p, "", out, flags=re.IGNORECASE)
-    # зачистить двойные пробелы и хвосты
-    out = re.sub(r"\s{2,}", " ", out).strip(" -–—\t")
-    return out
+def wants_english(text: str) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t) for p in _EN_PATTERNS)
 
 # -----------------------------------------------------------------------------
-# УВЕДОМЛЕНИЯ О ПРОГРЕССЕ (для TG)
+# Уведомления «бот работает»
 # -----------------------------------------------------------------------------
 async def ai_progress(text: str):
-    """Короткое уведомление в чат согласования о том, что бот работает."""
     try:
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=text)
     except Exception as e:
         log_ai.warning("AI|progress send fail: %s", e)
 
 # -----------------------------------------------------------------------------
-# УТИЛИТЫ ДЛИНЫ/ХЭШТЕГИ/ТЕКСТ
+# ТИХ (Twitter length), хвосты, хэштеги
 # -----------------------------------------------------------------------------
 _TCO_LEN = 23
 _URL_RE = re.compile(r'https?://\S+', flags=re.UNICODE)
 MY_HASHTAGS_STR = "#AiCoin #AI $Ai #crypto"
 
 def twitter_len(s: str) -> int:
-    if not s:
-        return 0
+    if not s: return 0
     s = normalize("NFC", s)
     return len(_URL_RE.sub('X' * _TCO_LEN, s))
 
 def trim_to_twitter_len(s: str, max_len: int) -> str:
-    if not s:
-        return s
+    if not s: return s
     s = normalize("NFC", s).strip()
     if twitter_len(s) <= max_len:
         return s
@@ -525,8 +433,7 @@ def _dedup_hashtags(*groups):
     seen, out = set(), []
     def norm(t: str) -> str:
         t = t.strip()
-        if not t:
-            return ""
+        if not t: return ""
         if not (t.startswith("#") or t.startswith("$")):
             t = "#" + t
         return t
@@ -534,41 +441,34 @@ def _dedup_hashtags(*groups):
         tl = t.lower()
         return ("ai" in tl) or ("crypto" in tl) or tl.startswith("$ai")
     for g in groups:
-        if not g:
-            continue
+        if not g: continue
         items = g.split() if isinstance(g, str) else list(g)
         for raw in items:
             tag = norm(raw)
-            if not tag or not ok(tag):
-                continue
-            key = tag.lower()
-            if key in seen:
-                continue
-            seen.add(key); out.append(tag)
+            if not tag or not ok(tag): continue
+            k = tag.lower()
+            if k in seen: continue
+            seen.add(k); out.append(tag)
     return " ".join(out)
 
 def _parse_hashtags_line_user(line: str) -> List[str]:
-    if not line:
-        return []
+    if not line: return []
     tmp = re.sub(r"[,\u00A0;]+", " ", line.strip())
     raw = [w for w in tmp.split() if w]
     seen, out = set(), []
     for t in raw:
         t = t.strip()
-        if not t:
-            continue
+        if not t: continue
         if not (t.startswith("#") or t.startswith("$")):
             t = "#" + t
         k = t.lower()
-        if k in seen:
-            continue
+        if k in seen: continue
         seen.add(k); out.append(t)
     return out
 
 def trim_preserving_urls(body: str, max_len: int) -> str:
     body = (body or "").strip()
-    if max_len <= 0 or not body:
-        return ""
+    if max_len <= 0 or not body: return ""
     parts, last = [], 0
     for m in _URL_RE.finditer(body):
         if m.start() > last:
@@ -579,8 +479,7 @@ def trim_preserving_urls(body: str, max_len: int) -> str:
         parts.append((False, body[last:]))
     out = ""
     for is_url, seg in parts:
-        if not seg:
-            continue
+        if not seg: continue
         if is_url:
             cand = (out + (" " if out else "") + seg).strip()
             if twitter_len(cand) <= max_len:
@@ -588,14 +487,11 @@ def trim_preserving_urls(body: str, max_len: int) -> str:
             else:
                 continue
         else:
-            if twitter_len(out) >= max_len:
-                break
+            if twitter_len(out) >= max_len: break
             remain = max_len - twitter_len(out) - (1 if out else 0)
-            if remain <= 0:
-                break
+            if remain <= 0: break
             chunk = seg.strip()
-            if not chunk:
-                continue
+            if not chunk: continue
             if twitter_len((out + (" " if out else "") + chunk).strip()) <= max_len:
                 out = (out + (" " if out else "") + chunk).strip()
             else:
@@ -692,7 +588,7 @@ def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
     return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
 # -----------------------------------------------------------------------------
-# TG: гарантированный хвост + лимиты
+# TG лимиты и сборка финального HTML
 # -----------------------------------------------------------------------------
 TG_CAPTION_MAX = 1024
 TG_TEXT_MAX = 4096
@@ -768,7 +664,7 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         return tmp.name
 
 # -----------------------------------------------------------------------------
-# Длина и очистка ИИ-текста (666±20, без дописываний)
+# Очистка ИИ-текста и обрезка к целевой длине
 # -----------------------------------------------------------------------------
 def _get_len_config() -> Tuple[int, int]:
     try:
@@ -827,8 +723,7 @@ async def init_db():
         await db.commit()
 
 def normalize_text_for_hashing(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     return " ".join(text.strip().lower().split())
 
 def sha256_hex(data: bytes) -> str:
@@ -894,7 +789,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.warning("HISTORY|insert fail (возможно дубликат): %s", e)
 
 # -----------------------------------------------------------------------------
-# Предпросмотр (один блок — с медиа или без)
+# Предпросмотр (с медиа/без)
 # -----------------------------------------------------------------------------
 async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None = "Предпросмотр"):
     text_for_message = build_telegram_preview(text_en, ai_hashtags or [])
@@ -952,13 +847,12 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
-
 # -----------------------------------------------------------------------------
-# Генерация ИИ-изображения (с уведомлениями «бот генерирует изображение…»)
+# Генерация ИИ-изображения
 # -----------------------------------------------------------------------------
 async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Optional[str]]:
     if not hasattr(ai_client, "ai_generate_image"):
-        log_ai.info("AI|image.skip | функция ai_generate_image отсутствует в ai_client.")
+        log_ai.info("AI|image.skip | функция ai_generate_image отсутствует.")
         return "⚠️ Генерация изображения недоступна (ai_generate_image отсутствует).", None
     try:
         await ai_progress("🖼 Бот генерирует изображение…")
@@ -986,6 +880,7 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
     except Exception as e:
         log_ai.warning("AI|image.exception: %s", e)
         return "⚠️ Ошибка генерации изображения.", None
+
 # -----------------------------------------------------------------------------
 # Публикация в Telegram
 # -----------------------------------------------------------------------------
@@ -994,7 +889,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         mk = post_data.get("media_kind", "none")
         msrc = post_data.get("media_src", "tg")
         mref = post_data.get("media_ref")
-        log.info("TG|publish start kind=%s src=%s ref=%s", mk, msrc, (mref if isinstance(mref, str) else str(mref))[:120])
+        log.info("TG|publish start kind=%s src=%s ref=%s", mk, msrc, (str(mref)[:120] if mref else None))
 
         final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
         if mk == "none" or not mref:
@@ -1008,7 +903,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
             log.info("TG|send_message ok id=%s len=%s", getattr(msg, "message_id", None), len(final_html))
             return True
 
-        local_path = None
+        # Подготовка локального файла
         if msrc == "url":
             local_path = _download_to_temp_file(mref)
             if not local_path:
@@ -1019,7 +914,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
             await tg_file.download_to_drive(tmp.name)
             local_path = tmp.name
-            log.info("TG|get_file id=%s path=%s size~? kind=%s", mref, local_path, mk)
+            log.info("TG|get_file id=%s path=%s kind=%s", mref, local_path, mk)
 
         post_data["media_local_path"] = local_path
 
@@ -1067,7 +962,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         return False
 
 # -----------------------------------------------------------------------------
-# Вспомогательные функции для URL-медиа (определение расширения/скачивание)
+# Вспомогательные функции URL-медиа
 # -----------------------------------------------------------------------------
 def _guess_ext_from_headers_and_url(ctype: str | None, url: str | None, default_img_ext: str = ".jpg") -> str:
     mapping = {
@@ -1266,31 +1161,14 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             tw_status = await publish_post_to_twitter(twitter_final_text)
             if tw_status:
                 await save_post_to_history(twitter_final_text, media_hash)
-
-    if publish_tg:
-        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в Telegram!" if tg_status else "❌ Не удалось отправить в Telegram."))
-    if publish_tw:
-        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=("✅ Успешно отправлено в X (Twitter)!" if tw_status else "❌ Не удалось отправить в X (Twitter)."))
 # -----------------------------------------------------------------------------
-# Определение языка запроса (форс EN по фразам пользователя)
-# -----------------------------------------------------------------------------
-_EN_HINTS = (
-    "на английском", "английском", "англ", "english", "in english", "write in english",
-    "eng only", "en only"
-)
-
-def wants_english(text: str) -> bool:
-    t = (text or "").lower()
-    return any(h in t for h in _EN_HINTS)
-
-# -----------------------------------------------------------------------------
-# Этап: Ввод темы для ИИ (через обычное сообщение)
+# Этап: ввод темы для ИИ
 # -----------------------------------------------------------------------------
 async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
         return
     now = datetime.now(TZ)
-    pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
+    pending_post.update(active=True, timer=now, timeout=600)
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
@@ -1298,7 +1176,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media_kind, media_src, media_ref = "none", "tg", None
     kind_logged = "text"
 
-    # Прикреплённое медиа/URL (опционально)
+    # Медиа/URL
     if getattr(update.message, "photo", None):
         media_kind, media_ref = "image", update.message.photo[-1].file_id; kind_logged = "photo"
     elif getattr(update.message, "video", None):
@@ -1321,20 +1199,18 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Отправьте тему поста (любой текст).")
         return
 
-    # Язык: если пользователь просит английский — принудительно генерируем EN
+    # Принудительный EN
     locale_hint = "en" if wants_english(topic) else None
     if locale_hint == "en" and not re.search(r"[A-Za-z]", topic):
         topic = f"{topic} (write in English)"
 
     ai_set_last_topic(topic)
 
-    # Уведомление о прогрессе
     await ai_progress("🧠 Бот генерирует текст…")
 
     # Генерация
     try:
         txt, warn_t = ai_client.ai_generate_text(topic)
-        # если просили EN, а пришёл не-EN — попробуем форсировать EN
         if locale_hint == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
             try:
                 txt = ai_client.generate_text(topic, locale_hint="en")
@@ -1376,7 +1252,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_approved_user(update):
         return
     now = datetime.now(TZ)
-    pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
+    pending_post.update(active=True, timer=now, timeout=600)
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
@@ -1424,25 +1300,28 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 # -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.debug("CBQ|in %s", _dbg_update_summary(update))
+        q = update.callback_query
     except Exception:
-        pass
+        return
+    if not q:
+        return
 
     if not _is_approved_user(update):
-        try:
-            await safe_q_answer(update.callback_query)
-        except Exception:
-            pass
+        await safe_q_answer(q)
         return
 
     global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
-    q = update.callback_query
     data = q.data
-    await safe_q_answer(q)
+
+    # Пытаемся ответить; если старый — просто не падаем
+    ok = await safe_q_answer(q)
+    if not ok:
+        # Даже если старый, мы всё равно обновим состояние, но без повторного answer()
+        pass
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
-    pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
+    pending_post.update(active=True, timer=now, timeout=600)
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
@@ -1494,7 +1373,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # === ИИ меню ===
     if data == "ai_home":
         ai_state_set(mode="ai_home")
         await safe_send_message(
@@ -1511,6 +1389,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="🧠 Введите тему поста (EN/RU/UA). Можно приложить картинку/видео или URL. У меня есть 5 минут.",
             reply_markup=ForceReply(selective=True, input_field_placeholder="Тема поста…")
         )
+        return
+
+    if data == "ai_hashtags_suggest":
+        # Если есть текст — попросим ai_client подобрать теги, иначе — подсказка
+        base = (post_data.get("text_en") or "").strip()
+        if base and hasattr(ai_client, "suggest_hashtags"):
+            try:
+                tags = ai_client.suggest_hashtags(base) or []
+                # Почистим/дедуп
+                tags = _parse_hashtags_line_user(" ".join(tags))
+                post_data["ai_hashtags"] = tags
+                post_data["user_tags_override"] = False
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(),
+                                        text=f"✅ Хэштеги подобраны: {' '.join(tags) if tags else '—'}")
+                await send_single_preview(post_data.get("text_en") or "", post_data.get("ai_hashtags") or [], header="Предпросмотр (теги авто)")
+            except Exception as e:
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"⚠️ Не удалось сгенерировать хэштеги: {e}")
+        else:
+            await safe_send_message(approval_bot, chat_id=_approval_chat_id(),
+                                    text="ℹ️ Сначала дайте текст поста (или нажмите «Сделай сам»), затем повторите подбор хэштегов.")
         return
 
     # === ТЕКСТ подтверждение/редактирование ===
@@ -1533,15 +1431,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await ai_progress("🧠 Бот генерирует текст…")
-            txt, warn = ai_client.ai_generate_text(last_topic)
-            if wants_english(last_topic) and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
-                try:
-                    txt = ai_client.generate_text(last_topic, locale_hint="en")
-                    warn = (warn or "")
-                    if "forced EN" not in (warn or ""):
-                        warn = (warn + " | forced EN").strip(" |")
-                except Exception:
-                    pass
+            try:
+                txt, warn = ai_client.ai_generate_text(last_topic)
+                if wants_english(last_topic) and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
+                    try:
+                        txt = ai_client.generate_text(last_topic, locale_hint="en")
+                        warn = (warn or "")
+                        if "forced EN" not in (warn or ""):
+                            warn = (warn + " | forced EN").strip(" |")
+                    except Exception:
+                        pass
+            except Exception as e:
+                txt, warn = "", f"regen fallback ({e})"
             txt = adjust_text_to_target_length(sanitize_ai_text(txt))
             post_data["text_en"] = txt
             ai_state_set(mode="confirm_text", await_until=(now + timedelta(minutes=5)))
@@ -1635,15 +1536,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "show_day_plan":
+        if open_planner:
+            try:
+                await open_planner(approval_bot, _approval_chat_id())
+            except Exception as e:
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"⚠️ Planner недоступен: {e}")
+        else:
+            await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="ℹ️ Planner не подключён.")
+        return
+
 # -----------------------------------------------------------------------------
-# Ввод обычных сообщений (роутинг по состоянию)
+# Роутинг обычных сообщений
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        log.debug("MSG|in %s", _dbg_update_summary(update))
-    except Exception:
-        pass
-
     if not _is_approved_user(update):
         return
 
@@ -1651,7 +1557,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     last_button_pressed_at = now
 
-    pending_post.update(active=True, timer=now, timeout=TIMER_PUBLISH_EXTEND)
+    pending_post.update(active=True, timer=now, timeout=600)
     if pending_post.get("mode") == "placeholder":
         pending_post["mode"] = "normal"
 
@@ -1662,9 +1568,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (await_until is None) or (now <= await_until):
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
-            from_approval_chat, _ = await _resolve_from_approval_chat(update)
-
-            if in_private or from_approval_chat or _message_addresses_bot(update):
+            # В группах — адресовано ли боту?
+            if in_private or _message_addresses_bot(update):
                 return await handle_ai_input(update, context)
             else:
                 return
@@ -1753,10 +1658,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
+    # По умолчанию — игнор
     return
 
 # -----------------------------------------------------------------------------
-# STARTUP / SHUTDOWN / MAIN
+# STARTUP / WATCHDOG / MAIN
 # -----------------------------------------------------------------------------
 async def on_start(app: Application):
     await init_db()
@@ -1766,10 +1672,20 @@ async def on_start(app: Application):
     post_data["media_src"] = "tg"
     post_data["media_ref"] = None
 
+    # Превью на старте
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], header="Предпросмотр (ручной режим)")
+
+    # Критично: считаем, что активность была только что
+    global last_button_pressed_at
+    last_button_pressed_at = datetime.now(TZ)
+
     log.info("START|bot launched; preview sent. Planner — см. planner.py (если подключен).")
 
 async def check_inactivity_shutdown():
+    # Запускаем только при включённом вотчдоге
+    if not ENABLE_WATCHDOG:
+        return
+
     global last_button_pressed_at
     while True:
         try:
@@ -1779,7 +1695,11 @@ async def check_inactivity_shutdown():
             idle = (datetime.now(TZ) - last_button_pressed_at).total_seconds()
             if idle >= AUTO_SHUTDOWN_AFTER_SECONDS:
                 try:
-                    await send_with_start_button(_approval_chat_id(), "🔴 Нет активности 10 минут. Отключаюсь. Нажми «Старт воркера», чтобы перезапустить.")
+                    mins = max(1, int(AUTO_SHUTDOWN_AFTER_SECONDS // 60))
+                    await send_with_start_button(
+                        _approval_chat_id(),
+                        f"🔴 Нет активности {mins} мин. Отключаюсь. Нажми «Старт воркера», чтобы перезапустить."
+                    )
                 except Exception:
                     pass
                 shutdown_bot_and_exit()
@@ -1788,7 +1708,10 @@ async def check_inactivity_shutdown():
         except Exception as e:
             log.warning("WATCHDOG|error: %s", e)
             try:
-                await send_with_start_button(_approval_chat_id(), f"⚠️ Ошибка наблюдателя активности: {e}\nНажми «Старт воркера», чтобы перезапустить.")
+                await send_with_start_button(
+                    _approval_chat_id(),
+                    f"⚠️ Ошибка наблюдателя активности: {e}\nНажми «Старт воркера», чтобы перезапустить."
+                )
             except Exception:
                 pass
 
@@ -1829,9 +1752,11 @@ def main():
     )
 
     register_planner_handlers(app)
-
     app.add_error_handler(on_error)
-    asyncio.get_event_loop().create_task(check_inactivity_shutdown())
+
+    # Запуск наблюдателя — ТОЛЬКО если включён
+    if ENABLE_WATCHDOG:
+        asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
     async def _fetch_me():
         global BOT_ID, BOT_USERNAME
