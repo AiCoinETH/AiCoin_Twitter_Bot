@@ -5,6 +5,7 @@ twitter_bot.py — согласование/публикация в Telegram и 
 - статусы «генерирую текст/изображение»
 - явное принуждение английского, если пользователь просит EN
 - совместимость с обновлённым ai_client.py
+- безопасный watchdog (по умолчанию выключен) и расширенное стартовое уведомление
 """
 
 import os
@@ -145,6 +146,7 @@ def _approval_chat_id() -> Any:
         TELEGRAM_APPROVAL_CHAT_ID = 0
         log.error("Approval chat id is invalid (cannot parse).")
         return 0
+
 # -----------------------------------------------------------------------------
 # ГЛОБАЛЫ/БОТЫ/ЧАСОВОЙ ПОЯС
 # -----------------------------------------------------------------------------
@@ -157,7 +159,14 @@ channel_bot  = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL) if TELEGRAM_BOT_TOKEN_CHANN
 # -----------------------------------------------------------------------------
 TIMER_PUBLISH_DEFAULT = 180
 TIMER_PUBLISH_EXTEND  = 600
-AUTO_SHUTDOWN_AFTER_SECONDS = 600
+
+# Watchdog: по умолчанию ОТКЛЮЧЁН (0). Включи через ENV AUTO_SHUTDOWN_AFTER_SECONDS, например 600.
+try:
+    AUTO_SHUTDOWN_AFTER_SECONDS = int(os.getenv("AUTO_SHUTDOWN_AFTER_SECONDS", "0") or "0")
+except Exception:
+    AUTO_SHUTDOWN_AFTER_SECONDS = 0
+ENABLE_WATCHDOG = AUTO_SHUTDOWN_AFTER_SECONDS > 0
+
 VERBATIM_MODE = False  # если True — твит без «хвоста»
 AUTO_AI_IMAGE = False  # авто-добавление картинки (оставляем False — только по кнопке)
 
@@ -254,7 +263,6 @@ def ai_set_last_topic(topic: str):
 
 def ai_get_last_topic() -> str:
     return AI_STATE_G.get("last_topic", "").strip()
-
 # -----------------------------------------------------------------------------
 # Адресовано ли сообщение нашему боту?
 # -----------------------------------------------------------------------------
@@ -478,6 +486,7 @@ def strip_language_directives(s: str) -> str:
     # зачистить двойные пробелы и хвосты
     out = re.sub(r"\s{2,}", " ", out).strip(" -–—\t")
     return out
+
 # -----------------------------------------------------------------------------
 # УВЕДОМЛЕНИЯ О ПРОГРЕССЕ (для TG)
 # -----------------------------------------------------------------------------
@@ -977,7 +986,6 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
     except Exception as e:
         log_ai.warning("AI|image.exception: %s", e)
         return "⚠️ Ошибка генерации изображения.", None
-
 # -----------------------------------------------------------------------------
 # Публикация в Telegram
 # -----------------------------------------------------------------------------
@@ -1059,7 +1067,7 @@ async def publish_post_to_telegram(text: str | None) -> bool:
         return False
 
 # -----------------------------------------------------------------------------
-# Публикация в X (Twitter)
+# Вспомогательные функции для URL-медиа (определение расширения/скачивание)
 # -----------------------------------------------------------------------------
 def _guess_ext_from_headers_and_url(ctype: str | None, url: str | None, default_img_ext: str = ".jpg") -> str:
     mapping = {
@@ -1114,6 +1122,9 @@ def _download_to_temp_file(url: str, suffix: Optional[str] = None) -> Optional[s
         log.warning("MEDIA|download fail url=%s err=%s", url, e)
         return None
 
+# -----------------------------------------------------------------------------
+# Публикация в X (Twitter)
+# -----------------------------------------------------------------------------
 def _twitter_media_category(kind: str) -> str | None:
     if kind == "video":
         return "tweet_video"
@@ -1313,7 +1324,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Язык: если пользователь просит английский — принудительно генерируем EN
     locale_hint = "en" if wants_english(topic) else None
     if locale_hint == "en" and not re.search(r"[A-Za-z]", topic):
-        # если тема целиком на кириллице, добавим нейтральный EN-маркер
         topic = f"{topic} (write in English)"
 
     ai_set_last_topic(topic)
@@ -1324,7 +1334,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Генерация
     try:
         txt, warn_t = ai_client.ai_generate_text(topic)
-        # второй проход: если просили EN, но пришёл не-EN, перегенерируем принудительно EN (если доступно)
+        # если просили EN, а пришёл не-EN — попробуем форсировать EN
         if locale_hint == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
             try:
                 txt = ai_client.generate_text(topic, locale_hint="en")
@@ -1359,7 +1369,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # -----------------------------------------------------------------------------
-# Ручной режим («Сделай сам») — неизменённый, но аккуратная обрезка/очистка
+# Ручной режим («Сделай сам»)
 # -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
@@ -1440,7 +1450,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     last_action_time[0] = now
 
-    # Меню
     if data == "cancel_to_main":
         ROUTE_TO_PLANNER.clear()
         awaiting_hashtags_until = None
@@ -1525,7 +1534,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await ai_progress("🧠 Бот генерирует текст…")
             txt, warn = ai_client.ai_generate_text(last_topic)
-            # если последний запрос просил EN — применим wants_english
             if wants_english(last_topic) and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
                 try:
                     txt = ai_client.generate_text(last_topic, locale_hint="en")
@@ -1843,3 +1851,6 @@ def main():
         timeout=2,
         allowed_updates=["message", "callback_query"]
     )
+
+if __name__ == "__main__":
+    main()
