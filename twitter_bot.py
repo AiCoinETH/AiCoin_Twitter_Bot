@@ -9,6 +9,8 @@ twitter_bot.py — согласование/публикация в Telegram и 
 - Безопасные отправки в TG (ретраи) и корректные уведомления
 - Обработчики для "подобрать хэштеги" и "план на день" (если planner подключён)
 - Дедуп публикаций с TTL, хэши медиа, обрезка текста, обязательные хвосты
+- ИИ-режим теперь читает обычные сообщения (как «Сделай сам») — управляется ENV AI_ACCEPT_ANY_MESSAGE
+- Единая «сводка» об итогах публикации (успех/ошибка) для всех разделов
 """
 
 import os
@@ -67,9 +69,7 @@ TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
 TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
-
-# Не обязателен для tweet’ов, но может быть в CI окружении
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")  # не обязателен
 
 GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
 GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
@@ -78,6 +78,10 @@ GITHUB_IMAGE_PATH = os.getenv("GH_IMAGES_DIR", "images_for_posts")
 AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
 PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
 FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
+
+# НОВОЕ: ИИ-режим читает обычные сообщения (как «Сделай сам»)
+AI_ACCEPT_ANY_MESSAGE = (os.getenv("AI_ACCEPT_ANY_MESSAGE", "1") or "1").strip() \
+    not in ("0", "false", "False", "no", "No")
 
 _need_env = [
     "TELEGRAM_BOT_TOKEN_APPROVAL", "TELEGRAM_APPROVAL_CHAT_ID",
@@ -257,6 +261,7 @@ def ai_set_last_topic(topic: str):
 
 def ai_get_last_topic() -> str:
     return AI_STATE_G.get("last_topic", "").strip()
+
 # -----------------------------------------------------------------------------
 # Адресовано ли сообщение нашему боту? (для групп)
 # -----------------------------------------------------------------------------
@@ -662,7 +667,6 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
         tmp.write(r.content); tmp.close()
         return tmp.name
-
 # -----------------------------------------------------------------------------
 # Очистка ИИ-текста и обрезка к целевой длине
 # -----------------------------------------------------------------------------
@@ -847,6 +851,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
             parse_mode="HTML", disable_web_page_preview=True,
             reply_markup=start_preview_keyboard()
         )
+
 # -----------------------------------------------------------------------------
 # Генерация ИИ-изображения
 # -----------------------------------------------------------------------------
@@ -982,6 +987,8 @@ def _guess_ext_from_headers_and_url(ctype: str | None, url: str | None, default_
 
 def _sniff_ext_from_bytes(head: bytes, fallback: str) -> str:
     try:
+        b = head or b"
+    try:
         b = head or b""
         if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
             return ".png"
@@ -1097,9 +1104,10 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
 
     except tweepy.TweepyException as e:
         log.error("TW|TweepyException: %s", e)
-        asyncio.create_task(send_with_start_button(
-            _approval_chat_id(), "❌ X/Twitter: ошибка загрузки. Проверь права app (Read+Write) и соответствие медиа требованиям."
-        ))
+        await send_with_start_button(
+            _approval_chat_id(),
+            "❌ X/Twitter: ошибка загрузки. Проверь права app (Read+Write) и соответствие медиа требованиям."
+        )
         lp = post_data.get("media_local_path")
         if lp:
             try:
@@ -1111,7 +1119,7 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
         return False
     except Exception as e:
         log.error("TW|general error: %s", e)
-        asyncio.create_task(send_with_start_button(_approval_chat_id(), f"❌ X/Twitter: {e}"))
+        await send_with_start_button(_approval_chat_id(), f"❌ X/Twitter: {e}")
         lp = post_data.get("media_local_path")
         if lp:
             try:
@@ -1123,7 +1131,7 @@ async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
         return False
 
 # -----------------------------------------------------------------------------
-# Общая публикация (Telegram + X) с дедупом
+# Общая публикация (Telegram + X) с дедупом + сводное уведомление
 # -----------------------------------------------------------------------------
 def build_twitter_payload_text(base_text_en: str) -> str:
     if post_data.get("user_tags_override"):
@@ -1142,9 +1150,11 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     media_hash = await compute_media_hash_from_state()
     tg_status = tw_status = None
+    tg_dup = tw_dup = False
 
     if publish_tg:
         if await is_duplicate_post(telegram_text_preview, media_hash):
+            tg_dup = True
             await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для Telegram. Публикация пропущена.")
             tg_status = False
         else:
@@ -1155,14 +1165,32 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
 
     if publish_tw:
         if await is_duplicate_post(twitter_final_text, media_hash):
+            tw_dup = True
             await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для X (Twitter). Публикация пропущена.")
             tw_status = False
         else:
             tw_status = await publish_post_to_twitter(twitter_final_text)
             if tw_status:
                 await save_post_to_history(twitter_final_text, media_hash)
+
+    # Сводка (единое уведомление «успех/ошибка/пропуск») — для всех разделов, включая «Сделай сам» и ИИ
+    def fmt(name: str, status, dup: bool) -> str:
+        if status is True:
+            return f"{name}: ✅ опубликовано"
+        if dup:
+            return f"{name}: ⏭️ дубликат"
+        if status is False:
+            return f"{name}: ❌ ошибка"
+        return f"{name}: —"
+
+    if publish_tg or publish_tw:
+        summary = "📣 Итоги публикации:\n" + "\n".join([
+            fmt("Telegram", tg_status, tg_dup) if publish_tg else "Telegram: —",
+            fmt("Twitter",  tw_status, tw_dup) if publish_tw else "Twitter: —",
+        ])
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=summary)
 # -----------------------------------------------------------------------------
-# Этап: ввод темы для ИИ
+# Этап: ввод темы/контента для ИИ (принимает текст/медиа/URL) — логика как «Сделай сам»
 # -----------------------------------------------------------------------------
 async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
@@ -1176,7 +1204,7 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media_kind, media_src, media_ref = "none", "tg", None
     kind_logged = "text"
 
-    # Медиа/URL
+    # Медиа/URL — полностью повторяет поведение «Сделай сам»
     if getattr(update.message, "photo", None):
         media_kind, media_ref = "image", update.message.photo[-1].file_id; kind_logged = "photo"
     elif getattr(update.message, "video", None):
@@ -1199,16 +1227,15 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Отправьте тему поста (любой текст).")
         return
 
-    # Принудительный EN
+    # Принудительный EN, если явно попросили
     locale_hint = "en" if wants_english(topic) else None
     if locale_hint == "en" and not re.search(r"[A-Za-z]", topic):
         topic = f"{topic} (write in English)"
-
     ai_set_last_topic(topic)
 
     await ai_progress("🧠 Бот генерирует текст…")
 
-    # Генерация
+    # Генерация текста
     try:
         txt, warn_t = ai_client.ai_generate_text(topic)
         if locale_hint == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
@@ -1313,11 +1340,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
     data = q.data
 
-    # Пытаемся ответить; если старый — просто не падаем
-    ok = await safe_q_answer(q)
-    if not ok:
-        # Даже если старый, мы всё равно обновим состояние, но без повторного answer()
-        pass
+    ok = await safe_q_answer(q)  # «Query is too old» обрабатываем мягко
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -1392,12 +1415,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ai_hashtags_suggest":
-        # Если есть текст — попросим ai_client подобрать теги, иначе — подсказка
         base = (post_data.get("text_en") or "").strip()
         if base and hasattr(ai_client, "suggest_hashtags"):
             try:
                 tags = ai_client.suggest_hashtags(base) or []
-                # Почистим/дедуп
                 tags = _parse_hashtags_line_user(" ".join(tags))
                 post_data["ai_hashtags"] = tags
                 post_data["user_tags_override"] = False
@@ -1547,7 +1568,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # -----------------------------------------------------------------------------
-# Роутинг обычных сообщений
+# Роутинг обычных сообщений (обновлено: ИИ читает как «Сделай сам» при AI_ACCEPT_ANY_MESSAGE=1)
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
@@ -1568,8 +1589,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (await_until is None) or (now <= await_until):
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
-            # В группах — адресовано ли боту?
-            if in_private or _message_addresses_bot(update):
+            # Новое: если AI_ACCEPT_ANY_MESSAGE=1 — принимаем в группах без упоминания
+            if in_private or AI_ACCEPT_ANY_MESSAGE or _message_addresses_bot(update):
                 return await handle_ai_input(update, context)
             else:
                 return
@@ -1675,17 +1696,15 @@ async def on_start(app: Application):
     # Превью на старте
     await send_single_preview(post_data["text_en"], post_data["ai_hashtags"], header="Предпросмотр (ручной режим)")
 
-    # Критично: считаем, что активность была только что
+    # Считаем, что активность была только что
     global last_button_pressed_at
     last_button_pressed_at = datetime.now(TZ)
 
     log.info("START|bot launched; preview sent. Planner — см. planner.py (если подключен).")
 
 async def check_inactivity_shutdown():
-    # Запускаем только при включённом вотчдоге
     if not ENABLE_WATCHDOG:
         return
-
     global last_button_pressed_at
     while True:
         try:
@@ -1754,7 +1773,6 @@ def main():
     register_planner_handlers(app)
     app.add_error_handler(on_error)
 
-    # Запуск наблюдателя — ТОЛЬКО если включён
     if ENABLE_WATCHDOG:
         asyncio.get_event_loop().create_task(check_inactivity_shutdown())
 
