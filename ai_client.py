@@ -807,6 +807,11 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         _report(progress, "upload_photo:image_ready")
         return None, "image generation failed"
 
+# --- alias for twitter_bot backward-compat ---
+def suggest_hashtags(text: str) -> List[str]:
+    """Alias, т.к. twitter_bot ищет suggest_hashtags()."""
+    return ai_suggest_hashtags(text)
+
 # -----------------------------------------------------------------------------
 # If run directly
 # -----------------------------------------------------------------------------
