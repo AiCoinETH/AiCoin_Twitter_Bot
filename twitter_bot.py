@@ -334,23 +334,6 @@ def ai_text_confirm_keyboard():
         [InlineKeyboardButton("⬅️ Назад", callback_data="cancel_to_main")]
     ])
 
-def _image_confirm_keyboard_for_state() -> InlineKeyboardMarkup:
-    if post_data.get("media_kind") in ("image", "video") and post_data.get("media_ref"):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📷 Оставить текущее медиа", callback_data="ai_img_keep")],
-            [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="ai_img_gen")],
-            [InlineKeyboardButton("📤 Загрузить другое", callback_data="ai_img_upload")],
-            [InlineKeyboardButton("🚫 Без изображения", callback_data="ai_img_skip")],
-            [InlineKeyboardButton("↩️ Назад к тексту", callback_data="ai_img_back_to_text")]
-        ])
-    else:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="ai_img_gen")],
-            [InlineKeyboardButton("📤 Загрузить свою картинку/видео", callback_data="ai_img_upload")],
-            [InlineKeyboardButton("🚫 Без изображения", callback_data="ai_img_skip")],
-            [InlineKeyboardButton("↩️ Назад к тексту", callback_data="ai_img_back_to_text")]
-        ])
-
 async def safe_q_answer(q) -> bool:
     try:
         await q.answer()
@@ -667,6 +650,251 @@ async def download_to_temp_local(path_or_file_id: str, is_telegram: bool, bot: B
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
         tmp.write(r.content); tmp.close()
         return tmp.name
+
+# -----------------------------------------------------------------------------
+# Вспомогательные функции URL-медиа
+# -----------------------------------------------------------------------------
+def _guess_ext_from_headers_and_url(ctype: str | None, url: str | None, default_img_ext: str = ".jpg") -> str:
+    mapping = {
+        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+        "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-m4v": ".m4v",
+    }
+    if ctype:
+        c = ctype.split(";")[0].strip().lower()
+        if c in mapping:
+            return mapping[c]
+    if url:
+        low = url.lower()
+        for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".m4v", ".webm"):
+            if low.endswith(e):
+                return e
+    return default_img_ext
+
+def _sniff_ext_from_bytes(head: bytes, fallback: str) -> str:
+    """
+    Определяем расширение по сигнатуре первых байт. Исправлено: без обрыва строки b"".
+    """
+    try:
+        b = head or b""
+        if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if len(b) >= 3 and b[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if len(b) >= 6 and b[:6] in (b"GIF87a", b"GIF89a"):
+            return ".gif"
+        if len(b) >= 12 and b[8:12] == b"WEBP":
+            return ".webp"
+        if len(b) >= 12 and b[4:8] == b"ftyp":
+            return ".mp4"
+        if len(b) >= 4 and b[:4] == b"RIFF":
+            return ".webm"
+    except Exception:
+        pass
+    return fallback
+
+def _download_to_temp_file(url: str, suffix: Optional[str] = None) -> Optional[str]:
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type")
+        guessed = _guess_ext_from_headers_and_url(ctype, url, default_img_ext=".jpg")
+        ext = suffix if suffix else guessed
+        head = r.content[:64]
+        ext = _sniff_ext_from_bytes(head, ext)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp.write(r.content)
+        tmp.close()
+        log.info("MEDIA|download url=%s ctype=%s -> %s bytes=%s", url, ctype, tmp.name, len(r.content))
+        return tmp.name
+    except Exception as e:
+        log.warning("MEDIA|download fail url=%s err=%s", url, e)
+        return None
+# -----------------------------------------------------------------------------
+# Публикация в X (Twitter)
+# -----------------------------------------------------------------------------
+def _twitter_media_category(kind: str) -> str | None:
+    if kind == "video":
+        return "tweet_video"
+    if kind == "image":
+        return None
+    return None
+
+async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
+    try:
+        if not twitter_client_v2 or not twitter_api_v1:
+            raise RuntimeError("Twitter clients are not configured (check API keys and tokens).")
+
+        mk = post_data.get("media_kind", "none")
+        msrc = post_data.get("media_src", "tg")
+        mref = post_data.get("media_ref")
+        clean_text = (final_text_ready or "").strip()
+
+        log.info("TW|publish start kind=%s src=%s text_len=%s", mk, msrc, len(clean_text))
+
+        media_ids = None
+        local_path = None
+
+        if mk in ("image", "video") and mref:
+            if msrc == "url":
+                local_path = _download_to_temp_file(mref)
+                if not local_path:
+                    raise RuntimeError("Не удалось получить медиа (URL) для X")
+            else:
+                local_path = await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
+            post_data["media_local_path"] = local_path
+            size = os.path.getsize(local_path) if (local_path and os.path.exists(local_path)) else -1
+            log.info("TW|media local=%s size=%s", local_path, size)
+
+            if mk == "image":
+                media = twitter_api_v1.media_upload(filename=local_path)
+                media_ids = [media.media_id_string]
+                log.info("TW|media_upload image ok id=%s", media.media_id_string)
+            else:
+                category = _twitter_media_category(mk)
+                media = twitter_api_v1.media_upload(filename=local_path, chunked=True, media_category=category)
+                media_ids = [media.media_id_string]
+                log.info("TW|media_upload video ok id=%s", media.media_id_string)
+
+        tweet_resp = None
+        if media_ids and not clean_text:
+            try:
+                tweet_resp = twitter_client_v2.create_tweet(media={"media_ids": media_ids})
+            except TypeError:
+                tweet_resp = twitter_client_v2.create_tweet(media_ids=media_ids)
+        elif not media_ids and clean_text:
+            tweet_resp = twitter_client_v2.create_tweet(text=clean_text)
+        else:
+            try:
+                tweet_resp = twitter_client_v2.create_tweet(text=clean_text, media={"media_ids": media_ids})
+            except TypeError:
+                tweet_resp = twitter_client_v2.create_tweet(text=clean_text, media_ids=media_ids)
+
+        try:
+            tw_id = None
+            if tweet_resp and hasattr(tweet_resp, "data") and isinstance(tweet_resp.data, dict):
+                tw_id = tweet_resp.data.get("id")
+            log.info("TW|create_tweet ok id=%s", tw_id)
+        except Exception:
+            log.info("TW|create_tweet ok (no-id-parsed) resp=%s", str(tweet_resp)[:200])
+
+        if local_path:
+            try:
+                os.remove(local_path)
+                log.info("TW|tmp removed %s", local_path)
+            except Exception as rm_e:
+                log.warning("TW|tmp remove fail %s", rm_e)
+            post_data["media_local_path"] = None
+
+        return True
+
+    except tweepy.TweepyException as e:
+        log.error("TW|TweepyException: %s", e)
+        await send_with_start_button(
+            _approval_chat_id(),
+            "❌ X/Twitter: ошибка загрузки. Проверь права app (Read+Write) и соответствие медиа требованиям."
+        )
+        lp = post_data.get("media_local_path")
+        if lp:
+            try:
+                os.remove(lp)
+                log.info("TW|cleanup tmp removed %s", lp)
+            except Exception:
+                pass
+            post_data["media_local_path"] = None
+        return False
+    except Exception as e:
+        log.error("TW|general error: %s", e)
+        await send_with_start_button(_approval_chat_id(), f"❌ X/Twitter: {e}")
+        lp = post_data.get("media_local_path")
+        if lp:
+            try:
+                os.remove(lp)
+                log.info("TW|cleanup tmp removed %s", lp)
+            except Exception:
+                pass
+            post_data["media_local_path"] = None
+        return False
+
+# -----------------------------------------------------------------------------
+# Публикация в Telegram
+# -----------------------------------------------------------------------------
+async def publish_post_to_telegram(text: str | None) -> bool:
+    try:
+        mk = post_data.get("media_kind", "none")
+        msrc = post_data.get("media_src", "tg")
+        mref = post_data.get("media_ref")
+        log.info("TG|publish start kind=%s src=%s ref=%s", mk, msrc, (str(mref)[:120] if mref else None))
+
+        final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
+        if mk == "none" or not mref:
+            if not final_html.strip():
+                await send_with_start_button(_approval_chat_id(), "⚠️ Telegram: пусто (нет текста и медиа).")
+                return False
+            msg = await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=final_html, parse_mode="HTML", disable_web_page_preview=True
+            )
+            log.info("TG|send_message ok id=%s len=%s", getattr(msg, "message_id", None), len(final_html))
+            return True
+
+        # Подготовка локального файла
+        if msrc == "url":
+            local_path = _download_to_temp_file(mref)
+            if not local_path:
+                raise RuntimeError("Не удалось скачать медиа из URL для Telegram")
+        else:
+            tg_file = await approval_bot.get_file(mref)
+            ext = ".mp4" if (tg_file.file_path or "").lower().endswith(".mp4") else (".jpg" if mk == "image" else ".bin")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+            await tg_file.download_to_drive(tmp.name)
+            local_path = tmp.name
+            log.info("TG|get_file id=%s path=%s kind=%s", mref, local_path, mk)
+
+        post_data["media_local_path"] = local_path
+
+        if mk == "image":
+            with open(local_path, "rb") as f:
+                msg = await channel_bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=f,
+                    caption=(final_html if final_html.strip() else None), parse_mode="HTML"
+                )
+            log.info("TG|send_photo ok id=%s", getattr(msg, "message_id", None))
+        elif mk == "video":
+            with open(local_path, "rb") as f:
+                msg = await channel_bot.send_video(
+                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, video=f,
+                    supports_streaming=True,
+                    caption=(final_html if final_html.strip() else None), parse_mode="HTML"
+                )
+            log.info("TG|send_video ok id=%s", getattr(msg, "message_id", None))
+        else:
+            msg = await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=final_html, parse_mode="HTML", disable_web_page_preview=True
+            )
+            log.info("TG|send_message(fallback) ok id=%s", getattr(msg, "message_id", None))
+
+        try:
+            os.remove(local_path)
+            log.info("TG|tmp removed %s", local_path)
+        except Exception as rm_e:
+            log.warning("TG|tmp remove fail %s", rm_e)
+        post_data["media_local_path"] = None
+        return True
+
+    except Exception as e:
+        log.error("TG|publish error: %s", e)
+        await send_with_start_button(_approval_chat_id(), f"❌ Ошибка публикации в Telegram: {e}")
+        lp = post_data.get("media_local_path")
+        if lp:
+            try:
+                os.remove(lp)
+                log.info("TG|cleanup tmp removed %s", lp)
+            except Exception:
+                pass
+            post_data["media_local_path"] = None
+        return False
+
 # -----------------------------------------------------------------------------
 # Очистка ИИ-текста и обрезка к целевой длине
 # -----------------------------------------------------------------------------
@@ -853,7 +1081,7 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
         )
 
 # -----------------------------------------------------------------------------
-# Генерация ИИ-изображения
+# Генерация ИИ-изображения (через ai_client) + аплоад в GitHub
 # -----------------------------------------------------------------------------
 async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Optional[str]]:
     if not hasattr(ai_client, "ai_generate_image"):
@@ -887,249 +1115,12 @@ async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Option
         return "⚠️ Ошибка генерации изображения.", None
 
 # -----------------------------------------------------------------------------
-# Публикация в Telegram
+# Общие помощники твит-текста (пользовательские теги vs авто)
 # -----------------------------------------------------------------------------
-async def publish_post_to_telegram(text: str | None) -> bool:
-    try:
-        mk = post_data.get("media_kind", "none")
-        msrc = post_data.get("media_src", "tg")
-        mref = post_data.get("media_ref")
-        log.info("TG|publish start kind=%s src=%s ref=%s", mk, msrc, (str(mref)[:120] if mref else None))
-
-        final_html = build_tg_final(text or "", for_photo_caption=(mk in ("image","video")))
-        if mk == "none" or not mref:
-            if not final_html.strip():
-                await send_with_start_button(_approval_chat_id(), "⚠️ Telegram: пусто (нет текста и медиа).")
-                return False
-            msg = await channel_bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                text=final_html, parse_mode="HTML", disable_web_page_preview=True
-            )
-            log.info("TG|send_message ok id=%s len=%s", getattr(msg, "message_id", None), len(final_html))
-            return True
-
-        # Подготовка локального файла
-        if msrc == "url":
-            local_path = _download_to_temp_file(mref)
-            if not local_path:
-                raise RuntimeError("Не удалось скачать медиа из URL для Telegram")
-        else:
-            tg_file = await approval_bot.get_file(mref)
-            ext = ".mp4" if (tg_file.file_path or "").lower().endswith(".mp4") else (".jpg" if mk == "image" else ".bin")
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-            await tg_file.download_to_drive(tmp.name)
-            local_path = tmp.name
-            log.info("TG|get_file id=%s path=%s kind=%s", mref, local_path, mk)
-
-        post_data["media_local_path"] = local_path
-
-        if mk == "image":
-            with open(local_path, "rb") as f:
-                msg = await channel_bot.send_photo(
-                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, photo=f,
-                    caption=(final_html if final_html.strip() else None), parse_mode="HTML"
-                )
-            log.info("TG|send_photo ok id=%s", getattr(msg, "message_id", None))
-        elif mk == "video":
-            with open(local_path, "rb") as f:
-                msg = await channel_bot.send_video(
-                    chat_id=TELEGRAM_CHANNEL_USERNAME_ID, video=f,
-                    supports_streaming=True,
-                    caption=(final_html if final_html.strip() else None), parse_mode="HTML"
-                )
-            log.info("TG|send_video ok id=%s", getattr(msg, "message_id", None))
-        else:
-            msg = await channel_bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
-                text=final_html, parse_mode="HTML", disable_web_page_preview=True
-            )
-            log.info("TG|send_message(fallback) ok id=%s", getattr(msg, "message_id", None))
-
-        try:
-            os.remove(local_path)
-            log.info("TG|tmp removed %s", local_path)
-        except Exception as rm_e:
-            log.warning("TG|tmp remove fail %s", rm_e)
-        post_data["media_local_path"] = None
-        return True
-
-    except Exception as e:
-        log.error("TG|publish error: %s", e)
-        await send_with_start_button(_approval_chat_id(), f"❌ Ошибка публикации в Telegram: {e}")
-        lp = post_data.get("media_local_path")
-        if lp:
-            try:
-                os.remove(lp)
-                log.info("TG|cleanup tmp removed %s", lp)
-            except Exception:
-                pass
-            post_data["media_local_path"] = None
-        return False
-
-# -----------------------------------------------------------------------------
-# Вспомогательные функции URL-медиа
-# -----------------------------------------------------------------------------
-def _guess_ext_from_headers_and_url(ctype: str | None, url: str | None, default_img_ext: str = ".jpg") -> str:
-    mapping = {
-        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
-        "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-m4v": ".m4v",
-    }
-    if ctype:
-        c = ctype.split(";")[0].strip().lower()
-        if c in mapping:
-            return mapping[c]
-    if url:
-        low = url.lower()
-        for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".m4v", ".webm"):
-            if low.endswith(e):
-                return e
-    return default_img_ext
-
-def _sniff_ext_from_bytes(head: bytes, fallback: str) -> str:
-    try:
-        b = head or b"
-    try:
-        b = head or b""
-        if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
-            return ".png"
-        if len(b) >= 3 and b[:3] == b"\xff\xd8\xff":
-            return ".jpg"
-        if len(b) >= 6 and b[:6] in (b"GIF87a", b"GIF89a"):
-            return ".gif"
-        if len(b) >= 12 and b[8:12] == b"WEBP":
-            return ".webp"
-        if len(b) >= 12 and b[4:8] == b"ftyp":
-            return ".mp4"
-        if len(b) >= 4 and b[:4] == b"RIFF":
-            return ".webm"
-    except Exception:
-        pass
-    return fallback
-
-def _download_to_temp_file(url: str, suffix: Optional[str] = None) -> Optional[str]:
-    try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type")
-        guessed = _guess_ext_from_headers_and_url(ctype, url, default_img_ext=".jpg")
-        ext = suffix if suffix else guessed
-        head = r.content[:64]
-        ext = _sniff_ext_from_bytes(head, ext)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-        tmp.write(r.content)
-        tmp.close()
-        log.info("MEDIA|download url=%s ctype=%s -> %s bytes=%s", url, ctype, tmp.name, len(r.content))
-        return tmp.name
-    except Exception as e:
-        log.warning("MEDIA|download fail url=%s err=%s", url, e)
-        return None
-
-# -----------------------------------------------------------------------------
-# Публикация в X (Twitter)
-# -----------------------------------------------------------------------------
-def _twitter_media_category(kind: str) -> str | None:
-    if kind == "video":
-        return "tweet_video"
-    if kind == "image":
-        return None
-    return None
-
-async def publish_post_to_twitter(final_text_ready: str | None) -> bool:
-    try:
-        if not twitter_client_v2 or not twitter_api_v1:
-            raise RuntimeError("Twitter clients are not configured (check API keys and tokens).")
-
-        mk = post_data.get("media_kind", "none")
-        msrc = post_data.get("media_src", "tg")
-        mref = post_data.get("media_ref")
-        clean_text = (final_text_ready or "").strip()
-
-        log.info("TW|publish start kind=%s src=%s text_len=%s", mk, msrc, len(clean_text))
-
-        media_ids = None
-        local_path = None
-
-        if mk in ("image", "video") and mref:
-            if msrc == "url":
-                local_path = _download_to_temp_file(mref)
-                if not local_path:
-                    raise RuntimeError("Не удалось получить медиа (URL) для X")
-            else:
-                local_path = await download_to_temp_local(mref, is_telegram=True, bot=approval_bot)
-            post_data["media_local_path"] = local_path
-            size = os.path.getsize(local_path) if (local_path and os.path.exists(local_path)) else -1
-            log.info("TW|media local=%s size=%s", local_path, size)
-
-            if mk == "image":
-                media = twitter_api_v1.media_upload(filename=local_path)
-                media_ids = [media.media_id_string]
-                log.info("TW|media_upload image ok id=%s", media.media_id_string)
-            else:
-                category = _twitter_media_category(mk)
-                media = twitter_api_v1.media_upload(filename=local_path, chunked=True, media_category=category)
-                media_ids = [media.media_id_string]
-                log.info("TW|media_upload video ok id=%s", media.media_id_string)
-
-        tweet_resp = None
-        if media_ids and not clean_text:
-            try:
-                tweet_resp = twitter_client_v2.create_tweet(media={"media_ids": media_ids})
-            except TypeError:
-                tweet_resp = twitter_client_v2.create_tweet(media_ids=media_ids)
-        elif not media_ids and clean_text:
-            tweet_resp = twitter_client_v2.create_tweet(text=clean_text)
-        else:
-            try:
-                tweet_resp = twitter_client_v2.create_tweet(text=clean_text, media={"media_ids": media_ids})
-            except TypeError:
-                tweet_resp = twitter_client_v2.create_tweet(text=clean_text, media_ids=media_ids)
-
-        try:
-            tw_id = None
-            if tweet_resp and hasattr(tweet_resp, "data") and isinstance(tweet_resp.data, dict):
-                tw_id = tweet_resp.data.get("id")
-            log.info("TW|create_tweet ok id=%s", tw_id)
-        except Exception:
-            log.info("TW|create_tweet ok (no-id-parsed) resp=%s", str(tweet_resp)[:200])
-
-        if local_path:
-            try:
-                os.remove(local_path)
-                log.info("TW|tmp removed %s", local_path)
-            except Exception as rm_e:
-                log.warning("TW|tmp remove fail %s", rm_e)
-            post_data["media_local_path"] = None
-
-        return True
-
-    except tweepy.TweepyException as e:
-        log.error("TW|TweepyException: %s", e)
-        await send_with_start_button(
-            _approval_chat_id(),
-            "❌ X/Twitter: ошибка загрузки. Проверь права app (Read+Write) и соответствие медиа требованиям."
-        )
-        lp = post_data.get("media_local_path")
-        if lp:
-            try:
-                os.remove(lp)
-                log.info("TW|cleanup tmp removed %s", lp)
-            except Exception:
-                pass
-            post_data["media_local_path"] = None
-        return False
-    except Exception as e:
-        log.error("TW|general error: %s", e)
-        await send_with_start_button(_approval_chat_id(), f"❌ X/Twitter: {e}")
-        lp = post_data.get("media_local_path")
-        if lp:
-            try:
-                os.remove(lp)
-                log.info("TW|cleanup tmp removed %s", lp)
-            except Exception:
-                pass
-            post_data["media_local_path"] = None
-        return False
-
+def build_twitter_payload_text(base_text_en: str) -> str:
+    if post_data.get("user_tags_override"):
+        return build_tweet_user_hashtags_275(base_text_en, post_data.get("ai_hashtags") or [])
+    return build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
 # -----------------------------------------------------------------------------
 # Общая публикация (Telegram + X) с дедупом + сводное уведомление
 # -----------------------------------------------------------------------------
@@ -1173,7 +1164,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             if tw_status:
                 await save_post_to_history(twitter_final_text, media_hash)
 
-    # Сводка (единое уведомление «успех/ошибка/пропуск») — для всех разделов, включая «Сделай сам» и ИИ
+    # Сводка (единое уведомление «успех/ошибка/пропуск»)
     def fmt(name: str, status, dup: bool) -> str:
         if status is True:
             return f"{name}: ✅ опубликовано"
@@ -1189,6 +1180,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             fmt("Twitter",  tw_status, tw_dup) if publish_tw else "Twitter: —",
         ])
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=summary)
+
 # -----------------------------------------------------------------------------
 # Этап: ввод темы/контента для ИИ (принимает текст/медиа/URL) — логика как «Сделай сам»
 # -----------------------------------------------------------------------------
@@ -1566,7 +1558,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="ℹ️ Planner не подключён.")
         return
-
 # -----------------------------------------------------------------------------
 # Роутинг обычных сообщений (обновлено: ИИ читает как «Сделай сам» при AI_ACCEPT_ANY_MESSAGE=1)
 # -----------------------------------------------------------------------------
