@@ -2,15 +2,13 @@
 """
 twitter_bot.py — согласование/публикация в Telegram и X (Twitter).
 
-Ключевые правки:
-- Надёжный watchdog (выключен по умолчанию; включается через ENV AUTO_SHUTDOWN_AFTER_SECONDS>0)
-- Инициализация "последней активности" на старте, чтобы бот не вырубался сам
-- Аккуратный обработчик старых callback'ов (Query is too old)
-- Безопасные отправки в TG (ретраи) и корректные уведомления
-- Обработчики для "подобрать хэштеги" и "план на день" (если planner подключён)
-- Дедуп публикаций с TTL, хэши медиа, обрезка текста, обязательные хвосты
-- ИИ-режим теперь читает обычные сообщения (как «Сделай сам») — управляется ENV AI_ACCEPT_ANY_MESSAGE
-- Единая «сводка» об итогах публикации (успех/ошибка) для всех разделов
+Ключевые:
+- Watchdog (ENV AUTO_SHUTDOWN_AFTER_SECONDS>0), инициализация активности на старте
+- Мягкая обработка «Query is too old», безопасные отправки (ретраи)
+- «Подобрать хэштеги» и «План на день» (если planner есть)
+- Дедуп с TTL, хэш медиа, обрезка текста, обязательные хвосты
+- ИИ-режим читает обычные сообщения (ENV AI_ACCEPT_ANY_MESSAGE)
+- Единая сводка публикации
 """
 
 import os
@@ -169,7 +167,6 @@ try:
 except Exception:
     AUTO_SHUTDOWN_AFTER_SECONDS = 0
 ENABLE_WATCHDOG = AUTO_SHUTDOWN_AFTER_SECONDS > 0
-
 # -----------------------------------------------------------------------------
 # СТЕЙТЫ/НАСТРОЙКИ ПУБЛИКАЦИЙ
 # -----------------------------------------------------------------------------
@@ -242,6 +239,7 @@ last_button_pressed_at: Optional[datetime] = None
 manual_expected_until: Optional[datetime] = None
 awaiting_hashtags_until: Optional[datetime] = None
 ROUTE_TO_PLANNER: set[int] = set()
+
 # AI стейт
 AI_STATE_G: Dict[str, Any] = {"mode": "idle"}
 def ai_state_reset():
@@ -387,7 +385,6 @@ async def send_with_start_button(chat_id: Any, text: str):
         await safe_send_message(approval_bot, chat_id=chat_id, text=text, reply_markup=start_worker_keyboard())
     except Exception:
         await safe_send_message(approval_bot, chat_id=chat_id, text=text)
-
 # -----------------------------------------------------------------------------
 # ДЕТЕКТОР языка «на английском»
 # -----------------------------------------------------------------------------
@@ -590,10 +587,115 @@ def build_twitter_text(text_en: str, ai_hashtags=None) -> str:
     return (text_en or "").strip() if VERBATIM_MODE else build_tweet_with_tail_275(text_en, ai_hashtags or [])
 
 # -----------------------------------------------------------------------------
-# TG лимиты и сборка финального HTML
+# TG лимиты и финализация текста с хвостом
 # -----------------------------------------------------------------------------
 TG_CAPTION_MAX = 1024
 TG_TEXT_MAX = 4096
+
+def _has_tail(html_text_lower: str) -> bool:
+    return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
+
+def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
+    body_raw = (body_text or "").strip()
+    body_html = html_escape(body_raw)
+    tail_html = TG_TAIL_HTML
+    limit = TG_CAPTION_MAX if for_photo_caption else TG_TEXT_MAX
+    current_full = body_html
+    if not _has_tail(current_full.lower()):
+        sep = ("\n\n" if body_html else "")
+        reserved = len(sep) + len(tail_html)
+        allowed_for_body = max(0, limit - reserved)
+        if len(body_html) > allowed_for_body:
+            body_html = body_html[:allowed_for_body].rstrip()
+        current_full = (f"{body_html}{sep}{tail_html}").strip()
+    if len(current_full) > limit:
+        current_full = current_full[:limit].rstrip()
+    return current_full
+
+def build_telegram_preview(text_en: str, _ai_hashtags_ignored=None) -> str:
+    return build_tg_final(text_en, for_photo_caption=False)
+# -----------------------------------------------------------------------------
+# Тексто-helpers + GitHub upload + публикация в TG/X
+# -----------------------------------------------------------------------------
+def sanitize_ai_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
+
+def adjust_text_to_target_length(s: str, max_len: int = 800) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= max_len else (s[:max_len - 1].rstrip() + "…")
+
+def upload_image_to_github(local_path: str, filename: Optional[str] = None) -> Optional[str]:
+    """Загружает файл в репо и возвращает RAW URL."""
+    if not (github_repo and os.path.exists(local_path)):
+        return None
+    name = filename or (uuid.uuid4().hex + os.path.splitext(local_path)[1].lower())
+    gh_path = f"{GITHUB_IMAGE_PATH.strip('/').rstrip('/')}/{name}"
+    with open(local_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("ascii")
+    try:
+        github_repo.create_file(
+            path=gh_path,
+            message=f"upload {name}",
+            content=content_b64
+        )
+        owner, repo = GITHUB_REPO.split("/", 1)
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/main/{gh_path}"
+    except Exception as e:
+        log.warning("GitHub upload fail: %s", e)
+        return None
+
+async def publish_post_to_telegram(text: str) -> bool:
+    """Публикация в канал: текст/картинка/видео + хвост и обрезка."""
+    if not channel_bot or not TELEGRAM_CHANNEL_USERNAME_ID:
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ TG channel bot/env not configured.")
+        return False
+    mk, mref, msrc = post_data.get("media_kind"), post_data.get("media_ref"), post_data.get("media_src")
+    try:
+        if mk == "image" and mref:
+            await channel_bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                photo=mref,
+                caption=build_tg_final(text, for_photo_caption=True),
+                parse_mode="HTML"
+            )
+        elif mk == "video" and mref:
+            await channel_bot.send_video(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                video=mref,
+                supports_streaming=True,
+                caption=build_tg_final(text, for_photo_caption=True),
+                parse_mode="HTML"
+            )
+        else:
+            await channel_bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_USERNAME_ID,
+                text=build_tg_final(text, for_photo_caption=False),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="✅ Опубликовано в Telegram.")
+        return True
+    except Exception as e:
+        log.warning("TG publish fail: %s", e)
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"❌ Ошибка TG: {e}")
+        return False
+
+async def publish_post_to_twitter(tweet_text: str) -> bool:
+    if not twitter_client_v2:
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Twitter client not configured.")
+        return False
+    try:
+        twitter_client_v2.create_tweet(text=tweet_text)  # без медиа
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="✅ Опубликовано в X (Twitter).")
+        return True
+    except Exception as e:
+        log.warning("TW publish fail: %s", e)
+        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"❌ Ошибка X/Twitter: {e}")
+        return False
+
 # -----------------------------------------------------------------------------
 # БД истории/дедуп (асинхронная, авто-очистка > TTL)
 # -----------------------------------------------------------------------------
@@ -684,7 +786,6 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.info("HISTORY|saved text_hash=%s img_hash=%s", (text_hash or "")[:12], (media_hash or "")[:12])
         except Exception as e:
             log.warning("HISTORY|insert fail (возможно дубликат): %s", e)
-
 # -----------------------------------------------------------------------------
 # Предпросмотр (с медиа/без)
 # -----------------------------------------------------------------------------
@@ -825,14 +926,11 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             if tw_status:
                 await save_post_to_history(twitter_final_text, media_hash)
 
-    # Сводка (единое уведомление «успех/ошибка/пропуск»)
+    # Сводка
     def fmt(name: str, status, dup: bool) -> str:
-        if status is True:
-            return f"{name}: ✅ опубликовано"
-        if dup:
-            return f"{name}: ⏭️ дубликат"
-        if status is False:
-            return f"{name}: ❌ ошибка"
+        if status is True:  return f"{name}: ✅ опубликовано"
+        if dup:             return f"{name}: ⏭️ дубликат"
+        if status is False: return f"{name}: ❌ ошибка"
         return f"{name}: —"
 
     if publish_tg or publish_tw:
@@ -842,254 +940,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
         ])
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=summary)
 # -----------------------------------------------------------------------------
-# БД истории/дедуп (асинхронная, авто-очистка > TTL)
-# -----------------------------------------------------------------------------
-DB_FILE = "post_history.db"
-DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "15") or "15")
-
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                text_hash TEXT,
-                timestamp TEXT NOT NULL,
-                image_hash TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_unique
-            ON posts (COALESCE(text_hash, ''), COALESCE(image_hash, ''));
-        """)
-        cutoff = (datetime.now(TZ) - timedelta(days=DEDUP_TTL_DAYS)).isoformat()
-        await db.execute("DELETE FROM posts WHERE timestamp < ?", (cutoff,))
-        await db.commit()
-
-def normalize_text_for_hashing(text: str) -> str:
-    if not text: return ""
-    return " ".join(text.strip().lower().split())
-
-def sha256_hex(data: bytes) -> str:
-    import hashlib as _h
-    return _h.sha256(data).hexdigest()
-
-async def compute_media_hash_from_state() -> Optional[str]:
-    kind = post_data.get("media_kind")
-    src  = post_data.get("media_src")
-    ref  = post_data.get("media_ref")
-    if not kind or kind == "none" or not ref:
-        log.debug("HASH|media: none")
-        return None
-    try:
-        if src == "url":
-            r = requests.get(ref, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
-            r.raise_for_status()
-            b = r.content
-            h = sha256_hex(b)
-            log.info("HASH|media[url] kind=%s bytes=%s sha256=%s", kind, len(b), h[:16])
-            return h
-        else:
-            tg_file = await approval_bot.get_file(ref)
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            await tg_file.download_to_drive(tmp.name)
-            with open(tmp.name, "rb") as f:
-                b = f.read()
-            try:
-                os.remove(tmp.name)
-            except Exception:
-                pass
-            h = sha256_hex(b)
-            log.info("HASH|media[tg] kind=%s bytes=%s sha256=%s", kind, len(b), h[:16])
-            return h
-    except Exception as e:
-        log.warning("HASH|fail: %s", e)
-        return None
-
-async def is_duplicate_post(text: str, media_hash: Optional[str]) -> bool:
-    text_norm = normalize_text_for_hashing(text)
-    text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
-    async with aiosqlite.connect(DB_FILE) as db:
-        cutoff = (datetime.now(TZ) - timedelta(days=DEDUP_TTL_DAYS)).isoformat()
-        await db.execute("DELETE FROM posts WHERE timestamp < ?", (cutoff,))
-        await db.commit()
-        q = "SELECT 1 FROM posts WHERE COALESCE(text_hash,'') = COALESCE(?, '') AND COALESCE(image_hash,'') = COALESCE(?, '') LIMIT 1"
-        async with db.execute(q, (text_hash, media_hash or None)) as cur:
-            row = await cur.fetchone()
-            is_dup = row is not None
-            log.info("DEDUP|text_hash=%s img_hash=%s -> %s", (text_hash or "")[:12], (media_hash or "")[:12], is_dup)
-            return is_dup
-
-async def save_post_to_history(text: str, media_hash: Optional[str]):
-    text_norm = normalize_text_for_hashing(text)
-    text_hash = sha256_hex(text_norm.encode("utf-8")) if text_norm else None
-    async with aiosqlite.connect(DB_FILE) as db:
-        try:
-            await db.execute("INSERT INTO posts (text, text_hash, timestamp, image_hash) VALUES (?, ?, ?, ?)",
-                             (text, text_hash, datetime.now(TZ).isoformat(), media_hash or None))
-            await db.commit()
-            log.info("HISTORY|saved text_hash=%s img_hash=%s", (text_hash or "")[:12], (media_hash or "")[:12])
-        except Exception as e:
-            log.warning("HISTORY|insert fail (возможно дубликат): %s", e)
-
-# -----------------------------------------------------------------------------
-# Предпросмотр (с медиа/без)
-# -----------------------------------------------------------------------------
-async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None = "Предпросмотр"):
-    text_for_message = build_telegram_preview(text_en, ai_hashtags or [])
-    caption_for_media = build_tg_final(text_en, for_photo_caption=True)
-    hdr = f"<b>{html_escape(header)}</b>\n" if header else ""
-    hashtags_line = ("<i>Хэштеги:</i> " + html_escape(" ".join(ai_hashtags or []))) if (ai_hashtags) else "<i>Хэштеги:</i> —"
-    text_message = f"{hdr}{text_for_message}\n\n{hashtags_line}".strip()
-
-    mk, msrc, mref = post_data.get("media_kind"), post_data.get("media_src"), post_data.get("media_ref")
-    log.info("PREVIEW|kind=%s src=%s ref=%s", mk, msrc, (str(mref)[:100] if mref else None))
-    try:
-        if mk == "video" and mref:
-            try:
-                await approval_bot.send_video(
-                    chat_id=_approval_chat_id(), video=mref, supports_streaming=True,
-                    caption=(caption_for_media if caption_for_media.strip() else None),
-                    parse_mode="HTML", reply_markup=start_preview_keyboard()
-                )
-                log.info("PREVIEW|video ok")
-            except Exception as ee:
-                log.warning("PREVIEW|video inline fail: %s; fallback text", ee)
-                await safe_send_message(
-                    approval_bot, chat_id=_approval_chat_id(),
-                    text=text_message, parse_mode="HTML",
-                    reply_markup=start_preview_keyboard()
-                )
-        elif mk == "image" and mref:
-            try:
-                await approval_bot.send_photo(
-                    chat_id=_approval_chat_id(), photo=mref,
-                    caption=(caption_for_media if caption_for_media.strip() else None),
-                    parse_mode="HTML", reply_markup=start_preview_keyboard()
-                )
-                log.info("PREVIEW|image ok")
-            except Exception as ee:
-                log.warning("PREVIEW|image inline fail: %s; fallback text", ee)
-                await safe_send_message(
-                    approval_bot, chat_id=_approval_chat_id(),
-                    text=text_message, parse_mode="HTML",
-                    reply_markup=start_preview_keyboard()
-                )
-        else:
-            await safe_send_message(
-                approval_bot, chat_id=_approval_chat_id(),
-                text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
-                parse_mode="HTML", disable_web_page_preview=True,
-                reply_markup=start_preview_keyboard()
-            )
-            log.info("PREVIEW|text-only ok")
-    except Exception as e:
-        log.warning("PREVIEW|fallback text due to: %s", e)
-        await safe_send_message(
-            approval_bot, chat_id=_approval_chat_id(),
-            text=(text_message if text_message else "<i>(пусто — только изображение/видео)</i>"),
-            parse_mode="HTML", disable_web_page_preview=True,
-            reply_markup=start_preview_keyboard()
-        )
-
-# -----------------------------------------------------------------------------
-# Генерация ИИ-изображения (через ai_client) + аплоад в GitHub
-# -----------------------------------------------------------------------------
-async def _generate_ai_image_explicit(topic: str) -> Tuple[Optional[str], Optional[str]]:
-    if not hasattr(ai_client, "ai_generate_image"):
-        log_ai.info("AI|image.skip | функция ai_generate_image отсутствует.")
-        return "⚠️ Генерация изображения недоступна (ai_generate_image отсутствует).", None
-    try:
-        await ai_progress("🖼 Бот генерирует изображение…")
-        img_path, warn_img = ai_client.ai_generate_image(topic or "")
-        if not img_path or not os.path.exists(img_path):
-            log_ai.info("AI|image.fail | генерация не вернула файл.")
-            return (warn_img or "⚠️ Не удалось сгенерировать изображение ИИ."), None
-
-        await ai_progress("📤 Загружаю изображение…")
-        raw_url = upload_image_to_github(img_path, filename=None)
-        try:
-            os.remove(img_path)
-        except Exception:
-            pass
-        if not raw_url:
-            log_ai.info("AI|image.fail | upload to GitHub failed.")
-            return (warn_img or "⚠️ Upload image failed."), None
-
-        post_data["media_kind"] = "image"
-        post_data["media_src"]  = "url"
-        post_data["media_ref"]  = raw_url
-        log_ai.info("AI|image.ok | url=%s", raw_url)
-        await ai_progress("✅ Изображение готово.")
-        return (warn_img or ""), raw_url
-    except Exception as e:
-        log_ai.warning("AI|image.exception: %s", e)
-        return "⚠️ Ошибка генерации изображения.", None
-
-# -----------------------------------------------------------------------------
-# Общие помощники твит-текста (пользовательские теги vs авто)
-# -----------------------------------------------------------------------------
-def build_twitter_payload_text(base_text_en: str) -> str:
-    if post_data.get("user_tags_override"):
-        return build_tweet_user_hashtags_275(base_text_en, post_data.get("ai_hashtags") or [])
-    return build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
-
-# -----------------------------------------------------------------------------
-# Общая публикация (Telegram + X) с дедупом + сводное уведомление
-# -----------------------------------------------------------------------------
-async def publish_flow(publish_tg: bool, publish_tw: bool):
-    base_text_en = (post_data.get("text_en") or "").strip()
-
-    twitter_final_text = build_twitter_payload_text(base_text_en)
-    telegram_text_preview = build_telegram_preview(base_text_en, None)
-
-    if do_not_disturb["active"]:
-        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="🌙 Режим «Не беспокоить» активен. Публикация отменена.")
-        return
-
-    media_hash = await compute_media_hash_from_state()
-    tg_status = tw_status = None
-    tg_dup = tw_dup = False
-
-    if publish_tg:
-        if await is_duplicate_post(telegram_text_preview, media_hash):
-            tg_dup = True
-            await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для Telegram. Публикация пропущена.")
-            tg_status = False
-        else:
-            tg_status = await publish_post_to_telegram(text=base_text_en)
-            if tg_status:
-                final_html_saved = build_tg_final(base_text_en, for_photo_caption=(post_data.get("media_kind") in ("image","video")))
-                await save_post_to_history(final_html_saved, media_hash)
-
-    if publish_tw:
-        if await is_duplicate_post(twitter_final_text, media_hash):
-            tw_dup = True
-            await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Дубликат для X (Twitter). Публикация пропущена.")
-            tw_status = False
-        else:
-            tw_status = await publish_post_to_twitter(twitter_final_text)
-            if tw_status:
-                await save_post_to_history(twitter_final_text, media_hash)
-
-    # Сводка (единое уведомление «успех/ошибка/пропуск»)
-    def fmt(name: str, status, dup: bool) -> str:
-        if status is True:
-            return f"{name}: ✅ опубликовано"
-        if dup:
-            return f"{name}: ⏭️ дубликат"
-        if status is False:
-            return f"{name}: ❌ ошибка"
-        return f"{name}: —"
-
-    if publish_tg or publish_tw:
-        summary = "📣 Итоги публикации:\n" + "\n".join([
-            fmt("Telegram", tg_status, tg_dup) if publish_tg else "Telegram: —",
-            fmt("Twitter",  tw_status, tw_dup) if publish_tw else "Twitter: —",
-        ])
-        await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=summary)
-# -----------------------------------------------------------------------------
-# Этап: ввод темы/контента для ИИ (принимает текст/медиа/URL) — логика как «Сделай сам»
+# Этапы ввода/обработки сообщений и коллбэков
 # -----------------------------------------------------------------------------
 async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
@@ -1103,7 +954,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media_kind, media_src, media_ref = "none", "tg", None
     kind_logged = "text"
 
-    # Медиа/URL — полностью повторяет поведение «Сделай сам»
     if getattr(update.message, "photo", None):
         media_kind, media_ref = "image", update.message.photo[-1].file_id; kind_logged = "photo"
     elif getattr(update.message, "video", None):
@@ -1126,7 +976,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Отправьте тему поста (любой текст).")
         return
 
-    # Принудительный EN, если явно попросили
     locale_hint = "en" if wants_english(topic) else None
     if locale_hint == "en" and not re.search(r"[A-Za-z]", topic):
         topic = f"{topic} (write in English)"
@@ -1134,7 +983,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await ai_progress("🧠 Бот генерирует текст…")
 
-    # Генерация текста
     try:
         txt, warn_t = ai_client.ai_generate_text(topic)
         if locale_hint == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt or ""):
@@ -1170,9 +1018,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ai_text_confirm_keyboard()
     )
 
-# -----------------------------------------------------------------------------
-# Ручной режим («Сделай сам»)
-# -----------------------------------------------------------------------------
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
     if not _is_approved_user(update):
@@ -1221,9 +1066,6 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header="Предпросмотр")
     manual_expected_until = None
 
-# -----------------------------------------------------------------------------
-# CALLBACKS
-# -----------------------------------------------------------------------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         q = update.callback_query
@@ -1239,7 +1081,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_button_pressed_at, last_action_time, manual_expected_until, awaiting_hashtags_until
     data = q.data
 
-    ok = await safe_q_answer(q)  # «Query is too old» обрабатываем мягко
+    _ = await safe_q_answer(q)
 
     now = datetime.now(TZ)
     last_button_pressed_at = now
@@ -1331,7 +1173,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     text="ℹ️ Сначала дайте текст поста (или нажмите «Сделай сам»), затем повторите подбор хэштегов.")
         return
 
-    # === ТЕКСТ подтверждение/редактирование ===
+    # === ТЕКСТ ===
     if data == "ai_text_ok":
         ai_state_set(mode="confirm_image", await_until=(now + timedelta(minutes=5)))
         await safe_send_message(
@@ -1467,7 +1309,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # -----------------------------------------------------------------------------
-# Роутинг обычных сообщений (обновлено: ИИ читает как «Сделай сам» при AI_ACCEPT_ANY_MESSAGE=1)
+# Роутинг обычных сообщений
 # -----------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
@@ -1488,7 +1330,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (await_until is None) or (now <= await_until):
             chat = update.effective_chat
             in_private = (getattr(chat, "type", "") == "private")
-            # Новое: если AI_ACCEPT_ANY_MESSAGE=1 — принимаем в группах без упоминания
             if in_private or AI_ACCEPT_ANY_MESSAGE or _message_addresses_bot(update):
                 return await handle_ai_input(update, context)
             else:
@@ -1578,7 +1419,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if manual_expected_until and now <= manual_expected_until:
         return await handle_manual_input(update, context)
 
-    # По умолчанию — игнор
     return
 
 # -----------------------------------------------------------------------------
@@ -1696,3 +1536,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
