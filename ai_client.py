@@ -156,6 +156,18 @@ def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeType
     h = max(0, bbox[3] - bbox[1])
     return w, h
 
+# Подробный лог о локальном файле (размер, сигнатура)
+def _log_file_info(path: str, logger=log):
+    try:
+        if not os.path.exists(path):
+            logger.warning("FS|missing file: %s", path); return
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            head = f.read(16)
+        logger.info("FS|file=%s size=%dB head=%s", path, st.st_size, head.hex())
+    except Exception as e:
+        logger.warning("FS|info error for %s: %s", path, e)
+
 # -----------------------------------------------------------------------------
 # Dedup storage (SQLite)
 # -----------------------------------------------------------------------------
@@ -302,10 +314,7 @@ def fetch_prices_coingecko_simple(vs: str = "usd") -> Dict[str, Dict[str, float]
     Без ключа: /simple/price. Возвращает {'bitcoin': {'usd': 000}, 'ethereum': ...}
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "bitcoin,ethereum,solana",
-        "vs_currencies": vs,
-    }
+    params = {"ids": "bitcoin,ethereum,solana", "vs_currencies": vs}
     try:
         r = requests.get(url, params=params, headers=_UA, timeout=12)
         if r.status_code == 429:
@@ -464,7 +473,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 {news_block}
 
 Обязательные требования:
-- Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TOL} символов.
+- Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TОЛ} символов.
 - Никаких подсказок в квадратных скобках и без служебных пометок.
 - Без хештегов, без вопросов к читателю, без "подпишись", без ссылок.
 - Фактура и актуальность: опирайся на популярные темы и формулировки из трендов Google и X(Twitter).
@@ -576,19 +585,23 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
 
     head = re.sub(r"\s+", " ", topic).strip()[:64]
     title_font = _load_font(72)
-    tw, th = _measure_text(draw, head, title_font)
+    tw, _ = _measure_text(draw, head, title_font)
     draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
 
     img = img.filter(ImageFilter.GaussianBlur(0.6))
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    out = buf.getvalue()
+    log.info("IMG|fallback cover built | size=%dx%d | bytes=%d", w, h, len(out))
+    return out
 
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
     """Пробуем получить картинку через Gemini/Imagen; при неуспехе — None."""
     if not (_genai_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
+        log.info("IMG|gemini skip (sdk/key/model missing)")
         return None
     try:
+        log.info("IMG|gemini start | model=%s | topic='%s'", GEMINI_IMAGE_MODEL, (topic or "")[:120])
         model = genai.GenerativeModel(GEMINI_IMAGE_MODEL)
         prompt = (
             "High-quality social cover image (no text overlay), gradient/dark tech background, "
@@ -599,16 +612,19 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
                 resp = model.generate_image(prompt=prompt)  # type: ignore[attr-defined]
                 img_bytes = getattr(resp, "image", None) or getattr(resp, "bytes", None)
                 if isinstance(img_bytes, (bytes, bytearray)):
+                    log.info("IMG|gemini ok | bytes=%d", len(img_bytes))
                     return bytes(img_bytes)
-            except Exception:
-                pass
+                log.warning("IMG|gemini returned no bytes (type=%s)", type(img_bytes))
+            except Exception as e:
+                log.warning("IMG|gemini.generate_image error: %s", e)
         if hasattr(model, "generate_content"):
             try:
                 _ = model.generate_content(prompt)
-            except Exception:
-                pass
+                log.info("IMG|gemini.generate_content called (no binary)")
+            except Exception as e:
+                log.warning("IMG|gemini.generate_content error: %s", e)
     except Exception as e:
-        log.warning("Gemini image gen failed: %s", e)
+        log.warning("IMG|gemini failed: %s", e)
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
@@ -623,6 +639,7 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     with open(local_path, "wb") as f:
         f.write(png_bytes)
     log.info("Image|saved local: %s", local_path)
+    _log_file_info(local_path, log)
 
     try:
         ensure_github_dir()
@@ -630,6 +647,25 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
         log_gh.warning("ensure_github_dir failed: %s", e)
 
     url = upload_file_to_github(png_bytes, fname)
+
+    # HEAD-проверка на стороне RAW
+    if url:
+        try:
+            clean = url.split("?", 1)[0]
+            r = requests.head(clean, headers=_UA, timeout=12, allow_redirects=True)
+            log_gh.info("GH|HEAD %s -> %s | CT=%s | len=%s",
+                        clean, r.status_code, r.headers.get("Content-Type",""), r.headers.get("Content-Length"))
+            with open(local_path + ".url.txt", "w", encoding="utf-8") as uf:
+                uf.write(clean)
+            with open(local_path + ".meta.json", "w", encoding="utf-8") as mf:
+                json.dump({
+                    "url": clean,
+                    "status": r.status_code,
+                    "content_type": r.headers.get("Content-Type"),
+                    "content_length": r.headers.get("Content-Length"),
+                }, mf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log_gh.warning("GH|HEAD check failed: %s", e)
 
     try:
         DEDUP.record(text, png_bytes)
@@ -712,6 +748,8 @@ def _upload_video_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         "branch": ACTION_BRANCH,
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
+    log_gh.info("GH|PUT video | repo=%s | branch=%s | rel=%s | bytes=%d",
+                ACTION_REPO_GITHUB, ACTION_BRANCH, rel_path, len(file_bytes))
     try:
         r = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
         if r.status_code == 200:
@@ -724,7 +762,8 @@ def _upload_video_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         try:
             r = requests.put(api, headers=headers, data=json.dumps(data), timeout=60)
             if r.status_code in (200, 201):
-                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
+                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}"
+                log_gh.info("GH|uploaded video OK | %s", raw)
                 return raw
             else:
                 log_gh.error("Video PUT failed: %s %s", r.status_code, r.text[:300])
@@ -739,12 +778,15 @@ def _tmp_write_and_maybe_upload_media(
     dir_local: str,
     auto_upload: bool
 ) -> Tuple[str, Optional[str]]:
-    """Сохранить (png/mp4) во временный файл, опц. залить в GH, положить *.url.txt."""
+    """Сохранить (png/mp4) во временный файл, опц. залить в GH, положить *.url.txt и *.meta.json."""
     ext = ".png" if kind == "image" else ".mp4"
     os.makedirs(dir_local, exist_ok=True)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=dir_local)
     with open(tmp.name, "wb") as f:
         f.write(data)
+
+    # Локальная проверка файла
+    _log_file_info(tmp.name, log)
 
     gh_url = None
     if auto_upload and (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
@@ -756,16 +798,40 @@ def _tmp_write_and_maybe_upload_media(
         ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         sha = _sha_short(data)
         filename = f"{ts}_{sha}{ext}"
+        log_gh.info("GH|upload start | kind=%s | repo=%s | branch=%s | file=%s | bytes=%d",
+                    kind, ACTION_REPO_GITHUB, ACTION_BRANCH, filename, len(data))
         if kind == "image":
             gh_url = upload_file_to_github(data, filename)
         else:
             gh_url = _upload_video_to_github(data, filename)
+
         if gh_url:
+            clean = gh_url.split("?", 1)[0].strip()
+            # Сохраняем URL рядом с файлом
             try:
                 with open(tmp.name + ".url.txt", "w", encoding="utf-8") as uf:
-                    uf.write(gh_url.strip())
+                    uf.write(clean)
+                log_gh.info("GH|url saved | %s", clean)
             except Exception as e:
                 log_gh.warning("write url file failed: %s", e)
+
+            # HEAD-проверка доступности и Content-Type
+            try:
+                r = requests.head(clean, headers=_UA, timeout=12, allow_redirects=True)
+                ct = r.headers.get("Content-Type", "")
+                log_gh.info("GH|HEAD %s -> %s | CT=%s | len=%s",
+                            clean, r.status_code, ct, r.headers.get("Content-Length"))
+                meta = {
+                    "kind": kind, "branch": ACTION_BRANCH, "url": clean,
+                    "status": r.status_code, "content_type": ct,
+                    "content_length": r.headers.get("Content-Length")
+                }
+                with open(tmp.name + ".meta.json", "w", encoding="utf-8") as mf:
+                    json.dump(meta, mf, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log_gh.warning("GH|HEAD check failed for %s: %s", clean, e)
+        else:
+            log_gh.warning("GH|upload returned None (kind=%s)", kind)
 
     return tmp.name, gh_url
 
@@ -828,7 +894,7 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     except Exception:
         pass
 
-    # запись в дедуп по тексту
+    # запись в дедуп по тексту+картинке
     try:
         if path_img and os.path.exists(path_img):
             with open(path_img, "rb") as f:
@@ -904,14 +970,19 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
     """
     try:
         _report(progress, "upload_photo:start_image")
+        log.info("IMG|make start | topic='%s'", (topic or "")[:160])
+
         # 1) ИИ
         img_bytes = _gemini_image_bytes(topic)
         warn = None
         if not img_bytes:
             # 2) Фолбэк
+            log.info("IMG|gemini none -> fallback")
             text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
             img_bytes = _cover_from_topic(topic, text_for_cover)
             warn = "gemini image fallback (Pillow)"
+
+        log.info("IMG|bytes ready | %d", len(img_bytes) if img_bytes else -1)
 
         # дедуп-запись по картинке (и теме как текстовому ключу)
         try:
@@ -919,9 +990,15 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         except Exception as e:
             log.warning("Dedup record (image) failed: %s", e)
 
-        path, _ = _tmp_write_and_maybe_upload_media(
+        path, gh_url = _tmp_write_and_maybe_upload_media(
             img_bytes, "image", LOCAL_MEDIA_DIR, AUTO_UPLOAD_IMAGE_TO_GH
         )
+        _log_file_info(path, log)
+        if gh_url:
+            log.info("IMG|gh_url=%s", gh_url)
+        else:
+            log.warning("IMG|gh_url is None (auto_upload=%s)", AUTO_UPLOAD_IMAGE_TO_GH)
+
         _report(progress, "upload_photo:image_ready")
         return path, warn
     except Exception as e:
@@ -1025,6 +1102,9 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
 
+    log_gh.info("GH|PUT image | repo=%s | branch=%s | rel=%s | bytes=%d",
+                ACTION_REPO_GITHUB, ACTION_BRANCH, rel_path, len(file_bytes))
+
     try:
         r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
         log_gh.info("GET %s -> %s", rel_path, r_get.status_code)
@@ -1040,8 +1120,8 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
             r = requests.put(api, headers=headers, data=json.dumps(data), timeout=30)
             log_gh.info("PUT %s (try %d) -> %s", rel_path, attempt, r.status_code)
             if r.status_code in (200, 201):
-                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
-                log_gh.info("Uploaded OK: %s", raw)
+                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}"
+                log_gh.info("GH|uploaded OK | %s", raw)
                 return raw
             if r.status_code in (409, 422):
                 try:
