@@ -1,3 +1,198 @@
+# -*- coding: utf-8 -*-
+"""
+twitter_bot.py — согласование/публикация в Telegram и X (Twitter).
+
+Ключевые:
+- Watchdog (ENV AUTO_SHUTDOWN_AFTER_SECONDS>0), инициализация активности на старте
+- Мягкая обработка «Query is too old», безопасные отправки (ретраи)
+- «Подобрать хэштеги» и «План на день» (если planner есть)
+- Дедуп с TTL, хэш медиа, обрезка текста, обязательные хвосты
+- ИИ-режим читает обычные сообщения (ENV AI_ACCEPT_ANY_MESSAGE)
+- Единая сводка публикации
+"""
+
+import os
+import re
+import sys
+import uuid
+import base64
+import asyncio
+import logging
+import tempfile
+from html import escape as html_escape
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timedelta, time as dt_time
+from unicodedata import normalize
+from zoneinfo import ZoneInfo
+
+import requests
+import tweepy
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot, ForceReply
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
+import aiosqlite
+
+from github import Github
+try:
+    from github import Auth as _GhAuth
+except Exception:
+    _GhAuth = None
+
+import ai_client
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
+)
+log = logging.getLogger("twitter_bot")
+log_ai = logging.getLogger("twitter_bot.ai")
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
+
+TELEGRAM_BOT_TOKEN_APPROVAL = os.getenv("TELEGRAM_BOT_TOKEN_APPROVAL")
+TELEGRAM_APPROVAL_CHAT_ID_STR = os.getenv("TELEGRAM_APPROVAL_CHAT_ID")
+TELEGRAM_BOT_TOKEN_CHANNEL = os.getenv("TELEGRAM_BOT_TOKEN_CHANNEL")
+TELEGRAM_CHANNEL_USERNAME_ID = os.getenv("TELEGRAM_CHANNEL_USERNAME_ID")
+
+TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
+TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
+TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+
+GITHUB_TOKEN = os.getenv("ACTION_PAT_GITHUB")
+GITHUB_REPO = os.getenv("ACTION_REPO_GITHUB")
+GITHUB_IMAGE_PATH = os.getenv("GH_IMAGES_DIR", "images_for_posts")
+
+AICOIN_WORKER_URL = os.getenv("AICOIN_WORKER_URL", "https://aicoin-bot-trigger.dfosjam.workers.dev/tg/webhook")
+PUBLIC_TRIGGER_SECRET = (os.getenv("PUBLIC_TRIGGER_SECRET") or "").strip()
+FALLBACK_PUBLIC_TRIGGER_SECRET = "z8PqH0e4jwN3rA1K"
+
+AI_ACCEPT_ANY_MESSAGE = (os.getenv("AI_ACCEPT_ANY_MESSAGE", "1") or "1").strip() not in ("0", "false", "False", "no", "No")
+
+_need_env = [
+    "TELEGRAM_BOT_TOKEN_APPROVAL", "TELEGRAM_APPROVAL_CHAT_ID",
+    "TELEGRAM_BOT_TOKEN_CHANNEL", "TELEGRAM_CHANNEL_USERNAME_ID",
+    "TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET",
+    "ACTION_PAT_GITHUB", "ACTION_REPO_GITHUB",
+]
+_missing = [k for k in _need_env if not os.getenv(k)]
+if _missing:
+    log.error("Не заданы обязательные переменные окружения: %s", _missing)
+
+TZ = ZoneInfo("Europe/Kyiv")
+
+approval_bot = Bot(token=TELEGRAM_BOT_TOKEN_APPROVAL) if TELEGRAM_BOT_TOKEN_APPROVAL else None
+channel_bot  = Bot(token=TELEGRAM_BOT_TOKEN_CHANNEL) if TELEGRAM_BOT_TOKEN_CHANNEL else None
+
+BOT_ID: Optional[int] = None
+BOT_USERNAME: Optional[str] = None
+
+TELEGRAM_APPROVAL_CHAT_ID: Any = None
+_raw_chat = (TELEGRAM_APPROVAL_CHAT_ID_STR or os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or "").strip()
+if _raw_chat.startswith("@"):
+    TELEGRAM_APPROVAL_CHAT_ID = _raw_chat
+    log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s (username)", TELEGRAM_APPROVAL_CHAT_ID)
+else:
+    try:
+        TELEGRAM_APPROVAL_CHAT_ID = int(_raw_chat) if _raw_chat else 0
+        log.info("ENV: TELEGRAM_APPROVAL_CHAT_ID=%s", TELEGRAM_APPROVAL_CHAT_ID)
+    except Exception as _e:
+        TELEGRAM_APPROVAL_CHAT_ID = 0
+        log.error("ENV TELEGRAM_APPROVAL_CHAT_ID некорректен: %s", _e)
+
+def _approval_chat_id() -> Any:
+    global TELEGRAM_APPROVAL_CHAT_ID, TELEGRAM_APPROVAL_CHAT_ID_STR
+    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, int) and TELEGRAM_APPROVAL_CHAT_ID != 0:
+        return TELEGRAM_APPROVAL_CHAT_ID
+    if isinstance(TELEGRAM_APPROVAL_CHAT_ID, str) and TELEGRAM_APPROVAL_CHAT_ID.strip():
+        return TELEGRAM_APPROVAL_CHAT_ID.strip()
+    raw = (os.getenv("TELEGRAM_APPROVAL_CHAT_ID") or (TELEGRAM_APPROVAL_CHAT_ID_STR or "")).strip()
+    if not raw:
+        log.error("Approval chat id is not set (empty).")
+        return 0
+    if raw.startswith("@"):
+        TELEGRAM_APPROVAL_CHAT_ID = raw
+        return TELEGRAM_APPROVAL_CHAT_ID
+    try:
+        TELEGRAM_APPROVAL_CHAT_ID = int(raw)
+        return TELEGRAM_APPROVAL_CHAT_ID
+    except Exception:
+        TELEGRAM_APPROVAL_CHAT_ID = 0
+        log.error("Approval chat id is invalid (cannot parse).")
+        return 0
+
+try:
+    APPROVAL_USER_ID = int(os.getenv("TELEGRAM_APPROVAL_USER_ID", "0") or "0")
+except Exception:
+    APPROVAL_USER_ID = 0
+
+def _is_approved_user(update: Update) -> bool:
+    if not update or not getattr(update, "effective_user", None):
+        return False
+    if APPROVAL_USER_ID and update.effective_user and update.effective_user.id != APPROVAL_USER_ID:
+        return False
+    return True
+
+try:
+    from planner import register_planner_handlers, open_planner
+    log.info("Planner module loaded")
+except Exception as _e:
+    log.warning("Planner module not available: %s", _e)
+    register_planner_handlers = lambda app: None
+    open_planner = None
+
+try:
+    AUTO_SHUTDOWN_AFTER_SECONDS = int(os.getenv("AUTO_SHUTDOWN_AFTER_SECONDS", "0") or "0")
+except Exception:
+    AUTO_SHUTDOWN_AFTER_SECONDS = 0
+ENABLE_WATCHDOG = AUTO_SHUTDOWN_AFTER_SECONDS > 0
+
+VERBATIM_MODE = False
+AUTO_AI_IMAGE = False
+
+TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 🐺 https://t.me/AiCoin_ETH"
+TG_TAIL_HTML     = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter X</a>'
+
+def _worker_url_with_secret() -> str:
+    base = AICOIN_WORKER_URL or ""
+    sec  = (PUBLIC_TRIGGER_SECRET or FALLBACK_PUBLIC_TRIGGER_SECRET).strip()
+    if not base: return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}s={sec}" if sec else base
+
+def get_twitter_clients():
+    if not (TWITTER_API_KEY and TWITTER_API_SECRET and TWITTER_ACCESS_TOKEN and TWITTER_ACCESS_TOKEN_SECRET):
+        log.warning("Twitter ENV переменные заданы не полностью — клиенты не будут созданы.")
+        return None, None
+    client_v2 = tweepy.Client(
+        consumer_key=TWITTER_API_KEY,
+        consumer_secret=TWITTER_API_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET,
+        bearer_token=TWITTER_BEARER_TOKEN
+    )
+    api_v1 = tweepy.API(
+        tweepy.OAuth1UserHandler(
+            TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET
+        )
+    )
+    return client_v2, api_v1
+
+twitter_client_v2, twitter_api_v1 = get_twitter_clients()
+
+try:
+    if _GhAuth and GITHUB_TOKEN:
+        _gh_auth = _GhAuth.Token(GITHUB_TOKEN)
+        github_client = Github(auth=_gh_auth)
+    else:
+        github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+except Exception:
+    github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+
+github_repo = github_client.get_repo(GITHUB_REPO) if (github_client and GITHUB_REPO) else None
 post_data: Dict[str, Any] = {
     "text_en": "",
     "ai_hashtags": [],
