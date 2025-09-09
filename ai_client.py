@@ -34,7 +34,7 @@ try:
 except Exception:
     _sns_ok = False
 
-# Gemini text
+# Gemini text / media
 _genai_ok = False
 try:
     import google.generativeai as genai  # type: ignore
@@ -46,7 +46,10 @@ except Exception:
 # Config
 # -----------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
+GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
+# Новое: модели для медиа (мягко, при недоступности срабатывают фолбэки)
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0")
+GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
 
 # Длина поста под Twitter/Telegram
 TARGET_CHAR_LEN = int(os.getenv("TARGET_CHAR_LEN", "666"))
@@ -57,12 +60,19 @@ ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB", "")
 ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB", "")  # owner/repo
 ACTION_BRANCH = os.getenv("ACTION_BRANCH", "main")
 
-# Папка для медиа в репозитории
+# Папки для медиа в репозитории
 GH_IMAGES_DIR = os.getenv("GH_IMAGES_DIR", "images_for_posts")
+GH_VIDEOS_DIR = os.getenv("GH_VIDEOS_DIR", "videos_for_posts")
 
 # Локальные пути
 LOCAL_MEDIA_DIR = os.getenv("LOCAL_MEDIA_DIR", "./images_for_posts")
 os.makedirs(LOCAL_MEDIA_DIR, exist_ok=True)
+LOCAL_VIDEO_DIR = os.getenv("LOCAL_VIDEO_DIR", "./videos_for_posts")
+os.makedirs(LOCAL_VIDEO_DIR, exist_ok=True)
+
+# Авто-аплоад
+AUTO_UPLOAD_IMAGE_TO_GH = (os.getenv("AUTO_UPLOAD_IMAGE_TO_GH", "1") or "1").lower() not in ("0", "false", "no")
+AUTO_UPLOAD_VIDEO_TO_GH = (os.getenv("AUTO_UPLOAD_VIDEO_TO_GH", "1") or "1").lower() not in ("0", "false", "no")
 
 # База для дедупликации
 DEDUP_DB_PATH = os.getenv("DEDUP_DB_PATH", "./history.db")
@@ -79,6 +89,14 @@ log_gh = logging.getLogger("ai_client.github")
 
 _RAW_GH = "https://raw.githubusercontent.com"
 _UA = {"User-Agent": "AiCoinBot/1.0 (+https://x.com/AiCoin_ETH)"}
+
+# Опциональные зависимости для локального видео-фолбэка
+try:
+    import numpy as _np  # type: ignore
+    import imageio.v3 as _iio  # type: ignore
+    _vid_local_ok = True
+except Exception:
+    _vid_local_ok = False
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -406,7 +424,7 @@ def build_news_context(max_items: int = 3, user_query: Optional[str] = None) -> 
     return "\n".join(lines)
 
 # -----------------------------------------------------------------------------
-# Gemini text
+# Gemini init
 # -----------------------------------------------------------------------------
 if _genai_ok and GEMINI_API_KEY:
     try:
@@ -420,6 +438,9 @@ else:
     _model = None
     log.info("Gemini not available (package or key missing)")
 
+# -----------------------------------------------------------------------------
+# Text generation
+# -----------------------------------------------------------------------------
 def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     lang = (locale_hint or _detect_lang(topic)).lower()
 
@@ -486,7 +507,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     return text
 
 # -----------------------------------------------------------------------------
-# Image generation (default: Pillow neon cover)
+# Image generation (Gemini/Imagen → Pillow fallback)
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -563,8 +584,36 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
+def _gemini_image_bytes(topic: str) -> Optional[bytes]:
+    """Пробуем получить картинку через Gemini/Imagen; при неуспехе — None."""
+    if not (_genai_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
+        return None
+    try:
+        model = genai.GenerativeModel(GEMINI_IMAGE_MODEL)
+        prompt = (
+            "High-quality social cover image (no text overlay), gradient/dark tech background, "
+            "subtle AI/crypto vibe. Topic: " + (topic or "").strip()
+        )
+        if hasattr(model, "generate_image"):
+            try:
+                resp = model.generate_image(prompt=prompt)  # type: ignore[attr-defined]
+                img_bytes = getattr(resp, "image", None) or getattr(resp, "bytes", None)
+                if isinstance(img_bytes, (bytes, bytearray)):
+                    return bytes(img_bytes)
+            except Exception:
+                pass
+        if hasattr(model, "generate_content"):
+            try:
+                _ = model.generate_content(prompt)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("Gemini image gen failed: %s", e)
+    return None
+
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
-    png_bytes = _cover_from_topic(topic, text)
+    # Сначала пробуем Gemini/Imagen, затем — локальный фолбэк
+    png_bytes = _gemini_image_bytes(topic) or _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
 
@@ -590,100 +639,138 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     return {"url": url, "local_path": local_path, "sha": sha}
 
 # -----------------------------------------------------------------------------
-# GitHub upload
+# Video generation (Gemini/Veo → fallback: MP4 pan-zoom from image)
 # -----------------------------------------------------------------------------
-def _split_repo(repo: str) -> Tuple[str, str]:
+def _gemini_video_bytes(topic: str, seconds: int = 6) -> Optional[bytes]:
+    """Пробуем получить MP4 через Gemini/Veo. Если нет доступа — None."""
+    if not (_genai_ok and GEMINI_API_KEY and GEMINI_VIDEO_MODEL):
+        return None
     try:
-        owner, name = repo.split("/", 1)
-        return owner, name
-    except Exception:
-        raise ValueError("ACTION_REPO_GITHUB must be 'owner/repo'")
+        model = genai.GenerativeModel(GEMINI_VIDEO_MODEL)
+        prompt = (
+            "Create a short 16:9 MP4 teaser (no text overlay) with abstract AI/crypto vibes. "
+            f"Duration ~{seconds}s. Topic: " + (topic or "").strip()
+        )
+        if hasattr(model, "generate_video"):
+            try:
+                resp = model.generate_video(prompt=prompt)  # type: ignore[attr-defined]
+                vid = getattr(resp, "video", None) or getattr(resp, "bytes", None)
+                if isinstance(vid, (bytes, bytearray)):
+                    return bytes(vid)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("Gemini video gen failed: %s", e)
+    return None
 
-def _gh_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"token {ACTION_PAT_GITHUB}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "aicoin-twitter-bot",
-    }
+def _build_panzoom_from_image(png_bytes: bytes, seconds: int = 6, fps: int = 24) -> Optional[bytes]:
+    """Локальный фолбэк: короткий MP4 с плавным зумом из одной картинки (Pillow -> numpy)."""
+    if not _vid_local_ok:
+        return None
+    try:
+        im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        W, H = im.size
+        out_w, out_h = 1280, 720
+        frames = seconds * fps
+        out = _np.zeros((frames, out_h, out_w, 3), dtype=_np.uint8)
+        for i in range(frames):
+            t = i / max(1, frames - 1)
+            scale = 1.0 + 0.08 * t
+            sw, sh = int(W / scale), int(H / scale)
+            cx, cy = W // 2, H // 2
+            x1 = max(0, cx - sw // 2); x2 = min(W, x1 + sw)
+            y1 = max(0, cy - sh // 2); y2 = min(H, y1 + sh)
+            crop = im.crop((x1, y1, x2, y2))
+            resized = crop.resize((out_w, out_h), Image.BICUBIC)
+            out[i] = _np.array(resized, dtype=_np.uint8)
+        tmp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        _iio.imwrite(tmp_path, out, fps=fps, codec="libx264", bitrate="3M", pix_fmt="yuv420p")
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return data
+    except Exception as e:
+        log.warning("Local video build failed: %s", e)
+        return None
 
-def ensure_github_dir() -> None:
+def _upload_video_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
+    """Аплоад MP4 в GH (в папку GH_VIDEOS_DIR)."""
     if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
-        return
-    owner, repo = _split_repo(ACTION_REPO_GITHUB)
-    api_dir = f"https://api.github.com/repos/{owner}/{repo}/contents/{GH_IMAGES_DIR}"
-    params = {"ref": ACTION_BRANCH}
-    r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
-    log_gh.info("Check dir %s -> %s", GH_IMAGES_DIR, r.status_code)
-    if r.status_code == 200:
-        return
-    if r.status_code != 404:
-        log_gh.warning("Dir check unexpected: %s %s", r.status_code, r.text[:200])
-        return
-    api_put = f"https://api.github.com/repos/{owner}/{repo}/contents/{GH_IMAGES_DIR}/.gitkeep"
-    data = {
-        "message": f"Create {GH_IMAGES_DIR}/ (bootstrap .gitkeep)",
-        "branch": ACTION_BRANCH,
-        "content": base64.b64encode(b"").decode("ascii"),
-    }
-    r2 = requests.put(api_put, headers=_gh_headers(), data=json.dumps(data), timeout=30)
-    log_gh.info("Create dir .gitkeep -> %s", r2.status_code)
-
-def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
-    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
-        log.info("GitHub upload skipped: no creds")
         return None
     try:
         owner, repo = _split_repo(ACTION_REPO_GITHUB)
     except ValueError as e:
-        log.error(str(e))
-        return None
-
-    rel_path = f"{GH_IMAGES_DIR}/{filename}"
+        log.error(str(e)); return None
+    rel_path = f"{GH_VIDEOS_DIR}/{filename}"
     api = f"https://api.github.com/repos/{owner}/{repo}/contents/{rel_path}"
     headers = _gh_headers()
-
     data = {
-        "message": f"Add image {filename}",
+        "message": f"Add video {filename}",
         "branch": ACTION_BRANCH,
         "content": base64.b64encode(file_bytes).decode("ascii"),
     }
-
     try:
-        r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
-        log_gh.info("GET %s -> %s", rel_path, r_get.status_code)
-        if r_get.status_code == 200:
-            sha_existing = (r_get.json() or {}).get("sha")
+        r = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
+        if r.status_code == 200:
+            sha_existing = (r.json() or {}).get("sha")
             if sha_existing:
                 data["sha"] = sha_existing
-    except Exception as e:
-        log_gh.warning("GET existing failed: %s", e)
-
+    except Exception:
+        pass
     for attempt in range(1, 4):
         try:
-            r = requests.put(api, headers=headers, data=json.dumps(data), timeout=30)
-            log_gh.info("PUT %s (try %d) -> %s", rel_path, attempt, r.status_code)
+            r = requests.put(api, headers=headers, data=json.dumps(data), timeout=60)
             if r.status_code in (200, 201):
                 raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
-                log_gh.info("Uploaded OK: %s", raw)
                 return raw
-            if r.status_code in (409, 422):
-                try:
-                    r_get2 = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
-                    if r_get2.status_code == 200:
-                        data["sha"] = (r_get2.json() or {}).get("sha")
-                        log_gh.info("Resolved sha, retrying…")
-                        continue
-                except Exception:
-                    pass
-            log_gh.error("PUT failed: %s %s", r.status_code, r.text[:300])
+            else:
+                log_gh.error("Video PUT failed: %s %s", r.status_code, r.text[:300])
         except Exception as e:
-            log_gh.error("PUT exception (try %d): %s", attempt, e)
-        time.sleep(1.5 * attempt)
+            log_gh.error("Video PUT try %d: %s", attempt, e)
+        time.sleep(1.2 * attempt)
     return None
 
+def _tmp_write_and_maybe_upload_media(
+    data: bytes,
+    kind: str,              # "image" | "video"
+    dir_local: str,
+    auto_upload: bool
+) -> Tuple[str, Optional[str]]:
+    """Сохранить (png/mp4) во временный файл, опц. залить в GH, положить *.url.txt."""
+    ext = ".png" if kind == "image" else ".mp4"
+    os.makedirs(dir_local, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=dir_local)
+    with open(tmp.name, "wb") as f:
+        f.write(data)
+
+    gh_url = None
+    if auto_upload and (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+        try:
+            ensure_github_dir()  # создаёт каталоги при первом запуске
+        except Exception as e:
+            log_gh.warning("ensure_github_dir failed: %s", e)
+
+        ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        sha = _sha_short(data)
+        filename = f"{ts}_{sha}{ext}"
+        if kind == "image":
+            gh_url = upload_file_to_github(data, filename)
+        else:
+            gh_url = _upload_video_to_github(data, filename)
+        if gh_url:
+            try:
+                with open(tmp.name + ".url.txt", "w", encoding="utf-8") as uf:
+                    uf.write(gh_url.strip())
+            except Exception as e:
+                log_gh.warning("write url file failed: %s", e)
+
+    return tmp.name, gh_url
+
 # -----------------------------------------------------------------------------
-# Public API (high-level) + progress hook
+# Public API: text/image/video + progress hooks
 # -----------------------------------------------------------------------------
 ProgressFn = Optional[Callable[[str], None]]
 
@@ -701,8 +788,8 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     2) генерим текст (666±20, факты — из цен/новостей)
     3) проверяем дубль текста
     4) прогресс "upload_photo": генерация изображения (по кнопке можно не вызывать здесь)
-    5) делаем картинку, сохраняем/загружаем
-    6) укладываем в дедуп-базу
+    5) кладём локально и (опционально) в GitHub
+    6) записываем в дедуп
     """
     _report(progress, "typing:start_text")      # для Telegram: send_chat_action('typing')
     text = generate_text(topic)
@@ -721,19 +808,42 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
         text = _clamp_to_len(_clean_bracket_hints(text), TARGET_CHAR_LEN, TARGET_CHAR_TOL)
 
     _report(progress, "upload_photo:start_image")
-    img = generate_image(topic, text)
+    # Сгенерируем картинку (ИИ/фолбэк), сохраним локально, опц. зальём в GH
+    path_img, _ = ai_generate_image(topic, progress)
     _report(progress, "upload_photo:image_ready")
+
+    url_img = None
+    if path_img and os.path.exists(path_img + ".url.txt"):
+        try:
+            url_img = (open(path_img + ".url.txt", "r", encoding="utf-8").read() or "").strip() or None
+        except Exception:
+            pass
+
+    # посчитаем sha по локальному файлу для консистентности
+    image_sha = None
+    try:
+        if path_img and os.path.exists(path_img):
+            with open(path_img, "rb") as f:
+                image_sha = _sha_short(f.read())
+    except Exception:
+        pass
+
+    # запись в дедуп по тексту
+    try:
+        if path_img and os.path.exists(path_img):
+            with open(path_img, "rb") as f:
+                DEDUP.record(text, f.read())
+    except Exception as e:
+        log.warning("Dedup record in make_post failed: %s", e)
 
     return {
         "text": text,
-        "image_url": img.get("url"),
-        "image_local_path": img.get("local_path"),
-        "image_sha": img.get("sha"),
+        "image_url": url_img,                 # может быть None, если автозалив выключен
+        "image_local_path": path_img,         # локальный путь точно есть
+        "image_sha": image_sha,
     }
 
-# -----------------------------------------------------------------------------
-# Compatibility wrappers for twitter_bot.py (с прогрессом)
-# -----------------------------------------------------------------------------
+# Совместимость с twitter_bot.py
 def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Optional[str]]:
     """
     Returns: (text, warn_message_or_None)
@@ -794,23 +904,159 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
     """
     try:
         _report(progress, "upload_photo:start_image")
-        text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
-        png_bytes = _cover_from_topic(topic, text_for_cover)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        with open(tmp.name, "wb") as f:
-            f.write(png_bytes)
-        log.info("Image(tmp) saved: %s (%d bytes)", tmp.name, len(png_bytes))
+        # 1) ИИ
+        img_bytes = _gemini_image_bytes(topic)
+        warn = None
+        if not img_bytes:
+            # 2) Фолбэк
+            text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
+            img_bytes = _cover_from_topic(topic, text_for_cover)
+            warn = "gemini image fallback (Pillow)"
+
+        # дедуп-запись по картинке (и теме как текстовому ключу)
+        try:
+            DEDUP.record(topic or "", img_bytes)
+        except Exception as e:
+            log.warning("Dedup record (image) failed: %s", e)
+
+        path, _ = _tmp_write_and_maybe_upload_media(
+            img_bytes, "image", LOCAL_MEDIA_DIR, AUTO_UPLOAD_IMAGE_TO_GH
+        )
         _report(progress, "upload_photo:image_ready")
-        return tmp.name, None
+        return path, warn
     except Exception as e:
         log.warning("Image gen error: %s", e)
         _report(progress, "upload_photo:image_ready")
         return None, "image generation failed"
 
+def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns: (local_mp4_path, warn_or_none)
+    progress(msg):
+      'upload_photo:start_image' -> показать "отправляет медиа..."
+      'upload_photo:image_ready' -> убрать индикацию
+    """
+    try:
+        _report(progress, "upload_photo:start_image")
+        vid_bytes = _gemini_video_bytes(topic, seconds=seconds)
+        warn = None
+        if not vid_bytes:
+            # фолбэк: берём обложку и строим MP4 пан-зум
+            cover = _gemini_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
+            vid_bytes = _build_panzoom_from_image(cover, seconds=seconds) if cover else None
+            warn = "gemini video fallback (pan-zoom MP4)"
+        if not vid_bytes:
+            _report(progress, "upload_photo:image_ready")
+            return None, "video generation failed"
+        path, _ = _tmp_write_and_maybe_upload_media(
+            vid_bytes, "video", LOCAL_VIDEO_DIR, AUTO_UPLOAD_VIDEO_TO_GH
+        )
+        _report(progress, "upload_photo:image_ready")
+        return path, warn
+    except Exception as e:
+        log.warning("Video gen error: %s", e)
+        _report(progress, "upload_photo:image_ready")
+        return None, "video generation failed"
+
 # --- alias for twitter_bot backward-compat ---
 def suggest_hashtags(text: str) -> List[str]:
     """Alias, т.к. twitter_bot ищет suggest_hashtags()."""
     return ai_suggest_hashtags(text)
+
+# -----------------------------------------------------------------------------
+# GitHub upload (images & ensure dirs)
+# -----------------------------------------------------------------------------
+def _split_repo(repo: str) -> Tuple[str, str]:
+    try:
+        owner, name = repo.split("/", 1)
+        return owner, name
+    except Exception:
+        raise ValueError("ACTION_REPO_GITHUB must be 'owner/repo'")
+
+def _gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {ACTION_PAT_GITHUB}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "aicoin-twitter-bot",
+    }
+
+def ensure_github_dir() -> None:
+    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+        return
+    owner, repo = _split_repo(ACTION_REPO_GITHUB)
+    for sub in (GH_IMAGES_DIR, GH_VIDEOS_DIR):
+        api_dir = f"https://api.github.com/repos/{owner}/{repo}/contents/{sub}"
+        params = {"ref": ACTION_BRANCH}
+        r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
+        log_gh.info("Check dir %s -> %s", sub, r.status_code)
+        if r.status_code == 200:
+            continue
+        if r.status_code != 404:
+            log_gh.warning("Dir check unexpected: %s %s", r.status_code, r.text[:200])
+            continue
+        api_put = f"https://api.github.com/repos/{owner}/{repo}/contents/{sub}/.gitkeep"
+        data = {
+            "message": f"Create {sub}/ (bootstrap .gitkeep)",
+            "branch": ACTION_BRANCH,
+            "content": base64.b64encode(b"").decode("ascii"),
+        }
+        r2 = requests.put(api_put, headers=_gh_headers(), data=json.dumps(data), timeout=30)
+        log_gh.info("Create dir %s/.gitkeep -> %s", sub, r2.status_code)
+
+def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
+    """Заливает картинку в GH_IMAGES_DIR, возвращает RAW URL."""
+    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+        log.info("GitHub upload skipped: no creds")
+        return None
+    try:
+        owner, repo = _split_repo(ACTION_REPO_GITHUB)
+    except ValueError as e:
+        log.error(str(e))
+        return None
+
+    rel_path = f"{GH_IMAGES_DIR}/{filename}"
+    api = f"https://api.github.com/repos/{owner}/{repo}/contents/{rel_path}"
+    headers = _gh_headers()
+
+    data = {
+        "message": f"Add image {filename}",
+        "branch": ACTION_BRANCH,
+        "content": base64.b64encode(file_bytes).decode("ascii"),
+    }
+
+    try:
+        r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
+        log_gh.info("GET %s -> %s", rel_path, r_get.status_code)
+        if r_get.status_code == 200:
+            sha_existing = (r_get.json() or {}).get("sha")
+            if sha_existing:
+                data["sha"] = sha_existing
+    except Exception as e:
+        log_gh.warning("GET existing failed: %s", e)
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.put(api, headers=headers, data=json.dumps(data), timeout=30)
+            log_gh.info("PUT %s (try %d) -> %s", rel_path, attempt, r.status_code)
+            if r.status_code in (200, 201):
+                raw = f"{_RAW_GH}/{owner}/{repo}/{ACTION_BRANCH}/{rel_path}?r={_now_ts()}"
+                log_gh.info("Uploaded OK: %s", raw)
+                return raw
+            if r.status_code in (409, 422):
+                try:
+                    r_get2 = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
+                    if r_get2.status_code == 200:
+                        data["sha"] = (r_get2.json() or {}).get("sha")
+                        log_gh.info("Resolved sha, retrying…")
+                        continue
+                except Exception:
+                    pass
+            log_gh.error("PUT failed: %s %s", r.status_code, r.text[:300])
+        except Exception as e:
+            log_gh.error("PUT exception (try %d): %s", attempt, e)
+        time.sleep(1.5 * attempt)
+    return None
 
 # -----------------------------------------------------------------------------
 # If run directly
@@ -821,3 +1067,4 @@ if __name__ == "__main__":
     print("TEXT:\n", post["text"])
     print("IMG URL:", post["image_url"])
     print("IMG FILE:", post["image_local_path"])
+    print("IMG SHA:", post["image_sha"])
