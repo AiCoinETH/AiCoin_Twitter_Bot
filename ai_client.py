@@ -36,11 +36,19 @@ except Exception:
 
 # Gemini text / media
 _genai_ok = False
+_genai_images_ok = False
 try:
     import google.generativeai as genai  # type: ignore
     _genai_ok = True
+    try:
+        # Официальный модуль для генерации изображений
+        from google.generativeai import images as gen_images  # type: ignore
+        _genai_images_ok = True
+    except Exception:
+        _genai_images_ok = False
 except Exception:
     _genai_ok = False
+    _genai_images_ok = False
 
 # -----------------------------------------------------------------------------
 # Config
@@ -446,6 +454,10 @@ if _genai_ok and GEMINI_API_KEY:
 else:
     _model = None
     log.info("Gemini not available (package or key missing)")
+if _genai_images_ok:
+    log.info("Gemini Images API available")
+else:
+    log.info("Gemini Images API NOT available (fallback → Pillow)")
 
 # -----------------------------------------------------------------------------
 # Text generation
@@ -473,7 +485,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 {news_block}
 
 Обязательные требования:
-- Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TОЛ} символов.
+- Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TOL} символов.
 - Никаких подсказок в квадратных скобках и без служебных пометок.
 - Без хештегов, без вопросов к читателю, без "подпишись", без ссылок.
 - Фактура и актуальность: опирайся на популярные темы и формулировки из трендов Google и X(Twitter).
@@ -596,35 +608,36 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     return out
 
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
-    """Пробуем получить картинку через Gemini/Imagen; при неуспехе — None."""
-    if not (_genai_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
-        log.info("IMG|gemini skip (sdk/key/model missing)")
+    """Пробуем получить картинку через **официальный Gemini Images API**; при неуспехе — None."""
+    if not (_genai_images_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
+        log.info("IMG|gemini skip (images sdk/key/model missing)")
         return None
     try:
-        log.info("IMG|gemini start | model=%s | topic='%s'", GEMINI_IMAGE_MODEL, (topic or "")[:120])
-        model = genai.GenerativeModel(GEMINI_IMAGE_MODEL)
         prompt = (
-            "High-quality social cover image (no text overlay), gradient/dark tech background, "
-            "subtle AI/crypto vibe. Topic: " + (topic or "").strip()
+            "High-quality social cover image (no text), dark/gradient tech background, "
+            "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        if hasattr(model, "generate_image"):
-            try:
-                resp = model.generate_image(prompt=prompt)  # type: ignore[attr-defined]
-                img_bytes = getattr(resp, "image", None) or getattr(resp, "bytes", None)
-                if isinstance(img_bytes, (bytes, bytearray)):
-                    log.info("IMG|gemini ok | bytes=%d", len(img_bytes))
-                    return bytes(img_bytes)
-                log.warning("IMG|gemini returned no bytes (type=%s)", type(img_bytes))
-            except Exception as e:
-                log.warning("IMG|gemini.generate_image error: %s", e)
-        if hasattr(model, "generate_content"):
-            try:
-                _ = model.generate_content(prompt)
-                log.info("IMG|gemini.generate_content called (no binary)")
-            except Exception as e:
-                log.warning("IMG|gemini.generate_content error: %s", e)
+        size = "1280x960"
+        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'",
+                 GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
+        resp = gen_images.generate(model=GEMINI_IMAGE_MODEL, prompt=prompt, size=size)  # type: ignore
+        # v>=0.7: bytes лежат внутри images[i].bytes
+        if hasattr(resp, "images") and resp.images:
+            img = resp.images[0]
+            data = getattr(img, "bytes", None) or getattr(img, "data", None)
+            if isinstance(data, (bytes, bytearray)):
+                log.info("IMG|gemini ok | bytes=%d", len(data))
+                return bytes(data)
+        # Альтернативные поля на всякий случай
+        for key in ("image", "bytes", "data"):
+            data = getattr(resp, key, None)
+            if isinstance(data, (bytes, bytearray)):
+                log.info("IMG|gemini ok (alt %s) | bytes=%d", key, len(data))
+                return bytes(data)
+        log.warning("IMG|gemini returned no image bytes; fields: %s",
+                    [k for k in dir(resp) if not k.startswith("_")][:20])
     except Exception as e:
-        log.warning("IMG|gemini failed: %s", e)
+        log.warning("IMG|gemini.generate error: %s", e)
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
@@ -875,11 +888,12 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
 
     _report(progress, "upload_photo:start_image")
     # Сгенерируем картинку (ИИ/фолбэк), сохраним локально, опц. зальём в GH
-    path_img, _ = ai_generate_image(topic, progress)
+    path_img, url_img_direct, _ = ai_generate_image(topic, progress)
     _report(progress, "upload_photo:image_ready")
 
-    url_img = None
-    if path_img and os.path.exists(path_img + ".url.txt"):
+    # URL берём приоритетно из возврата аплоада, .url.txt — резерв
+    url_img = url_img_direct
+    if not url_img and path_img and os.path.exists(path_img + ".url.txt"):
         try:
             url_img = (open(path_img + ".url.txt", "r", encoding="utf-8").read() or "").strip() or None
         except Exception:
@@ -961,9 +975,9 @@ def ai_suggest_hashtags(text: str) -> List[str]:
             break
     return out
 
-def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str]]:
+def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Returns: (local_png_path, warn_or_none)
+    Returns: (local_png_path, gh_raw_url_or_none, warn_or_none)
     progress(msg):
       'upload_photo:start_image' -> показать "отправляет фото..."
       'upload_photo:image_ready' -> убрать индикацию
@@ -1000,11 +1014,11 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
             log.warning("IMG|gh_url is None (auto_upload=%s)", AUTO_UPLOAD_IMAGE_TO_GH)
 
         _report(progress, "upload_photo:image_ready")
-        return path, warn
+        return path, gh_url, warn
     except Exception as e:
         log.warning("Image gen error: %s", e)
         _report(progress, "upload_photo:image_ready")
-        return None, "image generation failed"
+        return None, None, "image generation failed"
 
 def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str]]:
     """
