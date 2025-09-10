@@ -58,11 +58,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🔑 Добавлено: подключение Google ключа для Vertex AI
+      # 🔑 Подключение Google ключа для Vertex AI
       - name: Set up Google credentials
         run: |
           echo "${{ secrets.GCP_KEY_JSON }}" > $HOME/gcp-key.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcp-key.json" >> $GITHUB_ENV
+
+      # ✅ Проверка доступа к Vertex AI
+      - name: Test Vertex AI credentials
+        run: |
+          python - <<'EOF'
+          import vertexai
+          try:
+              vertexai.init()
+              print("✅ Vertex AI credentials OK")
+          except Exception as e:
+              print("❌ Vertex AI error:", e)
+              exit(1)
+          EOF
 
       - name: Run Twitter Bot
         run: python twitter_bot.py
