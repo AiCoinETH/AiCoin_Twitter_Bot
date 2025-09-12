@@ -12,3 +12,4 @@ pytz>=2023.3
 pillow>=9.5.0
 playwright>=1.44.0
 google-generativeai>=0.7.2
+google-cloud-aiplatform>=1.38.1
