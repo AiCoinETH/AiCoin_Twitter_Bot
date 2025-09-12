@@ -50,6 +50,19 @@ except Exception:
     _genai_ok = False
     _genai_images_ok = False
 
+# Vertex AI (Imagen via vertexai SDK)
+_vertex_ok = False
+try:
+    import json as _json_for_vertex
+    import vertexai  # type: ignore
+    try:
+        from vertexai.preview.vision_models import ImageGenerationModel  # type: ignore
+        _vertex_ok = True
+    except Exception:
+        _vertex_ok = False
+except Exception:
+    _vertex_ok = False
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
@@ -58,6 +71,12 @@ GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
 # Новое: модели для медиа (мягко, при недоступности срабатывают фолбэки)
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0")
 GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
+
+# Vertex AI
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+GCP_KEY_JSON = os.getenv("GCP_KEY_JSON", "").strip()
+_vertex_inited = False
+_vertex_err: Optional[str] = None
 
 # Длина поста под Twitter/Telegram
 TARGET_CHAR_LEN = int(os.getenv("TARGET_CHAR_LEN", "666"))
@@ -113,7 +132,7 @@ def _sha_short(data: bytes, n: int = 12) -> str:
     return hashlib.sha256(data).hexdigest()[:n]
 
 def _sha_text(text: str, n: int = 12) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:n]
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:n]
 
 def _now_ts() -> int:
     return int(time.time())
@@ -134,7 +153,7 @@ def _clean_bracket_hints(text: str) -> str:
 
 def _clamp_to_len(text: str, target: int, tol: int) -> str:
     min_len, max_len = target - tol, target + tol
-    s = text.strip()
+    s = (text or "").strip()
     if len(s) <= max_len and len(s) >= min_len:
         return s
     if len(s) > max_len:
@@ -460,6 +479,128 @@ else:
     log.info("Gemini Images API NOT available (fallback → Pillow)")
 
 # -----------------------------------------------------------------------------
+# Vertex init
+# -----------------------------------------------------------------------------
+def _init_vertex_ai_once() -> bool:
+    """
+    Инициализация vertexai.init(project, location) один раз.
+    GCP_KEY_JSON может быть:
+      - чистый JSON (начинается на '{')
+      - base64(JSON)
+      - путь к файлу (*.json)
+    Записываем во временный файл и экспортируем GOOGLE_APPLICATION_CREDENTIALS.
+    """
+    global _vertex_inited, _vertex_err
+    if _vertex_inited:
+        return True
+    try:
+        if not _vertex_ok:
+            _vertex_err = "vertexai package not available"
+            return False
+        if not GCP_KEY_JSON:
+            _vertex_err = "GCP_KEY_JSON is empty"
+            return False
+
+        key_bytes: Optional[bytes] = None
+        if GCP_KEY_JSON.startswith("{"):
+            key_bytes = GCP_KEY_JSON.encode("utf-8")
+        elif GCP_KEY_JSON.endswith(".json") or GCP_KEY_JSON.startswith("/"):
+            if os.path.exists(GCP_KEY_JSON):
+                with open(GCP_KEY_JSON, "rb") as f:
+                    key_bytes = f.read()
+            else:
+                _vertex_err = f"Key file not found: {GCP_KEY_JSON}"
+                return False
+        else:
+            # base64 или просто строка
+            try:
+                key_bytes = base64.b64decode(GCP_KEY_JSON)
+            except Exception:
+                key_bytes = GCP_KEY_JSON.encode("utf-8")
+
+        if not key_bytes:
+            _vertex_err = "Key decode failed"
+            return False
+
+        tmp_dir = tempfile.mkdtemp(prefix="gcp_cred_")
+        cred_path = os.path.join(tmp_dir, "key.json")
+        with open(cred_path, "wb") as f:
+            f.write(key_bytes)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
+
+        jd = _json_for_vertex.loads(key_bytes.decode("utf-8"))
+        project_id = jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+        if not project_id:
+            _vertex_err = "project_id not found in GCP key"
+            return False
+
+        vertexai.init(project=project_id, location=VERTEX_LOCATION)
+        _vertex_inited = True
+        log.info("VertexAI initialized: project=%s location=%s", project_id, VERTEX_LOCATION)
+        return True
+    except Exception as e:
+        _vertex_err = f"vertex init error: {e}"
+        log.warning("VertexAI init failed: %s", e)
+        return False
+
+# -----------------------------------------------------------------------------
+# Crypto normalization (tickers + hashtags)
+# -----------------------------------------------------------------------------
+# Варианты написания → тикер
+_CRYPTO_VARIANTS: Dict[str, List[str]] = {
+    "BTC": [r"bitcoin", r"биткоин", r"биткойн", r"btc"],
+    "ETH": [r"ethereum", r"эфириум", r"eth"],
+    "SOL": [r"solana", r"солана", r"sol"],
+    "XRP": [r"ripple", r"xrp"],
+    "BNB": [r"binance\s*coin", r"\bbnb\b"],
+    "DOGE": [r"dogecoin", r"додж(?:коин|койн)?", r"doge"],
+    "TON": [r"\bton(?:coin)?\b", r"тон(?:коин|койн)?"],
+    "ADA": [r"cardano", r"кардано", r"\bada\b"],
+    "DOT": [r"polkadot", r"полкадот", r"\bdot\b"],
+    "AVAX":[r"avalanche", r"\bavax\b"],
+    "MATIC":[r"polygon", r"\bmatic\b"],
+    "TRX":[r"tron", r"\btrx\b"],
+}
+
+# Скомпилируем паттерны (чувствительны к словам; игнорируем, если уже есть $TICKER/#TICKER)
+_CR_PATTERNS: List[Tuple[str, re.Pattern]] = []
+for ticker, variants in _CRYPTO_VARIANTS.items():
+    pat = r"(?i)(?<![\$#])\b(?:" + "|".join(variants) + r")\b"
+    _CR_PATTERNS.append((ticker, re.compile(pat, flags=re.IGNORECASE)))
+
+def _ensure_crypto_tickers_and_hashtags(text: str) -> str:
+    """
+    1) Заменяет полные названия монет на $TICKER.
+    2) Добавляет #TICKER в конец (если ещё нет).
+    """
+    if not text:
+        return text
+    found: List[str] = []
+    s = text
+
+    # Замена на $TICKER
+    for ticker, pat in _CR_PATTERNS:
+        if pat.search(s):
+            s = pat.sub(f"${ticker}", s)
+            found.append(ticker)
+
+    # Добавить #TICKER (без дублей) — аккуратно, чтобы не ломать длину: максимум 4 тега
+    if found:
+        found_uniq = []
+        seen = set()
+        for t in found:
+            if t not in seen:
+                seen.add(t); found_uniq.append(t)
+        # уже присутствующие #TICKER не дублируем
+        existing_tags = set(m.group(1).upper() for m in re.finditer(r"#([A-Za-z]{2,10})\b", s))
+        add_tags = [t for t in found_uniq if t not in existing_tags][:4]
+        if add_tags:
+            tail = " " + " ".join(f"#{t}" for t in add_tags)
+            s = (s.rstrip() + tail).strip()
+
+    return s
+
+# -----------------------------------------------------------------------------
 # Text generation
 # -----------------------------------------------------------------------------
 def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
@@ -477,6 +618,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     prices_block = f"\nАктуальные цены (CoinGecko, USD): {prices_ctx}\n" if prices_ctx else "\nАктуальные цены недоступны — не указывай конкретные числа.\n"
     news_block = f"\nНовости для контекста (используй факты только отсюда, ссылки НЕ вставляй в итог):\n{news_ctx}\n" if news_ctx else "\nНовости недоступны — не упоминай конкретные события/даты.\n"
 
+    # Разрешаем тикеры/хэштеги именно для монет
     prompt = f"""
 Сгенерируй короткий пост для соцсетей на языке "{'Русский' if lang=='ru' else 'English'}".
 Тема: {topic}
@@ -487,12 +629,12 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 Обязательные требования:
 - Длина {TARGET_CHAR_LEN}±{TARGET_CHAR_TOL} символов.
 - Никаких подсказок в квадратных скобках и без служебных пометок.
-- Без хештегов, без вопросов к читателю, без "подпишись", без ссылок.
+- Без ссылок.
+- Разрешены тикеры и хэштеги ТОЛЬКО для монет (например: $BTC и #BTC), но не для всего подряд.
 - Фактура и актуальность: опирайся на популярные темы и формулировки из трендов Google и X(Twitter).
 - Пиши как инфо-пост/наблюдение, польза и конкретика.
 - Тон: бодрый, уверенный, без кликбейта, без эмодзи.
 - Факты, события и ЧИСЛА бери только из блоков «Актуальные цены» и «Новости». Не выдумывай новые цифры.
-- Ссылки из контекста НЕ вставляй в итоговый текст.
 
 Подсказки по трендам (не вставляй дословно как список, используй смысл): {trend_bits} {tag_bits}
 """
@@ -515,7 +657,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
         try:
             if _model:
                 resp2 = _model.generate_content(
-                    "Rewrite in concise English (no hashtags, no links, no questions):\n" + text
+                    "Rewrite in concise English (no links):\n" + text
                 )
                 text2 = (getattr(resp2, "text", "") or "").strip()
                 if text2:
@@ -523,12 +665,16 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
         except Exception:
             pass
 
+    # >>> НОРМАЛИЗАЦИЯ КРИПТО-УПОМИНАНИЙ
+    text = _ensure_crypto_tickers_and_hashtags(text)
+    # <<<
+
     text = _clamp_to_len(text, TARGET_CHAR_LEN, TARGET_CHAR_TOL)
     log.info("Text|len=%d lang=%s", len(text), lang)
     return text
 
 # -----------------------------------------------------------------------------
-# Image generation (Gemini/Imagen → Pillow fallback)
+# Image generation (Vertex/Gemini → Pillow fallback)
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -640,9 +786,45 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
         log.warning("IMG|gemini.generate error: %s", e)
     return None
 
+def _vertex_image_bytes(topic: str) -> Optional[bytes]:
+    """Генерация через Vertex Imagen 3 (если доступно)."""
+    if not _init_vertex_ai_once():
+        if _vertex_err:
+            log.info("IMG|vertex skip: %s", _vertex_err)
+        return None
+    try:
+        model_name = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-001")
+        prompt = (
+            "High-quality social cover image (no text), dark/gradient tech background, "
+            "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
+        )
+        size = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
+        log.info("IMG|vertex start | model=%s | size=%s | topic='%s'", model_name, size, (topic or "")[:160])
+        model = ImageGenerationModel.from_pretrained(model_name)
+        images = model.generate_images(prompt=prompt, number_of_images=1, size=size,
+                                       safety_filter_level=os.getenv("VERTEX_SAFETY_LEVEL", "block_few"))
+        if not images:
+            return None
+        first = images[0]
+        data = getattr(first, "image_bytes", None) or getattr(first, "bytes", None)
+        if isinstance(data, (bytes, bytearray)):
+            log.info("IMG|vertex ok | bytes=%d", len(data))
+            return bytes(data)
+        data = getattr(first, "_image_bytes", None)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        pil = getattr(first, "_pil_image", None)
+        if pil is not None:
+            buf = io.BytesIO(); pil.save(buf, format="PNG")
+            return buf.getvalue()
+        log.warning("IMG|vertex returned unknown structure")
+    except Exception as e:
+        log.warning("IMG|vertex error: %s", e)
+    return None
+
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
-    # Сначала пробуем Gemini/Imagen, затем — локальный фолбэк
-    png_bytes = _gemini_image_bytes(topic) or _cover_from_topic(topic, text)
+    # Порядок источников: Vertex → Gemini → Pillow
+    png_bytes = _vertex_image_bytes(topic) or _gemini_image_bytes(topic) or _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
 
@@ -864,13 +1046,13 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     """
     Полный цикл:
     1) прогресс "typing": начало генерации
-    2) генерим текст (666±20, факты — из цен/новостей)
+    2) генерим текст (666±20, факты — из цен/новостей) + нормализация $TICKER/#TICKER
     3) проверяем дубль текста
-    4) прогресс "upload_photo": генерация изображения (по кнопке можно не вызывать здесь)
+    4) прогресс "upload_photo": генерация изображения
     5) кладём локально и (опционально) в GitHub
     6) записываем в дедуп
     """
-    _report(progress, "typing:start_text")      # для Telegram: send_chat_action('typing')
+    _report(progress, "typing:start_text")
     text = generate_text(topic)
     _report(progress, "typing:text_ready")
 
@@ -885,9 +1067,10 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
         random.shuffle(parts)
         text = " ".join(parts)
         text = _clamp_to_len(_clean_bracket_hints(text), TARGET_CHAR_LEN, TARGET_CHAR_TOL)
+        text = _ensure_crypto_tickers_and_hashtags(text)
 
     _report(progress, "upload_photo:start_image")
-    # Сгенерируем картинку (ИИ/фолбэк), сохраним локально, опц. зальём в GH
+    # Изображение (Vertex → Gemini → Pillow), сохранить/загрузить
     path_img, url_img_direct, _ = ai_generate_image(topic, progress)
     _report(progress, "upload_photo:image_ready")
 
@@ -918,8 +1101,8 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
 
     return {
         "text": text,
-        "image_url": url_img,                 # может быть None, если автозалив выключен
-        "image_local_path": path_img,         # локальный путь точно есть
+        "image_url": url_img,
+        "image_local_path": path_img,
         "image_sha": image_sha,
     }
 
@@ -953,10 +1136,18 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
 def ai_suggest_hashtags(text: str) -> List[str]:
     defaults = ["#AiCoin", "#AI", "$Ai", "#crypto"]
     dynamic = get_x_hashtags(limit=6)
+
+    # добавим хэштеги по найденным тикерам в тексте (если ещё нет)
+    tickers_in_text = set(m.group(1).upper() for m in re.finditer(r"\$([A-Za-z]{2,10})\b", text or ""))
+    for t in sorted(tickers_in_text):
+        ht = f"#{t}"
+        if ht not in dynamic and ht not in defaults:
+            dynamic.append(ht)
+
     low = (text or "").lower()
-    if "ethereum" in low or " eth " in f" {low} ":
+    if "ethereum" in low or " eth " in f" {low} " or "$eth" in low:
         dynamic.append("#ETH")
-    if "solana" in low or " sol " in f" {low} ":
+    if "solana" in low or " sol " in f" {low} " or "$sol" in low:
         dynamic.append("#SOL")
     if "defi" in low:
         dynamic.append("#DeFi")
@@ -986,15 +1177,23 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         _report(progress, "upload_photo:start_image")
         log.info("IMG|make start | topic='%s'", (topic or "")[:160])
 
-        # 1) ИИ
-        img_bytes = _gemini_image_bytes(topic)
+        # 1) Vertex
+        img_bytes = _vertex_image_bytes(topic)
         warn = None
+
+        # 2) Gemini
         if not img_bytes:
-            # 2) Фолбэк
-            log.info("IMG|gemini none -> fallback")
+            gb = _gemini_image_bytes(topic)
+            if gb:
+                img_bytes = gb
+                warn = None
+
+        # 3) Фолбэк
+        if not img_bytes:
+            log.info("IMG|vertex/gemini none -> fallback")
             text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
             img_bytes = _cover_from_topic(topic, text_for_cover)
-            warn = "gemini image fallback (Pillow)"
+            warn = "fallback (Pillow)"
 
         log.info("IMG|bytes ready | %d", len(img_bytes) if img_bytes else -1)
 
@@ -1033,9 +1232,9 @@ def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None)
         warn = None
         if not vid_bytes:
             # фолбэк: берём обложку и строим MP4 пан-зум
-            cover = _gemini_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
+            cover = _vertex_image_bytes(topic) or _gemini_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
             vid_bytes = _build_panzoom_from_image(cover, seconds=seconds) if cover else None
-            warn = "gemini video fallback (pan-zoom MP4)"
+            warn = "fallback (pan-zoom MP4)"
         if not vid_bytes:
             _report(progress, "upload_photo:image_ready")
             return None, "video generation failed"
@@ -1156,7 +1355,7 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
 # If run directly
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    t = "Горячие ИИ-тренды и крипто-сигналы недели"
+    t = "Горячие ИИ-тренды, Bitcoin и Ethereum сигналы недели"
     post = make_post(t)
     print("TEXT:\n", post["text"])
     print("IMG URL:", post["image_url"])
