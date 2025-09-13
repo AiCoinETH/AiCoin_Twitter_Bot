@@ -502,6 +502,7 @@ def _init_vertex_ai_once() -> bool:
         project_id: Optional[str] = (VERTEX_PROJECT or None)
         cred_path: Optional[str] = None
         key_bytes: Optional[bytes] = None
+        svc_email: Optional[str] = None
 
         # 1) Если уже задан GOOGLE_APPLICATION_CREDENTIALS и он существует — используем его
         gac = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
@@ -509,11 +510,12 @@ def _init_vertex_ai_once() -> bool:
             cred_path = gac
             try:
                 with open(gac, "rb") as f:
-                    kb = f.read(4096)
-                # Пытаемся вытащить project_id из JSON сервис-аккаунта (если это он)
+                    kb = f.read()
+                key_bytes = kb
                 try:
                     jd = _json_for_vertex.loads(kb.decode("utf-8"))
                     project_id = project_id or jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+                    svc_email = jd.get("client_email")
                 except Exception:
                     pass
             except Exception:
@@ -553,11 +555,12 @@ def _init_vertex_ai_once() -> bool:
                     f.write(key_bytes)
                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
-            # вытащим project_id из JSON, если ещё не известен
-            if key_bytes and not project_id:
+            # вытащим project_id/email из JSON, если ещё не известны
+            if key_bytes:
                 try:
                     jd = _json_for_vertex.loads(key_bytes.decode("utf-8"))
-                    project_id = jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+                    project_id = project_id or jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+                    svc_email = svc_email or jd.get("client_email")
                 except Exception:
                     pass
 
@@ -569,9 +572,16 @@ def _init_vertex_ai_once() -> bool:
             _vertex_err = "project_id not found (set VERTEX_PROJECT or use a service key with project_id)"
             return False
 
+        # Экспортируем project vars — это иногда критично для биллинга/квот
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+        os.environ.setdefault("GOOGLE_CLOUD_QUOTA_PROJECT", project_id)
+
         vertexai.init(project=project_id, location=VERTEX_LOCATION)
         _vertex_inited = True
-        log.info("VertexAI initialized: project=%s location=%s creds=%s", project_id, VERTEX_LOCATION, cred_path)
+        log.info(
+            "VertexAI initialized: project=%s location=%s creds=%s svc=%s",
+            project_id, VERTEX_LOCATION, cred_path, (svc_email or "n/a")
+        )
         return True
     except Exception as e:
         _vertex_err = f"vertex init error: {e}"
@@ -828,33 +838,55 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             log.info("IMG|vertex skip: %s", _vertex_err)
         return None
     try:
-        model_name = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-001")
+        # ВАЖНО: fast-вариант по умолчанию; можно переопределить через env
+        model_name = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-fast-generate-001")
         prompt = (
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
         size = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
+        safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
+
         log.info("IMG|vertex start | model=%s | size=%s | topic='%s'", model_name, size, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
-        images = model.generate_images(prompt=prompt, number_of_images=1, size=size,
-                                       safety_filter_level=os.getenv("VERTEX_SAFETY_LEVEL", "block_few"))
+
+        images = model.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            size=size,
+            safety_filter_level=safety
+        )
+
         if not images:
+            log.warning("IMG|vertex got empty response")
             return None
+
         first = images[0]
         data = getattr(first, "image_bytes", None) or getattr(first, "bytes", None)
         if isinstance(data, (bytes, bytearray)):
             log.info("IMG|vertex ok | bytes=%d", len(data))
             return bytes(data)
+
         data = getattr(first, "_image_bytes", None)
         if isinstance(data, (bytes, bytearray)):
+            log.info("IMG|vertex ok (_image_bytes) | bytes=%d", len(data))
             return bytes(data)
+
         pil = getattr(first, "_pil_image", None)
         if pil is not None:
             buf = io.BytesIO(); pil.save(buf, format="PNG")
-            return buf.getvalue()
-        log.warning("IMG|vertex returned unknown structure")
+            out = buf.getvalue()
+            log.info("IMG|vertex ok (PIL) | bytes=%d", len(out))
+            return out
+
+        log.warning("IMG|vertex returned unknown structure: %s", type(first))
     except Exception as e:
-        log.warning("IMG|vertex error: %s", e)
+        msg = str(e)
+        # Частые варианты: no permission / auth / model not enabled
+        if any(x in msg.lower() for x in ("permission", "unauth", "forbidden", "quota", "authenticate")):
+            log.warning("IMG|vertex auth/perm error: %s", msg)
+        else:
+            log.warning("IMG|vertex error: %s", msg)
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
@@ -1351,7 +1383,7 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     }
 
     log_gh.info("GH|PUT image | repo=%s | branch=%s | rel=%s | bytes=%d",
-                ACTION_REPO_GITHUB, ACTION_BRANCH, rel_path, len(file_bytes))
+        ACTION_REPO_GITHUB, ACTION_BRANCH, rel_path, len(file_bytes))
 
     try:
         r_get = requests.get(api, headers=headers, params={"ref": ACTION_BRANCH}, timeout=20)
