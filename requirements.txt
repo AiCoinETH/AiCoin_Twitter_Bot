@@ -5,7 +5,7 @@ python-telegram-bot==20.7
 pandas>=1.5.0
 pytrends>=4.8.0
 snscrape>=0.4.3.20220106
-# PyGithub>=2.1.1          # <- нужно только если реально используете PyGithub
+PyGithub>=2.1.1
 aiosqlite>=0.18.0
 python-dotenv>=0.21.0
 pytz>=2023.3
@@ -20,4 +20,4 @@ numpy>=1.24.0
 google-generativeai>=0.7.2
 google-cloud-aiplatform>=1.38.1
 
-# playwright>=1.44.0       # <- оставляйте, только если реально нужен
+# playwright>=1.44.0       # <- оставляй только если реально нужен
