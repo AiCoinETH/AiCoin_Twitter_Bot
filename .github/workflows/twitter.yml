@@ -43,6 +43,7 @@ jobs:
 
       # Google Vertex AI
       VERTEX_PROJECT:               ${{ secrets.VERTEX_PROJECT }}
+      VERTEX_LOCATION:              ${{ secrets.VERTEX_LOCATION }}
 
       # Логи
       LOG_LEVEL: INFO
@@ -67,6 +68,7 @@ jobs:
           echo "${{ secrets.GCP_KEY_JSON }}" > $HOME/gcp-key.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcp-key.json" >> $GITHUB_ENV
           echo "VERTEX_PROJECT=${{ secrets.VERTEX_PROJECT }}" >> $GITHUB_ENV
+          echo "VERTEX_LOCATION=${{ secrets.VERTEX_LOCATION }}" >> $GITHUB_ENV
 
       # ✅ Проверка доступа к Vertex AI
       - name: Test Vertex AI credentials
@@ -76,9 +78,10 @@ jobs:
           import vertexai
 
           project_id = os.getenv("VERTEX_PROJECT")
+          location = os.getenv("VERTEX_LOCATION", "us-central1")
           try:
-              vertexai.init(project=project_id, location="us-central1")
-              print(f"✅ Vertex AI credentials OK | project={project_id}")
+              vertexai.init(project=project_id, location=location)
+              print(f"✅ Vertex AI credentials OK | project={project_id} | location={location}")
           except Exception as e:
               print("❌ Vertex AI error:", e)
               exit(1)
