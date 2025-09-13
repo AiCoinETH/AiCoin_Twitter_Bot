@@ -75,6 +75,7 @@ GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
 # Vertex AI
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON", "").strip()
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # NEW: явное указание project (опционально)
 _vertex_inited = False
 _vertex_err: Optional[str] = None
 
@@ -484,11 +485,11 @@ else:
 def _init_vertex_ai_once() -> bool:
     """
     Инициализация vertexai.init(project, location) один раз.
-    GCP_KEY_JSON может быть:
-      - чистый JSON (начинается на '{')
-      - base64(JSON)
-      - путь к файлу (*.json)
-    Записываем во временный файл и экспортируем GOOGLE_APPLICATION_CREDENTIALS.
+
+    Источники кредов:
+      1) GCP_KEY_JSON: raw JSON | base64(JSON) | путь к *.json
+      2) GOOGLE_APPLICATION_CREDENTIALS: уже указывает на файл с ключом/ADC
+    Если указан VERTEX_PROJECT — используем его; иначе берём project_id из ключа.
     """
     global _vertex_inited, _vertex_err
     if _vertex_inited:
@@ -497,46 +498,80 @@ def _init_vertex_ai_once() -> bool:
         if not _vertex_ok:
             _vertex_err = "vertexai package not available"
             return False
-        if not GCP_KEY_JSON:
-            _vertex_err = "GCP_KEY_JSON is empty"
-            return False
 
+        project_id: Optional[str] = (VERTEX_PROJECT or None)
+        cred_path: Optional[str] = None
         key_bytes: Optional[bytes] = None
-        if GCP_KEY_JSON.startswith("{"):
-            key_bytes = GCP_KEY_JSON.encode("utf-8")
-        elif GCP_KEY_JSON.endswith(".json") or GCP_KEY_JSON.startswith("/"):
-            if os.path.exists(GCP_KEY_JSON):
-                with open(GCP_KEY_JSON, "rb") as f:
-                    key_bytes = f.read()
-            else:
-                _vertex_err = f"Key file not found: {GCP_KEY_JSON}"
-                return False
-        else:
-            # base64 или просто строка
-            try:
-                key_bytes = base64.b64decode(GCP_KEY_JSON)
-            except Exception:
-                key_bytes = GCP_KEY_JSON.encode("utf-8")
 
-        if not key_bytes:
-            _vertex_err = "Key decode failed"
+        # 1) Если уже задан GOOGLE_APPLICATION_CREDENTIALS и он существует — используем его
+        gac = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+        if gac and os.path.exists(gac):
+            cred_path = gac
+            try:
+                with open(gac, "rb") as f:
+                    kb = f.read(4096)
+                # Пытаемся вытащить project_id из JSON сервис-аккаунта (если это он)
+                try:
+                    jd = _json_for_vertex.loads(kb.decode("utf-8"))
+                    project_id = project_id or jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # 2) Иначе разбираем GCP_KEY_JSON (raw/base64/путь)
+        if not cred_path:
+            if not GCP_KEY_JSON:
+                _vertex_err = "no credentials: set GOOGLE_APPLICATION_CREDENTIALS or GCP_KEY_JSON"
+                return False
+
+            if GCP_KEY_JSON.startswith("{"):
+                key_bytes = GCP_KEY_JSON.encode("utf-8")
+            elif GCP_KEY_JSON.endswith(".json") or GCP_KEY_JSON.startswith("/"):
+                if os.path.exists(GCP_KEY_JSON):
+                    cred_path = GCP_KEY_JSON
+                    try:
+                        with open(GCP_KEY_JSON, "rb") as f:
+                            key_bytes = f.read()
+                    except Exception:
+                        key_bytes = None
+                else:
+                    _vertex_err = f"Key file not found: {GCP_KEY_JSON}"
+                    return False
+            else:
+                # вероятно base64
+                try:
+                    key_bytes = base64.b64decode(GCP_KEY_JSON)
+                except Exception:
+                    key_bytes = GCP_KEY_JSON.encode("utf-8")
+
+            # если у нас байты — кладём во временный файл и экспортируем GAC
+            if key_bytes and not cred_path:
+                tmp_dir = tempfile.mkdtemp(prefix="gcp_cred_")
+                cred_path = os.path.join(tmp_dir, "key.json")
+                with open(cred_path, "wb") as f:
+                    f.write(key_bytes)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
+
+            # вытащим project_id из JSON, если ещё не известен
+            if key_bytes and not project_id:
+                try:
+                    jd = _json_for_vertex.loads(key_bytes.decode("utf-8"))
+                    project_id = jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
+                except Exception:
+                    pass
+
+        if not cred_path or not os.path.exists(cred_path):
+            _vertex_err = "credentials file missing/unreadable"
             return False
 
-        tmp_dir = tempfile.mkdtemp(prefix="gcp_cred_")
-        cred_path = os.path.join(tmp_dir, "key.json")
-        with open(cred_path, "wb") as f:
-            f.write(key_bytes)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-
-        jd = _json_for_vertex.loads(key_bytes.decode("utf-8"))
-        project_id = jd.get("project_id") or jd.get("project") or jd.get("quota_project_id")
         if not project_id:
-            _vertex_err = "project_id not found in GCP key"
+            _vertex_err = "project_id not found (set VERTEX_PROJECT or use a service key with project_id)"
             return False
 
         vertexai.init(project=project_id, location=VERTEX_LOCATION)
         _vertex_inited = True
-        log.info("VertexAI initialized: project=%s location=%s", project_id, VERTEX_LOCATION)
+        log.info("VertexAI initialized: project=%s location=%s creds=%s", project_id, VERTEX_LOCATION, cred_path)
         return True
     except Exception as e:
         _vertex_err = f"vertex init error: {e}"
