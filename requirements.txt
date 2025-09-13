@@ -5,11 +5,19 @@ python-telegram-bot==20.7
 pandas>=1.5.0
 pytrends>=4.8.0
 snscrape>=0.4.3.20220106
-PyGithub>=2.1.1
+# PyGithub>=2.1.1          # <- нужно только если реально используете PyGithub
 aiosqlite>=0.18.0
 python-dotenv>=0.21.0
 pytz>=2023.3
 pillow>=9.5.0
-playwright>=1.44.0
+
+# Видео-фолбэк (пан-зума из картинки)
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+numpy>=1.24.0
+
+# Генерация через Gemini и Vertex AI
 google-generativeai>=0.7.2
 google-cloud-aiplatform>=1.38.1
+
+# playwright>=1.44.0       # <- оставляйте, только если реально нужен
