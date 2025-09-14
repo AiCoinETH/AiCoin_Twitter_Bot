@@ -5,8 +5,7 @@ on:
   repository_dispatch:
     types: [telegram-bot-restart]
   schedule:
-    # GitHub Actions работает в UTC (Киев сейчас UTC+3)
-    - cron: "0 11-13 * * *"   # 14:00, 15:00, 16:00 Kyiv
+    - cron: "0 11-13 * * *"   # 14:00, 15:00, 16:00 Kyiv (UTC+3)
 
 jobs:
   test-bot:
@@ -43,9 +42,8 @@ jobs:
       GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
 
       # Google Vertex AI
-      VERTEX_PROJECT:               ${{ secrets.VERTEX_PROJECT }}
-      VERTEX_LOCATION:              us-central1   # <- фиксируем регион Imagen
-      # опционально: прокинем сырое содержимое ключа (для ai_client.py fallback-логики)
+      VERTEX_PROJECT:               ${{ secrets.VERTEX_PROJECT }}   # api-project-756766452273
+      VERTEX_LOCATION:              us-central1
       GCP_KEY_JSON:                 ${{ secrets.GCP_KEY_JSON }}
 
       # Логи
@@ -70,15 +68,15 @@ jobs:
       - name: Show installed packages
         run: pip freeze | sort
 
-      # 🔑 Ключ GCP -> файл + переменные окружения
+      # 🔑 Кладём ключ и экспортим переменные
       - name: Set up Google credentials
         run: |
-          echo "${{ secrets.GCP_KEY_JSON }}" > $HOME/gcp-key.json
+          printf '%s' "${GCP_KEY_JSON}" > "$HOME/gcp-key.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcp-key.json" >> $GITHUB_ENV
-          echo "VERTEX_PROJECT=${{ secrets.VERTEX_PROJECT }}" >> $GITHUB_ENV
-          echo "VERTEX_LOCATION=us-central1" >> $GITHUB_ENV
+          echo "VERTEX_PROJECT=${VERTEX_PROJECT}" >> $GITHUB_ENV
+          echo "VERTEX_LOCATION=${VERTEX_LOCATION}" >> $GITHUB_ENV
 
-      # ✅ Тестируем не только init, но и сам Imagen
+      # ✅ Тест: сначала Imagen 4, если нет доступа — пробуем Imagen 3
       - name: Test Vertex AI Imagen access
         run: |
           python - <<'EOF'
@@ -86,29 +84,33 @@ jobs:
           import vertexai
           from vertexai.preview.vision_models import ImageGenerationModel
 
-          project = os.getenv("VERTEX_PROJECT")
+          project  = os.getenv("VERTEX_PROJECT")
           location = os.getenv("VERTEX_LOCATION", "us-central1")
-          try:
-              vertexai.init(project=project, location=location)
-              print(f"✅ vertexai.init OK | project={project} | location={location}")
-              model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
-              imgs = model.generate_images(
-                  prompt="simple abstract gradient background, no text",
-                  number_of_images=1,
-                  size="512x384",
-                  safety_filter_level="block_few"
-              )
-              if not imgs:
-                  print("❌ Imagen returned empty list")
-                  sys.exit(1)
-              img0 = imgs[0]
-              got = getattr(img0, "image_bytes", None) or getattr(img0, "bytes", None)
-              if got:
-                  print(f"✅ Imagen generate_images OK | bytes={len(got)}")
-              else:
-                  print("⚠️ Imagen responded but no raw bytes attribute (SDK variant) — считается OK")
-          except Exception as e:
-              print("❌ Vertex/Imagen error:", e)
+          vertexai.init(project=project, location=location)
+          print(f"✅ vertexai.init OK | project={project} | location={location}")
+
+          tried = []
+          for model_id in ("imagen-4.0-generate-001", "imagen-3.0-generate-001"):
+              try:
+                  tried.append(model_id)
+                  print(f"→ Trying {model_id} …")
+                  model = ImageGenerationModel.from_pretrained(model_id)
+                  imgs = model.generate_images(
+                      prompt="simple abstract gradient background, no text",
+                      number_of_images=1,
+                      size="512x384",
+                      safety_filter_level="block_few",
+                  )
+                  if not imgs:
+                      raise RuntimeError("Empty response from Imagen")
+                  img0 = imgs[0]
+                  got = getattr(img0, "image_bytes", None) or getattr(img0, "bytes", None)
+                  print(f"✅ {model_id} OK | bytes={len(got) if got else 'n/a'}")
+                  break
+              except Exception as e:
+                  print(f"⚠️ {model_id} failed: {e}")
+          else:
+              print(f"❌ No working Imagen models among: {tried}")
               sys.exit(1)
           EOF
 
