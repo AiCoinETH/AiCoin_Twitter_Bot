@@ -20,6 +20,10 @@ import requests
 # Pillow cover generator (fallback & default)
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+# -----------------------------------------------------------------------------
+# Optional deps (graceful fallbacks)
+# -----------------------------------------------------------------------------
+
 # Trends (both are optional at runtime)
 try:
     from pytrends.request import TrendReq  # type: ignore
@@ -41,7 +45,7 @@ try:
     import google.generativeai as genai  # type: ignore
     _genai_ok = True
     try:
-        # Официальный модуль для генерации изображений
+        # Официальный модуль для генерации изображений Gemini Images API
         from google.generativeai import images as gen_images  # type: ignore
         _genai_images_ok = True
     except Exception:
@@ -63,19 +67,36 @@ try:
 except Exception:
     _vertex_ok = False
 
+# Опциональные зависимости для локального видео-фолбэка
+try:
+    import numpy as _np  # type: ignore
+    import imageio.v3 as _iio  # type: ignore
+    _vid_local_ok = True
+except Exception:
+    _vid_local_ok = False
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
-# Новое: модели для медиа (мягко, при недоступности срабатывают фолбэки)
+
+# ВНИМАНИЕ:
+# GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex). Для него обычно
+# используются имена семейств "imagen-3.0" и т.п. Оставляем как есть — это запасной путь.
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0")
+
+# Видеогенерация через Gemini/Veo — как экспериментальный фолбэк
 GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
 
-# Vertex AI
+# Vertex AI (основной путь для картинок через Imagen 4)
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON", "").strip()
-VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # NEW: явное указание project (опционально)
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # явное указание project (опционально)
+# Модель по умолчанию — быстрая 4.0 Fast; можно переопределить переменной окружения:
+#   VERTEX_IMAGEN_MODEL=imagen-4.0-generate-001 (полное качество)
+VERTEX_IMAGEN_MODEL_DEFAULT = "imagen-4.0-fast-generate-001"
+
 _vertex_inited = False
 _vertex_err: Optional[str] = None
 
@@ -117,14 +138,6 @@ log_gh = logging.getLogger("ai_client.github")
 
 _RAW_GH = "https://raw.githubusercontent.com"
 _UA = {"User-Agent": "AiCoinBot/1.0 (+https://x.com/AiCoin_ETH)"}
-
-# Опциональные зависимости для локального видео-фолбэка
-try:
-    import numpy as _np  # type: ignore
-    import imageio.v3 as _iio  # type: ignore
-    _vid_local_ok = True
-except Exception:
-    _vid_local_ok = False
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -535,6 +548,7 @@ def _init_vertex_ai_once() -> bool:
                     try:
                         with open(GCP_KEY_JSON, "rb") as f:
                             key_bytes = f.read()
+                        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
                     except Exception:
                         key_bytes = None
                 else:
@@ -832,14 +846,13 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
     return None
 
 def _vertex_image_bytes(topic: str) -> Optional[bytes]:
-    """Генерация через Vertex Imagen 3 (если доступно)."""
+    """Генерация через Vertex **Imagen 4** (Fast по умолчанию)."""
     if not _init_vertex_ai_once():
         if _vertex_err:
             log.info("IMG|vertex skip: %s", _vertex_err)
         return None
     try:
-        # ВАЖНО: fast-вариант по умолчанию; можно переопределить через env
-        model_name = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-fast-generate-001")
+        model_name = os.getenv("VERTEX_IMAGEN_MODEL", VERTEX_IMAGEN_MODEL_DEFAULT)
         prompt = (
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
@@ -867,11 +880,7 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             log.info("IMG|vertex ok | bytes=%d", len(data))
             return bytes(data)
 
-        data = getattr(first, "_image_bytes", None)
-        if isinstance(data, (bytes, bytearray)):
-            log.info("IMG|vertex ok (_image_bytes) | bytes=%d", len(data))
-            return bytes(data)
-
+        # Некоторые версии SDK возвращают PIL-объект
         pil = getattr(first, "_pil_image", None)
         if pil is not None:
             buf = io.BytesIO(); pil.save(buf, format="PNG")
@@ -890,7 +899,10 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
-    # Порядок источников: Vertex → Gemini → Pillow
+    """
+    Старый публичный интерфейс (не используется ботом напрямую).
+    Сохраняет PNG локально + заливает в GH. Возвращает словарь с url/локальным путём/sha.
+    """
     png_bytes = _vertex_image_bytes(topic) or _gemini_image_bytes(topic) or _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
@@ -1244,18 +1256,18 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         _report(progress, "upload_photo:start_image")
         log.info("IMG|make start | topic='%s'", (topic or "")[:160])
 
-        # 1) Vertex
+        # 1) Vertex (Imagen 4)
         img_bytes = _vertex_image_bytes(topic)
         warn = None
 
-        # 2) Gemini
+        # 2) Gemini Images (если доступен)
         if not img_bytes:
             gb = _gemini_image_bytes(topic)
             if gb:
                 img_bytes = gb
                 warn = None
 
-        # 3) Фолбэк
+        # 3) Фолбэк (Pillow)
         if not img_bytes:
             log.info("IMG|vertex/gemini none -> fallback")
             text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
