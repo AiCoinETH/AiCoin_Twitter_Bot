@@ -82,14 +82,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
 
 # ВНИМАНИЕ:
-# GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex). Для него обычно
-# используются имена семейств "imagen-3.0" и т.п. Оставляем как есть — это запасной путь.
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0")
+# GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex).
+# По умолчанию — Imagen 4 Fast; можно переопределить через переменную окружения.
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-4.0-fast-generate-001")
 
 # Видеогенерация через Gemini/Veo — как экспериментальный фолбэк
 GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
 
-# Vertex AI (основной путь для картинок через Imagen 4)
+# Vertex AI (запасной путь для картинок через Imagen 4)
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON", "").strip()
 VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # явное указание project (опционально)
@@ -660,9 +660,9 @@ def _ensure_crypto_tickers_and_hashtags(text: str) -> str:
     return s
 
 # -----------------------------------------------------------------------------
-# Text generation
+# Text generation (stream-ready)
 # -----------------------------------------------------------------------------
-def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
+def generate_text(topic: str, locale_hint: Optional[str] = None, progress: Optional[Callable[[str], None]] = None) -> str:
     lang = (locale_hint or _detect_lang(topic)).lower()
 
     # контексты: тренды/тэги (могут пустить fallback), цены, новости
@@ -700,10 +700,24 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     text = ""
     if _model:
         try:
-            resp = _model.generate_content(prompt)
-            text = (getattr(resp, "text", "") or "").strip()
+            # Потоковая генерация: отдаём дельты через progress("typing:delta:<...>")
+            resp = _model.generate_content(prompt, stream=True)
+            for chunk in resp:
+                delta = (getattr(chunk, "text", "") or "")
+                if delta:
+                    text += delta
+                    try:
+                        if progress:
+                            progress("typing:delta:" + delta)
+                    except Exception:
+                        pass
+            try:
+                # Для некоторых SDK требуется resolve(), чтобы завершить поток.
+                resp.resolve()
+            except Exception:
+                pass
         except Exception as e:
-            log.warning("Gemini text error: %s", e)
+            log.warning("Gemini text error (stream): %s", e)
 
     if not text:
         base = f"{topic.strip().capitalize()}: актуальные наблюдения без воды. "
@@ -733,7 +747,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     return text
 
 # -----------------------------------------------------------------------------
-# Image generation (Vertex/Gemini → Pillow fallback)
+# Image generation (Gemini → Vertex → Pillow)
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -903,7 +917,8 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     Старый публичный интерфейс (не используется ботом напрямую).
     Сохраняет PNG локально + заливает в GH. Возвращает словарь с url/локальным путём/sha.
     """
-    png_bytes = _vertex_image_bytes(topic) or _gemini_image_bytes(topic) or _cover_from_topic(topic, text)
+    # Новый приоритет: Gemini → Vertex → Pillow
+    png_bytes = _gemini_image_bytes(topic) or _vertex_image_bytes(topic) or _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
 
@@ -1132,7 +1147,7 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     6) записываем в дедуп
     """
     _report(progress, "typing:start_text")
-    text = generate_text(topic)
+    text = generate_text(topic, progress=progress)
     _report(progress, "typing:text_ready")
 
     try:
@@ -1149,7 +1164,7 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
         text = _ensure_crypto_tickers_and_hashtags(text)
 
     _report(progress, "upload_photo:start_image")
-    # Изображение (Vertex → Gemini → Pillow), сохранить/загрузить
+    # Изображение (Gemini → Vertex → Pillow), сохранить/загрузить
     path_img, url_img_direct, _ = ai_generate_image(topic, progress)
     _report(progress, "upload_photo:image_ready")
 
@@ -1192,6 +1207,7 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
     progress(msg):
       'typing:start_text'  -> показать "печатает..."
       'typing:text_ready'  -> убрать индикацию/написать "черновик готов"
+      'typing:delta:<chunk>' -> потоковые дельты текста (если включены)
     """
     topic = (topic or "").strip()
     if not topic:
@@ -1206,7 +1222,7 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
         warn_parts.append("snscrape missing")
 
     _report(progress, "typing:start_text")
-    text = generate_text(topic)
+    text = generate_text(topic, progress=progress)
     _report(progress, "typing:text_ready")
 
     warn = " | ".join(warn_parts) if warn_parts else None
@@ -1256,20 +1272,20 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         _report(progress, "upload_photo:start_image")
         log.info("IMG|make start | topic='%s'", (topic or "")[:160])
 
-        # 1) Vertex (Imagen 4)
-        img_bytes = _vertex_image_bytes(topic)
+        # 1) Gemini Images — ПЕРВЫЙ ПРИОРИТЕТ
+        img_bytes = _gemini_image_bytes(topic)
         warn = None
 
-        # 2) Gemini Images (если доступен)
+        # 2) Vertex (Imagen 4) — запасной путь
         if not img_bytes:
-            gb = _gemini_image_bytes(topic)
-            if gb:
-                img_bytes = gb
+            vb = _vertex_image_bytes(topic)
+            if vb:
+                img_bytes = vb
                 warn = None
 
         # 3) Фолбэк (Pillow)
         if not img_bytes:
-            log.info("IMG|vertex/gemini none -> fallback")
+            log.info("IMG|gemini/vertex none -> fallback")
             text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
             img_bytes = _cover_from_topic(topic, text_for_cover)
             warn = "fallback (Pillow)"
@@ -1310,8 +1326,8 @@ def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None)
         vid_bytes = _gemini_video_bytes(topic, seconds=seconds)
         warn = None
         if not vid_bytes:
-            # фолбэк: берём обложку и строим MP4 пан-зум
-            cover = _vertex_image_bytes(topic) or _gemini_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
+            # фолбэк: берём обложку и строим MP4 пан-зум (сначала Gemini)
+            cover = _gemini_image_bytes(topic) or _vertex_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
             vid_bytes = _build_panzoom_from_image(cover, seconds=seconds) if cover else None
             warn = "fallback (pan-zoom MP4)"
         if not vid_bytes:
@@ -1434,8 +1450,21 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
 # If run directly
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    def cli_progress(ev: str) -> None:
+        if ev == "typing:start_text":
+            print("[typing] начинаю генерацию…", flush=True)
+        elif ev.startswith("typing:delta:"):
+            print(ev.split("typing:delta:", 1)[1], end="", flush=True)
+        elif ev == "typing:text_ready":
+            print("\n[typing] текст готов.", flush=True)
+        elif ev == "upload_photo:start_image":
+            print("[image] генерирую…", flush=True)
+        elif ev == "upload_photo:image_ready":
+            print("[image] готово.", flush=True)
+
     t = "Горячие ИИ-тренды, Bitcoin и Ethereum сигналы недели"
-    post = make_post(t)
+    post = make_post(t, progress=cli_progress)
+    print("\n\n=== ИТОГ ===")
     print("TEXT:\n", post["text"])
     print("IMG URL:", post["image_url"])
     print("IMG FILE:", post["image_local_path"])
