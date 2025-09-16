@@ -1131,7 +1131,7 @@ def _tmp_write_and_maybe_upload_media(
                     "status": r.status_code, "content_type": ct,
                     "content_length": r.headers.get("Content-Length")
                 }
-                with open(tmp.name + ".meta.json", "w", encoding="utf-8") as mf:
+                with open(tmp.name + ".meta.json", "w", encoding="utf-8") as mf):
                     json.dump(meta, mf, ensure_ascii=False, indent=2)
             except Exception as e:
                 log_gh.warning("GH|HEAD check failed for %s: %s", clean, e)
