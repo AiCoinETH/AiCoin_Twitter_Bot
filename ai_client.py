@@ -109,9 +109,10 @@ ACTION_PAT_GITHUB = os.getenv("ACTION_PAT_GITHUB", "")
 ACTION_REPO_GITHUB = os.getenv("ACTION_REPO_GITHUB", "")  # owner/repo
 ACTION_BRANCH = os.getenv("ACTION_BRANCH", "main")
 
-# Папки для медиа в репозитории
-GH_IMAGES_DIR = os.getenv("GH_IMAGES_DIR", "images_for_posts")
-GH_VIDEOS_DIR = os.getenv("GH_VIDEOS_DIR", "videos_for_posts")
+# Папки для медиа в репозитории (видео-папка может быть пустой -> тогда не заливаем видео)
+GH_IMAGES_DIR = os.getenv("GH_IMAGES_DIR", "images_for_posts") or "images_for_posts"
+_raw_videos_dir = os.getenv("GH_VIDEOS_DIR", "videos_for_posts")
+GH_VIDEOS_DIR = _raw_videos_dir.strip() if (_raw_videos_dir and _raw_videos_dir.strip()) else None
 
 # Локальные пути
 LOCAL_MEDIA_DIR = os.getenv("LOCAL_MEDIA_DIR", "./images_for_posts")
@@ -121,7 +122,11 @@ os.makedirs(LOCAL_VIDEO_DIR, exist_ok=True)
 
 # Авто-аплоад
 AUTO_UPLOAD_IMAGE_TO_GH = (os.getenv("AUTO_UPLOAD_IMAGE_TO_GH", "1") or "1").lower() not in ("0", "false", "no")
-AUTO_UPLOAD_VIDEO_TO_GH = (os.getenv("AUTO_UPLOAD_VIDEO_TO_GH", "1") or "1").lower() not in ("0", "false", "no")
+# Видео-аплоад разрешаем только если включён флаг и задана папка
+AUTO_UPLOAD_VIDEO_TO_GH = (
+    (os.getenv("AUTO_UPLOAD_VIDEO_TO_GH", "1") or "1").lower() not in ("0", "false", "no")
+    and GH_VIDEOS_DIR is not None
+)
 
 # База для дедупликации
 DEDUP_DB_PATH = os.getenv("DEDUP_DB_PATH", "./history.db")
@@ -857,16 +862,15 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        size = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
+        # Новые версии SDK не принимают size= → убираем параметр и оставляем дефолтные размеры/AR
         safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
 
-        log.info("IMG|vertex start | model=%s | size=%s | topic='%s'", model_name, size, (topic or "")[:160])
+        log.info("IMG|vertex start | model=%s | topic='%s'", model_name, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
 
         images = model.generate_images(
             prompt=prompt,
             number_of_images=1,
-            size=size,
             safety_filter_level=safety
         )
 
@@ -1009,7 +1013,7 @@ def _build_panzoom_from_image(png_bytes: bytes, seconds: int = 6, fps: int = 24)
 
 def _upload_video_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     """Аплоад MP4 в GH (в папку GH_VIDEOS_DIR)."""
-    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
+    if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB and GH_VIDEOS_DIR):
         return None
     try:
         owner, repo = _split_repo(ACTION_REPO_GITHUB)
@@ -1064,6 +1068,10 @@ def _tmp_write_and_maybe_upload_media(
     _log_file_info(tmp.name, log)
 
     gh_url = None
+    # Если это видео и GH_VIDEOS_DIR не задан — аплоад выключаем
+    if kind == "video" and not GH_VIDEOS_DIR:
+        auto_upload = False
+
     if auto_upload and (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
         try:
             ensure_github_dir()  # создаёт каталоги при первом запуске
@@ -1355,7 +1363,7 @@ def ensure_github_dir() -> None:
     if not (ACTION_PAT_GITHUB and ACTION_REPO_GITHUB):
         return
     owner, repo = _split_repo(ACTION_REPO_GITHUB)
-    for sub in (GH_IMAGES_DIR, GH_VIDEOS_DIR):
+    for sub in filter(None, (GH_IMAGES_DIR, GH_VIDEOS_DIR)):
         api_dir = f"https://api.github.com/repos/{owner}/{repo}/contents/{sub}"
         params = {"ref": ACTION_BRANCH}
         r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
