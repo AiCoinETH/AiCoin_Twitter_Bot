@@ -13,6 +13,7 @@ import logging
 import sqlite3
 import tempfile
 import datetime as dt
+import inspect
 from typing import Dict, List, Optional, Tuple, Callable
 
 import requests
@@ -96,6 +97,8 @@ VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # явное указ�
 # Модель по умолчанию — быстрая 4.0 Fast; можно переопределить переменной окружения:
 #   VERTEX_IMAGEN_MODEL=imagen-4.0-generate-001 (полное качество)
 VERTEX_IMAGEN_MODEL_DEFAULT = "imagen-4.0-fast-generate-001"
+# Необязательная просьба к SDK, если поддерживает: аспект
+VERTEX_IMAGEN_AR = os.getenv("VERTEX_IMAGEN_AR", "16:9")
 
 _vertex_inited = False
 _vertex_err: Optional[str] = None
@@ -762,6 +765,7 @@ def _neon_bg(w: int, h: int) -> Image.Image:
         gd = ImageDraw.Draw(grad)
         for i in range(r, 0, -1):
             a = int(255 * (i/r)**2)
+        # (оставляем мягкий блик)
             gd.ellipse((r-i, r-i, r+i, r+i), fill=a)
         glow = Image.new("RGB", (r*2, r*2), col)
         img.paste(glow, (cx-r, cy-r), grad)
@@ -850,6 +854,22 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
         log.warning("IMG|gemini.generate error: %s", e)
     return None
 
+def _imagen_generate_adaptive(model, prompt: str, number_of_images: int, safety_filter_level: str):
+    """
+    П.2 — Адаптивный вызов Imagen:
+    - Без size=
+    - Если SDK поддерживает aspect_ratio — прокинем VERTEX_IMAGEN_AR (по умолчанию 16:9)
+    """
+    sig = inspect.signature(model.generate_images)
+    kwargs = dict(
+        prompt=prompt,
+        number_of_images=number_of_images,
+        safety_filter_level=safety_filter_level,
+    )
+    if "aspect_ratio" in sig.parameters:
+        kwargs["aspect_ratio"] = VERTEX_IMAGEN_AR
+    return model.generate_images(**kwargs)
+
 def _vertex_image_bytes(topic: str) -> Optional[bytes]:
     """Генерация через Vertex **Imagen 4** (Fast по умолчанию)."""
     if not _init_vertex_ai_once():
@@ -868,7 +888,9 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
         log.info("IMG|vertex start | model=%s | topic='%s'", model_name, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
 
-        images = model.generate_images(
+        # П.2 — адаптивный вызов
+        images = _imagen_generate_adaptive(
+            model,
             prompt=prompt,
             number_of_images=1,
             safety_filter_level=safety
@@ -1440,13 +1462,53 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
     return None
 
 # -----------------------------------------------------------------------------
+# Vertex smoke-test (П.3 — удобный самотест для CI; включает через SMOKE_TEST_VERTEX=1)
+# -----------------------------------------------------------------------------
+def _vertex_smoke_test() -> int:
+    if not _init_vertex_ai_once():
+        log.error("Smoke|vertex init failed: %s", _vertex_err)
+        return 1
+    tried = []
+    for model_id in ("imagen-4.0-generate-001", "imagen-4.0-fast-generate-001", "imagen-3.0-generate-001"):
+        try:
+            tried.append(model_id)
+            log.info("Smoke|Trying %s …", model_id)
+            model = ImageGenerationModel.from_pretrained(model_id)
+            imgs = _imagen_generate_adaptive(
+                model,
+                prompt="simple abstract gradient background, no text; wide composition",
+                number_of_images=1,
+                safety_filter_level="block_few",
+            )
+            if not imgs:
+                raise RuntimeError("Empty response")
+            img0 = imgs[0]
+            got = getattr(img0, "image_bytes", None) or getattr(img0, "bytes", None)
+            if not got:
+                pil = getattr(img0, "_pil_image", None)
+                if pil is not None:
+                    buf = io.BytesIO(); pil.save(buf, format="PNG"); got = buf.getvalue()
+            if not got:
+                raise RuntimeError("No bytes on first image")
+            log.info("Smoke|%s OK | %d bytes", model_id, len(got))
+            return 0
+        except Exception as e:
+            log.warning("Smoke|%s failed: %s", model_id, e)
+    log.error("Smoke|No working Imagen models among: %s", tried)
+    return 1
+
+# -----------------------------------------------------------------------------
 # If run directly
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    if os.getenv("SMOKE_TEST_VERTEX") == "1":
+        # П.3 — быстрый смок для CI
+        code = _vertex_smoke_test()
+        raise SystemExit(code)
+
     t = "Горячие ИИ-тренды, Bitcoin и Ethereum сигналы недели"
     post = make_post(t)
     print("TEXT:\n", post["text"])
     print("IMG URL:", post["image_url"])
     print("IMG FILE:", post["image_local_path"])
     print("IMG SHA:", post["image_sha"])
-    
