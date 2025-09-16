@@ -45,7 +45,7 @@ try:
     import google.generativeai as genai  # type: ignore
     _genai_ok = True
     try:
-        # Официальный модуль для генерации изображений Gemini Images API
+        # Официальный модуль для генерации изображений Gemini Images API (Imagen 3/4)
         from google.generativeai import images as gen_images  # type: ignore
         _genai_images_ok = True
     except Exception:
@@ -85,6 +85,8 @@ GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
 # GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex).
 # По умолчанию — Imagen 4 Fast; можно переопределить через переменную окружения.
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-4.0-fast-generate-001")
+# Явно задать аспект для Gemini (напр. "16:9", "4:3"); если пусто — маппим из VERTEX_IMAGE_SIZE
+GEMINI_IMAGE_ASPECT = os.getenv("GEMINI_IMAGE_ASPECT", "")
 
 # Видеогенерация через Gemini/Veo — как экспериментальный фолбэк
 GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
@@ -96,6 +98,9 @@ VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # явное указ�
 # Модель по умолчанию — быстрая 4.0 Fast; можно переопределить переменной окружения:
 #   VERTEX_IMAGEN_MODEL=imagen-4.0-generate-001 (полное качество)
 VERTEX_IMAGEN_MODEL_DEFAULT = "imagen-4.0-fast-generate-001"
+# Аналогично — аспект и «наследуемый» размер (конвертим в аспект)
+VERTEX_IMAGE_ASPECT = os.getenv("VERTEX_IMAGE_ASPECT", "")
+VERTEX_IMAGE_SIZE = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
 
 _vertex_inited = False
 _vertex_err: Optional[str] = None
@@ -189,6 +194,30 @@ def _detect_lang(s: str) -> str:
     if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt):
         return "ru"
     return "en"
+
+def _size_to_aspect_ratio(size_str: Optional[str], default: str = "4:3") -> str:
+    """
+    Конвертирует '1280x960' → ближайшее поддерживаемое соотношение:
+    '1:1','3:4','4:3','9:16','16:9'.
+    """
+    if not size_str:
+        return default
+    m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", str(size_str))
+    if not m:
+        return default
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        return default
+    ratio = w / h
+    candidates = [
+        (1/1,  "1:1"),
+        (3/4,  "3:4"),
+        (4/3,  "4:3"),
+        (9/16, "9:16"),
+        (16/9, "16:9"),
+    ]
+    best = min(candidates, key=lambda x: abs(x[0] - ratio))
+    return best[1]
 
 # Pillow ≥10 — используем textbbox
 def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
@@ -712,7 +741,6 @@ def generate_text(topic: str, locale_hint: Optional[str] = None, progress: Optio
                     except Exception:
                         pass
             try:
-                # Для некоторых SDK требуется resolve(), чтобы завершить поток.
                 resp.resolve()
             except Exception:
                 pass
@@ -827,7 +855,7 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     return out
 
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
-    """Пробуем получить картинку через **официальный Gemini Images API**; при неуспехе — None."""
+    """Пробуем получить картинку через **официальный Gemini Images API (Imagen 4)**; при неуспехе — None."""
     if not (_genai_images_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
         log.info("IMG|gemini skip (images sdk/key/model missing)")
         return None
@@ -836,23 +864,33 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        size = "1280x960"
-        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'",
-                 GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
-        resp = gen_images.generate(model=GEMINI_IMAGE_MODEL, prompt=prompt, size=size)  # type: ignore
-        # v>=0.7: bytes лежат внутри images[i].bytes
+        # Соотношение сторон: env → fallback из старого VERTEX_IMAGE_SIZE → дефолт
+        aspect = (GEMINI_IMAGE_ASPECT or _size_to_aspect_ratio(VERTEX_IMAGE_SIZE, "4:3"))
+        log.info("IMG|gemini start | model=%s | aspect=%s | topic='%s'",
+                 GEMINI_IMAGE_MODEL, aspect, (topic or "")[:160])
+
+        # Современные билды принимают aspect_ratio и number_of_images
+        resp = gen_images.generate(  # type: ignore
+            model=GEMINI_IMAGE_MODEL,
+            prompt=prompt,
+            aspect_ratio=aspect,
+            number_of_images=1,
+        )
+
+        # Достаём байты из разных возможных полей (SDK менялся)
         if hasattr(resp, "images") and resp.images:
             img = resp.images[0]
             data = getattr(img, "bytes", None) or getattr(img, "data", None)
             if isinstance(data, (bytes, bytearray)):
                 log.info("IMG|gemini ok | bytes=%d", len(data))
                 return bytes(data)
-        # Альтернативные поля на всякий случай
+
         for key in ("image", "bytes", "data"):
             data = getattr(resp, key, None)
             if isinstance(data, (bytes, bytearray)):
                 log.info("IMG|gemini ok (alt %s) | bytes=%d", key, len(data))
                 return bytes(data)
+
         log.warning("IMG|gemini returned no image bytes; fields: %s",
                     [k for k in dir(resp) if not k.startswith("_")][:20])
     except Exception as e:
@@ -871,16 +909,17 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        size = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
+        # Преимущественно берём явный аспект; иначе мэппим из 'WxH'
+        aspect = VERTEX_IMAGE_ASPECT or _size_to_aspect_ratio(VERTEX_IMAGE_SIZE, "4:3")
         safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
 
-        log.info("IMG|vertex start | model=%s | size=%s | topic='%s'", model_name, size, (topic or "")[:160])
+        log.info("IMG|vertex start | model=%s | aspect=%s | topic='%s'", model_name, aspect, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
 
         images = model.generate_images(
             prompt=prompt,
             number_of_images=1,
-            size=size,
+            aspect_ratio=aspect,          # ← вместо size=
             safety_filter_level=safety
         )
 
@@ -905,11 +944,7 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
         log.warning("IMG|vertex returned unknown structure: %s", type(first))
     except Exception as e:
         msg = str(e)
-        # Частые варианты: no permission / auth / model not enabled
-        if any(x in msg.lower() for x in ("permission", "unauth", "forbidden", "quota", "authenticate")):
-            log.warning("IMG|vertex auth/perm error: %s", msg)
-        else:
-            log.warning("IMG|vertex error: %s", msg)
+        log.warning("IMG|vertex error: %s", msg)
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
