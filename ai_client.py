@@ -1131,7 +1131,7 @@ def _tmp_write_and_maybe_upload_media(
                     "status": r.status_code, "content_type": ct,
                     "content_length": r.headers.get("Content-Length")
                 }
-                with open(tmp.name + ".meta.json", "w", encoding="utf-8") as mf):
+                with open(tmp.name + ".meta.json", "w", encoding="utf-8") as mf:
                     json.dump(meta, mf, ensure_ascii=False, indent=2)
             except Exception as e:
                 log_gh.warning("GH|HEAD check failed for %s: %s", clean, e)
@@ -1469,7 +1469,8 @@ def _vertex_smoke_test() -> int:
         log.error("Smoke|vertex init failed: %s", _vertex_err)
         return 1
     tried = []
-    for model_id in ("imagen-4.0-generate-001", "imagen-4.0-fast-generate-001", "imagen-3.0-generate-001"):
+    # fast -> full -> 3.0
+    for model_id in ("imagen-4.0-fast-generate-001", "imagen-4.0-generate-001", "imagen-3.0-generate-001"):
         try:
             tried.append(model_id)
             log.info("Smoke|Trying %s …", model_id)
