@@ -45,7 +45,7 @@ try:
     import google.generativeai as genai  # type: ignore
     _genai_ok = True
     try:
-        # Официальный модуль для генерации изображений Gemini Images API (Imagen 3/4)
+        # Официальный модуль для генерации изображений Gemini Images API
         from google.generativeai import images as gen_images  # type: ignore
         _genai_images_ok = True
     except Exception:
@@ -82,25 +82,20 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TEXT_MODEL  = os.getenv("GEMINI_TEXT_MODEL",  "gemini-1.5-pro")
 
 # ВНИМАНИЕ:
-# GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex).
-# По умолчанию — Imagen 4 Fast; можно переопределить через переменную окружения.
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-4.0-fast-generate-001")
-# Явно задать аспект для Gemini (напр. "16:9", "4:3"); если пусто — маппим из VERTEX_IMAGE_SIZE
-GEMINI_IMAGE_ASPECT = os.getenv("GEMINI_IMAGE_ASPECT", "")
+# GEMINI_IMAGE_MODEL относится к Gemini Images API (а не Vertex). Для него обычно
+# используются имена семейств "imagen-3.0" и т.п. Оставляем как есть — это запасной путь.
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0")
 
 # Видеогенерация через Gemini/Veo — как экспериментальный фолбэк
 GEMINI_VIDEO_MODEL = os.getenv("GEMINI_VIDEO_MODEL", "veo-1.0")
 
-# Vertex AI (запасной путь для картинок через Imagen 4)
+# Vertex AI (доп. путь для картинок через Imagen 4)
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON", "").strip()
 VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "").strip()  # явное указание project (опционально)
 # Модель по умолчанию — быстрая 4.0 Fast; можно переопределить переменной окружения:
 #   VERTEX_IMAGEN_MODEL=imagen-4.0-generate-001 (полное качество)
 VERTEX_IMAGEN_MODEL_DEFAULT = "imagen-4.0-fast-generate-001"
-# Аналогично — аспект и «наследуемый» размер (конвертим в аспект)
-VERTEX_IMAGE_ASPECT = os.getenv("VERTEX_IMAGE_ASPECT", "")
-VERTEX_IMAGE_SIZE = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
 
 _vertex_inited = False
 _vertex_err: Optional[str] = None
@@ -194,30 +189,6 @@ def _detect_lang(s: str) -> str:
     if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", txt):
         return "ru"
     return "en"
-
-def _size_to_aspect_ratio(size_str: Optional[str], default: str = "4:3") -> str:
-    """
-    Конвертирует '1280x960' → ближайшее поддерживаемое соотношение:
-    '1:1','3:4','4:3','9:16','16:9'.
-    """
-    if not size_str:
-        return default
-    m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", str(size_str))
-    if not m:
-        return default
-    w, h = int(m.group(1)), int(m.group(2))
-    if w <= 0 or h <= 0:
-        return default
-    ratio = w / h
-    candidates = [
-        (1/1,  "1:1"),
-        (3/4,  "3:4"),
-        (4/3,  "4:3"),
-        (9/16, "9:16"),
-        (16/9, "16:9"),
-    ]
-    best = min(candidates, key=lambda x: abs(x[0] - ratio))
-    return best[1]
 
 # Pillow ≥10 — используем textbbox
 def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
@@ -689,9 +660,9 @@ def _ensure_crypto_tickers_and_hashtags(text: str) -> str:
     return s
 
 # -----------------------------------------------------------------------------
-# Text generation (stream-ready)
+# Text generation
 # -----------------------------------------------------------------------------
-def generate_text(topic: str, locale_hint: Optional[str] = None, progress: Optional[Callable[[str], None]] = None) -> str:
+def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     lang = (locale_hint or _detect_lang(topic)).lower()
 
     # контексты: тренды/тэги (могут пустить fallback), цены, новости
@@ -729,23 +700,10 @@ def generate_text(topic: str, locale_hint: Optional[str] = None, progress: Optio
     text = ""
     if _model:
         try:
-            # Потоковая генерация: отдаём дельты через progress("typing:delta:<...>")
-            resp = _model.generate_content(prompt, stream=True)
-            for chunk in resp:
-                delta = (getattr(chunk, "text", "") or "")
-                if delta:
-                    text += delta
-                    try:
-                        if progress:
-                            progress("typing:delta:" + delta)
-                    except Exception:
-                        pass
-            try:
-                resp.resolve()
-            except Exception:
-                pass
+            resp = _model.generate_content(prompt)
+            text = (getattr(resp, "text", "") or "").strip()
         except Exception as e:
-            log.warning("Gemini text error (stream): %s", e)
+            log.warning("Gemini text error: %s", e)
 
     if not text:
         base = f"{topic.strip().capitalize()}: актуальные наблюдения без воды. "
@@ -775,7 +733,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None, progress: Optio
     return text
 
 # -----------------------------------------------------------------------------
-# Image generation (Gemini → Vertex → Pillow)
+# Image generation (Gemini → Vertex → Pillow fallback)
 # -----------------------------------------------------------------------------
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -855,7 +813,7 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     return out
 
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
-    """Пробуем получить картинку через **официальный Gemini Images API (Imagen 4)**; при неуспехе — None."""
+    """Пробуем получить картинку через **официальный Gemini Images API**; при неуспехе — None."""
     if not (_genai_images_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
         log.info("IMG|gemini skip (images sdk/key/model missing)")
         return None
@@ -864,33 +822,23 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        # Соотношение сторон: env → fallback из старого VERTEX_IMAGE_SIZE → дефолт
-        aspect = (GEMINI_IMAGE_ASPECT or _size_to_aspect_ratio(VERTEX_IMAGE_SIZE, "4:3"))
-        log.info("IMG|gemini start | model=%s | aspect=%s | topic='%s'",
-                 GEMINI_IMAGE_MODEL, aspect, (topic or "")[:160])
-
-        # Современные билды принимают aspect_ratio и number_of_images
-        resp = gen_images.generate(  # type: ignore
-            model=GEMINI_IMAGE_MODEL,
-            prompt=prompt,
-            aspect_ratio=aspect,
-            number_of_images=1,
-        )
-
-        # Достаём байты из разных возможных полей (SDK менялся)
+        size = "1280x960"
+        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'",
+                 GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
+        resp = gen_images.generate(model=GEMINI_IMAGE_MODEL, prompt=prompt, size=size)  # type: ignore
+        # v>=0.7: bytes лежат внутри images[i].bytes
         if hasattr(resp, "images") and resp.images:
             img = resp.images[0]
             data = getattr(img, "bytes", None) or getattr(img, "data", None)
             if isinstance(data, (bytes, bytearray)):
                 log.info("IMG|gemini ok | bytes=%d", len(data))
                 return bytes(data)
-
+        # Альтернативные поля на всякий случай
         for key in ("image", "bytes", "data"):
             data = getattr(resp, key, None)
             if isinstance(data, (bytes, bytearray)):
                 log.info("IMG|gemini ok (alt %s) | bytes=%d", key, len(data))
                 return bytes(data)
-
         log.warning("IMG|gemini returned no image bytes; fields: %s",
                     [k for k in dir(resp) if not k.startswith("_")][:20])
     except Exception as e:
@@ -909,17 +857,16 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        # Преимущественно берём явный аспект; иначе мэппим из 'WxH'
-        aspect = VERTEX_IMAGE_ASPECT or _size_to_aspect_ratio(VERTEX_IMAGE_SIZE, "4:3")
+        size = os.getenv("VERTEX_IMAGE_SIZE", "1280x960")
         safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
 
-        log.info("IMG|vertex start | model=%s | aspect=%s | topic='%s'", model_name, aspect, (topic or "")[:160])
+        log.info("IMG|vertex start | model=%s | size=%s | topic='%s'", model_name, size, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
 
         images = model.generate_images(
             prompt=prompt,
             number_of_images=1,
-            aspect_ratio=aspect,          # ← вместо size=
+            size=size,
             safety_filter_level=safety
         )
 
@@ -944,7 +891,11 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
         log.warning("IMG|vertex returned unknown structure: %s", type(first))
     except Exception as e:
         msg = str(e)
-        log.warning("IMG|vertex error: %s", msg)
+        # Частые варианты: no permission / auth / model not enabled
+        if any(x in msg.lower() for x in ("permission", "unauth", "forbidden", "quota", "authenticate")):
+            log.warning("IMG|vertex auth/perm error: %s", msg)
+        else:
+            log.warning("IMG|vertex error: %s", msg)
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
@@ -952,7 +903,7 @@ def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
     Старый публичный интерфейс (не используется ботом напрямую).
     Сохраняет PNG локально + заливает в GH. Возвращает словарь с url/локальным путём/sha.
     """
-    # Новый приоритет: Gemini → Vertex → Pillow
+    # Порядок: Gemini → Vertex → Pillow
     png_bytes = _gemini_image_bytes(topic) or _vertex_image_bytes(topic) or _cover_from_topic(topic, text)
     sha = _sha_short(png_bytes)
     log.info("Image|bytes=%d sha=%s", len(png_bytes), sha)
@@ -1182,7 +1133,7 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     6) записываем в дедуп
     """
     _report(progress, "typing:start_text")
-    text = generate_text(topic, progress=progress)
+    text = generate_text(topic)
     _report(progress, "typing:text_ready")
 
     try:
@@ -1242,7 +1193,6 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
     progress(msg):
       'typing:start_text'  -> показать "печатает..."
       'typing:text_ready'  -> убрать индикацию/написать "черновик готов"
-      'typing:delta:<chunk>' -> потоковые дельты текста (если включены)
     """
     topic = (topic or "").strip()
     if not topic:
@@ -1257,7 +1207,7 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
         warn_parts.append("snscrape missing")
 
     _report(progress, "typing:start_text")
-    text = generate_text(topic, progress=progress)
+    text = generate_text(topic)
     _report(progress, "typing:text_ready")
 
     warn = " | ".join(warn_parts) if warn_parts else None
@@ -1307,16 +1257,16 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
         _report(progress, "upload_photo:start_image")
         log.info("IMG|make start | topic='%s'", (topic or "")[:160])
 
-        # 1) Gemini Images — ПЕРВЫЙ ПРИОРИТЕТ
-        img_bytes = _gemini_image_bytes(topic)
         warn = None
 
-        # 2) Vertex (Imagen 4) — запасной путь
+        # 1) Gemini Images (приоритет)
+        img_bytes = _gemini_image_bytes(topic)
+
+        # 2) Vertex (Imagen 4) — если Gemini недоступен/вернул None
         if not img_bytes:
             vb = _vertex_image_bytes(topic)
             if vb:
                 img_bytes = vb
-                warn = None
 
         # 3) Фолбэк (Pillow)
         if not img_bytes:
@@ -1361,7 +1311,7 @@ def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None)
         vid_bytes = _gemini_video_bytes(topic, seconds=seconds)
         warn = None
         if not vid_bytes:
-            # фолбэк: берём обложку и строим MP4 пан-зум (сначала Gemini)
+            # фолбэк: берём обложку и строим MP4 пан-зум
             cover = _gemini_image_bytes(topic) or _vertex_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
             vid_bytes = _build_panzoom_from_image(cover, seconds=seconds) if cover else None
             warn = "fallback (pan-zoom MP4)"
@@ -1485,21 +1435,8 @@ def upload_file_to_github(file_bytes: bytes, filename: str) -> Optional[str]:
 # If run directly
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    def cli_progress(ev: str) -> None:
-        if ev == "typing:start_text":
-            print("[typing] начинаю генерацию…", flush=True)
-        elif ev.startswith("typing:delta:"):
-            print(ev.split("typing:delta:", 1)[1], end="", flush=True)
-        elif ev == "typing:text_ready":
-            print("\n[typing] текст готов.", flush=True)
-        elif ev == "upload_photo:start_image":
-            print("[image] генерирую…", flush=True)
-        elif ev == "upload_photo:image_ready":
-            print("[image] готово.", flush=True)
-
     t = "Горячие ИИ-тренды, Bitcoin и Ethereum сигналы недели"
-    post = make_post(t, progress=cli_progress)
-    print("\n\n=== ИТОГ ===")
+    post = make_post(t)
     print("TEXT:\n", post["text"])
     print("IMG URL:", post["image_url"])
     print("IMG FILE:", post["image_local_path"])
