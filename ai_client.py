@@ -212,10 +212,9 @@ def _log_file_info(path: str, logger=log):
         st = os.stat(path)
         with open(path, "rb") as f:
             head = f.read(16)
-        logger.info("FS|file=%s size=%dB head=%s", path, st.st_size, head.hex())
+        logger.info("FS|file=%s size=%dB head=%s", path, st_st_size, head.hex())
     except Exception as e:
         logger.warning("FS|info error for %s: %s", path, e)
-
 # -----------------------------------------------------------------------------
 # Dedup storage (SQLite)
 # -----------------------------------------------------------------------------
@@ -506,7 +505,6 @@ if _genai_images_ok:
     log.info("Gemini Images API available")
 else:
     log.info("Gemini Images API NOT available (fallback → Pillow)")
-
 # -----------------------------------------------------------------------------
 # Vertex init
 # -----------------------------------------------------------------------------
@@ -828,7 +826,6 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
     out = buf.getvalue()
     log.info("IMG|fallback cover built | size=%dx%d | bytes=%d", w, h, len(out))
     return out
-
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
     """Пробуем получить картинку через **официальный Gemini Images API**; при неуспехе — None."""
     if not (_genai_images_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
