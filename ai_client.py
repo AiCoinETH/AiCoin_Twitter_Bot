@@ -141,7 +141,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("ai_client")
-log_http = logging.getLogger("ai_client.http")
 log_gh = logging.getLogger("ai_client.github")
 
 _RAW_GH = "https://raw.githubusercontent.com"
@@ -153,7 +152,7 @@ _UA = {"User-Agent": "AiCoinBot/1.0 (+https://x.com/AiCoin_ETH)"}
 def _sha_short(data: bytes, n: int = 12) -> str:
     return hashlib.sha256(data).hexdigest()[:n]
 
-def _sha_text(text: str, n: int = 12) -> str:
+def _sha_text(text: Optional[str], n: int = 12) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:n]
 
 def _now_ts() -> int:
@@ -226,6 +225,14 @@ class Deduper:
         self._ensure()
 
     def _ensure(self):
+        # создаём директорию под БД, если путь включает папку
+        try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
         conn = sqlite3.connect(self.path)
         try:
             cur = conn.cursor()
@@ -525,7 +532,7 @@ def _init_vertex_ai_once() -> bool:
         key_bytes: Optional[bytes] = None
         svc_email: Optional[str] = None
 
-        # 1) Если уже задан GOOGLE_APPLICATION_CREDENTIALS и он существует — используем его
+        # 1) GOOGLE_APPLICATION_CREDENTIALS (уже файл)
         gac = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
         if gac and os.path.exists(gac):
             cred_path = gac
@@ -542,7 +549,7 @@ def _init_vertex_ai_once() -> bool:
             except Exception:
                 pass
 
-        # 2) Иначе разбираем GCP_KEY_JSON (raw/base64/путь)
+        # 2) Разбираем GCP_KEY_JSON (raw/base64/путь)
         if not cred_path:
             if not GCP_KEY_JSON:
                 _vertex_err = "no credentials: set GOOGLE_APPLICATION_CREDENTIALS or GCP_KEY_JSON"
@@ -594,7 +601,7 @@ def _init_vertex_ai_once() -> bool:
             _vertex_err = "project_id not found (set VERTEX_PROJECT or use a service key with project_id)"
             return False
 
-        # Экспортируем project vars — это иногда критично для биллинга/квот
+        # Экспорт проектных env — полезно для квот/биллинга
         os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
         os.environ.setdefault("GOOGLE_CLOUD_QUOTA_PROJECT", project_id)
 
@@ -615,12 +622,12 @@ def _init_vertex_ai_once() -> bool:
 # -----------------------------------------------------------------------------
 # Варианты написания → тикер
 _CRYPTO_VARIANTS: Dict[str, List[str]] = {
-    "BTC": [r"bitcoin", r"биткоин", r"биткойн", r"btc"],
-    "ETH": [r"ethereum", r"эфириум", r"eth"],
-    "SOL": [r"solana", r"солана", r"sol"],
-    "XRP": [r"ripple", r"xrp"],
+    "BTC": [r"bitcoin", r"биткоин", r"биткойн", r"\bbtc\b"],
+    "ETH": [r"ethereum", r"эфириум", r"\beth\b"],
+    "SOL": [r"solana", r"солана", r"\bsol\b"],
+    "XRP": [r"ripple", r"\bxrp\b"],
     "BNB": [r"binance\s*coin", r"\bbnb\b"],
-    "DOGE": [r"dogecoin", r"додж(?:коин|койн)?", r"doge"],
+    "DOGE": [r"dogecoin", r"додж(?:коин|койн)?", r"\bdoge\b"],
     "TON": [r"\bton(?:coin)?\b", r"тон(?:коин|койн)?"],
     "ADA": [r"cardano", r"кардано", r"\bada\b"],
     "DOT": [r"polkadot", r"полкадот", r"\bdot\b"],
@@ -651,13 +658,14 @@ def _ensure_crypto_tickers_and_hashtags(text: str) -> str:
             s = pat.sub(f"${ticker}", s)
             found.append(ticker)
 
-    # Добавить #TICKER (без дублей) — аккуратно, чтобы не ломать длину: максимум 4 тега
+    # Добавить #TICKER (без дублей) — максимум 4 тега
     if found:
-        found_uniq = []
-        seen = set()
+        found_uniq: List[str] = []
+        seen: set = set()
         for t in found:
             if t not in seen:
-                seen.add(t); found_uniq.append(t)
+                seen.add(t)
+                found_uniq.append(t)
         # уже присутствующие #TICKER не дублируем
         existing_tags = set(m.group(1).upper() for m in re.finditer(r"#([A-Za-z]{2,10})\b", s))
         add_tags = [t for t in found_uniq if t not in existing_tags][:4]
@@ -706,7 +714,7 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
 Подсказки по трендам (не вставляй дословно как список, используй смысл): {trend_bits} {tag_bits}
 """
     text = ""
-    if _model:
+    if _genai_ok and _model:
         try:
             resp = _model.generate_content(prompt)
             text = (getattr(resp, "text", "") or "").strip()
@@ -722,10 +730,8 @@ def generate_text(topic: str, locale_hint: Optional[str] = None) -> str:
     # если модель сорвалась не на тот язык — мини-фикс
     if lang == "en" and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", text):
         try:
-            if _model:
-                resp2 = _model.generate_content(
-                    "Rewrite in concise English (no links):\n" + text
-                )
+            if _genai_ok and _model:
+                resp2 = _model.generate_content("Rewrite in concise English (no links):\n" + text)
                 text2 = (getattr(resp2, "text", "") or "").strip()
                 if text2:
                     text = text2
@@ -751,7 +757,10 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     ]
     for p in candidates:
         if os.path.exists(p):
-            return ImageFont.truetype(p, size=size)
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                continue
     return ImageFont.load_default()
 
 def _neon_bg(w: int, h: int) -> Image.Image:
@@ -765,7 +774,6 @@ def _neon_bg(w: int, h: int) -> Image.Image:
         gd = ImageDraw.Draw(grad)
         for i in range(r, 0, -1):
             a = int(255 * (i/r)**2)
-        # (оставляем мягкий блик)
             gd.ellipse((r-i, r-i, r+i, r+i), fill=a)
         glow = Image.new("RGB", (r*2, r*2), col)
         img.paste(glow, (cx-r, cy-r), grad)
@@ -832,10 +840,8 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
         size = "1280x960"
-        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'",
-                 GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
+        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'", GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
         resp = gen_images.generate(model=GEMINI_IMAGE_MODEL, prompt=prompt, size=size)  # type: ignore
-        # v>=0.7: bytes лежат внутри images[i].bytes
         if hasattr(resp, "images") and resp.images:
             img = resp.images[0]
             data = getattr(img, "bytes", None) or getattr(img, "data", None)
@@ -848,27 +854,34 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
             if isinstance(data, (bytes, bytearray)):
                 log.info("IMG|gemini ok (alt %s) | bytes=%d", key, len(data))
                 return bytes(data)
-        log.warning("IMG|gemini returned no image bytes; fields: %s",
-                    [k for k in dir(resp) if not k.startswith("_")][:20])
+        log.warning("IMG|gemini returned no image bytes")
     except Exception as e:
         log.warning("IMG|gemini.generate error: %s", e)
     return None
 
 def _imagen_generate_adaptive(model, prompt: str, number_of_images: int, safety_filter_level: str):
     """
-    П.2 — Адаптивный вызов Imagen:
+    Адаптивный вызов Imagen:
     - Без size=
-    - Если SDK поддерживает aspect_ratio — прокинем VERTEX_IMAGEN_AR (по умолчанию 16:9)
+    - Если SDK поддерживает aspect_ratio — прокинем VERTEX_IMAGEN_AR
     """
-    sig = inspect.signature(model.generate_images)
-    kwargs = dict(
-        prompt=prompt,
-        number_of_images=number_of_images,
-        safety_filter_level=safety_filter_level,
-    )
-    if "aspect_ratio" in sig.parameters:
-        kwargs["aspect_ratio"] = VERTEX_IMAGEN_AR
-    return model.generate_images(**kwargs)
+    try:
+        fn = getattr(model, "generate_images")
+    except Exception:
+        raise RuntimeError("vertex model does not expose generate_images")
+    try:
+        sig = inspect.signature(fn)
+        kwargs = dict(
+            prompt=prompt,
+            number_of_images=number_of_images,
+            safety_filter_level=safety_filter_level,
+        )
+        if "aspect_ratio" in sig.parameters:
+            kwargs["aspect_ratio"] = VERTEX_IMAGEN_AR
+        return fn(**kwargs)
+    except Exception:
+        # последний шанс — прямой вызов без kwargs
+        return model.generate_images(prompt=prompt, number_of_images=number_of_images, safety_filter_level=safety_filter_level)
 
 def _vertex_image_bytes(topic: str) -> Optional[bytes]:
     """Генерация через Vertex **Imagen 4** (Fast по умолчанию)."""
@@ -882,13 +895,11 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             "High-quality social cover image (no text), dark/gradient tech background, "
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
-        # Новые версии SDK не принимают size= → убираем параметр и оставляем дефолтные размеры/AR
         safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
 
         log.info("IMG|vertex start | model=%s | topic='%s'", model_name, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
 
-        # П.2 — адаптивный вызов
         images = _imagen_generate_adaptive(
             model,
             prompt=prompt,
@@ -917,7 +928,6 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
         log.warning("IMG|vertex returned unknown structure: %s", type(first))
     except Exception as e:
         msg = str(e)
-        # Частые варианты: no permission / auth / model not enabled
         if any(x in msg.lower() for x in ("permission", "unauth", "forbidden", "quota", "authenticate")):
             log.warning("IMG|vertex auth/perm error: %s", msg)
         else:
@@ -1162,8 +1172,9 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
     5) кладём локально и (опционально) в GitHub
     6) записываем в дедуп
     """
+    topic = (topic or "").strip()
     _report(progress, "typing:start_text")
-    text = generate_text(topic)
+    text = generate_text(topic or "Крипто и ИИ")
     _report(progress, "typing:text_ready")
 
     try:
@@ -1181,7 +1192,7 @@ def make_post(topic: str, progress: ProgressFn = None) -> Dict[str, Optional[str
 
     _report(progress, "upload_photo:start_image")
     # Изображение (Gemini → Vertex → Pillow), сохранить/загрузить
-    path_img, url_img_direct, _ = ai_generate_image(topic, progress)
+    path_img, url_img_direct, _warn = ai_generate_image(topic, progress)
     _report(progress, "upload_photo:image_ready")
 
     # URL берём приоритетно из возврата аплоада, .url.txt — резерв
@@ -1229,7 +1240,7 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
         return ("", "empty topic")
 
     warn_parts: List[str] = []
-    if not _model:
+    if not _genai_ok or not _model:
         warn_parts.append("Gemini not available")
     if not _pytrends_ok:
         warn_parts.append("pytrends missing")
@@ -1244,7 +1255,7 @@ def ai_generate_text(topic: str, progress: ProgressFn = None) -> Tuple[str, Opti
     return text, (warn or None)
 
 def ai_suggest_hashtags(text: str) -> List[str]:
-    defaults = ["#AiCoin", "#AI", "$Ai", "#crypto"]
+    defaults = ["#AiCoin", "#AI", "#crypto", "#Web3"]
     dynamic = get_x_hashtags(limit=6)
 
     # добавим хэштеги по найденным тикерам в тексте (если ещё нет)
@@ -1305,7 +1316,11 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
             img_bytes = _cover_from_topic(topic, text_for_cover)
             warn = "fallback (Pillow)"
 
-        log.info("IMG|bytes ready | %d", len(img_bytes) if img_bytes else -1)
+        if not img_bytes:
+            _report(progress, "upload_photo:image_ready")
+            return None, None, "image generation failed"
+
+        log.info("IMG|bytes ready | %d", len(img_bytes))
 
         # дедуп-запись по картинке (и теме как текстовому ключу)
         try:
@@ -1388,7 +1403,11 @@ def ensure_github_dir() -> None:
     for sub in filter(None, (GH_IMAGES_DIR, GH_VIDEOS_DIR)):
         api_dir = f"https://api.github.com/repos/{owner}/{repo}/contents/{sub}"
         params = {"ref": ACTION_BRANCH}
-        r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
+        try:
+            r = requests.get(api_dir, headers=_gh_headers(), params=params, timeout=20)
+        except Exception as e:
+            log_gh.warning("Dir check failed for %s: %s", sub, e)
+            continue
         log_gh.info("Check dir %s -> %s", sub, r.status_code)
         if r.status_code == 200:
             continue
@@ -1503,7 +1522,7 @@ def _vertex_smoke_test() -> int:
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     if os.getenv("SMOKE_TEST_VERTEX") == "1":
-        # П.3 — быстрый смок для CI
+        # быстрый смок для CI
         code = _vertex_smoke_test()
         raise SystemExit(code)
 
