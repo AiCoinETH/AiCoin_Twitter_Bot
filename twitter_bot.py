@@ -20,6 +20,7 @@ import base64
 import asyncio
 import logging
 import tempfile
+import mimetypes
 from html import escape as html_escape
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, time as dt_time
@@ -196,7 +197,6 @@ except Exception:
     github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 github_repo = github_client.get_repo(GITHUB_REPO) if (github_client and GITHUB_REPO) else None
-
 post_data: Dict[str, Any] = {
     "text_en": "",
     "ai_hashtags": [],
@@ -237,6 +237,7 @@ def ai_set_last_topic(topic: str):
 
 def ai_get_last_topic() -> str:
     return AI_STATE_G.get("last_topic", "").strip()
+
 def _message_addresses_bot(update: Update) -> bool:
     msg = update.message
     if not msg:
@@ -479,9 +480,6 @@ def trim_preserving_urls(body: str, max_len: int) -> str:
 def _has_tail(html_text_lower: str) -> bool:
     return ("getaicoin.com" in html_text_lower) and ("x.com/aicoin_eth" in html_text_lower)
 
-TW_TAIL_REQUIRED = "🌐 https://getaicoin.com | 🐺 https://t.me/AiCoin_ETH"
-TG_TAIL_HTML     = '<a href="https://getaicoin.com/">Website</a> | <a href="https://x.com/AiCoin_ETH">Twitter X</a>'
-
 def build_tg_final(body_text: str | None, for_photo_caption: bool) -> str:
     body_raw = (body_text or "").strip()
     body_html = html_escape(body_raw)
@@ -646,12 +644,115 @@ async def publish_post_to_telegram(text: str) -> bool:
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=f"❌ Ошибка TG: {e}")
         return False
 
+# --- Вспомогательные функции для твита с медиа ---
+async def _download_bytes(url: str) -> Optional[bytes]:
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=45)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        log.warning("DOWNLOAD|fail url=%s : %s", url, e)
+        return None
+
+async def _fetch_tg_file_bytes(file_id: str) -> Optional[bytes]:
+    try:
+        tg_file = await approval_bot.get_file(file_id)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            await tg_file.download_to_drive(tmp.name)
+            with open(tmp.name, "rb") as f:
+                data = f.read()
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+        return data
+    except Exception as e:
+        log.warning("TGFILE|fetch fail: %s", e)
+        return None
+
+async def _get_media_tempfile_from_state() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Возвращает (path, mime) временного файла из текущего состояния post_data
+    или (None, None), если медиа нет/не удалось получить.
+    """
+    kind = (post_data.get("media_kind") or "none").lower()
+    ref  = post_data.get("media_ref")
+    src  = post_data.get("media_src") or "tg"
+    if kind not in ("image", "video") or not ref:
+        return None, None
+
+    data: Optional[bytes] = None
+    if src == "url":
+        data = await _download_bytes(ref)
+    else:
+        data = await _fetch_tg_file_bytes(ref)
+    if not data:
+        return None, None
+
+    mime_type, _ = mimetypes.guess_type(ref if isinstance(ref, str) else "")
+    if not mime_type:
+        if data[:4] == b"\x89PNG":
+            mime_type = "image/png"
+        elif data[:3] == b"\xff\xd8\xff":
+            mime_type = "image/jpeg"
+        elif data[4:8] == b"ftyp":
+            mime_type = "video/mp4"
+        else:
+            mime_type = "application/octet-stream"
+
+    suffix = mimetypes.guess_extension(mime_type) or (".mp4" if kind == "video" else ".jpg")
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path, mime_type
+
+async def _twitter_upload_media(path: str, mime: Optional[str]) -> Optional[str]:
+    if not twitter_api_v1:
+        return None
+    try:
+        is_video = (mime or "").startswith("video/")
+        media = await asyncio.to_thread(
+            twitter_api_v1.media_upload,
+            filename=path,
+            chunked=is_video,
+        )
+        return getattr(media, "media_id_string", None) or str(getattr(media, "media_id", ""))
+    except Exception as e:
+        log.warning("TW|media_upload fail: %s", e)
+        return None
+
 async def publish_post_to_twitter(tweet_text: str) -> bool:
+    """
+    Логика публикации в X (Twitter):
+    - При наличии медиа загружаем его через API v1 (media_upload) и получаем media_id.
+    - Создаём твит через API v2, передавая media_ids.
+    - Фоллбек: если медиа не загрузилось — публикуем без медиа.
+    """
     if not twitter_client_v2:
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Twitter client not configured.")
         return False
+
+    mk = (post_data.get("media_kind") or "none").lower()
+    media_ids: List[str] = []
+
+    if mk in ("image", "video"):
+        path, mime = await _get_media_tempfile_from_state()
+        if path:
+            mid = await _twitter_upload_media(path, mime)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            if mid:
+                media_ids.append(mid)
+            else:
+                await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="⚠️ Не удалось загрузить медиа в X. Будет твит без медиа.")
+
     try:
-        twitter_client_v2.create_tweet(text=tweet_text)
+        if media_ids:
+            twitter_client_v2.create_tweet(text=tweet_text, media_ids=media_ids)
+        else:
+            twitter_client_v2.create_tweet(text=tweet_text)
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="✅ Опубликовано в X (Twitter).")
         return True
     except Exception as e:
@@ -689,7 +790,6 @@ def normalize_text_for_hashing(text: str) -> str:
 def sha256_hex(data: bytes) -> str:
     import hashlib as _h
     return _h.sha256(data).hexdigest()
-
 async def compute_media_hash_from_state() -> Optional[str]:
     kind = post_data.get("media_kind")
     src  = post_data.get("media_src")
@@ -747,6 +847,7 @@ async def save_post_to_history(text: str, media_hash: Optional[str]):
             log.info("HISTORY|saved text_hash=%s img_hash=%s", (text_hash or "")[:12], (media_hash or "")[:12])
         except Exception as e:
             log.warning("HISTORY|insert fail (возможно дубликат): %s", e)
+
 # --- Предпросмотр ---
 async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None = "Предпросмотр"):
     text_for_message = build_telegram_preview(text_en, ai_hashtags or [])
@@ -809,33 +910,23 @@ async def send_single_preview(text_en: str, ai_hashtags=None, header: str | None
 async def _generate_ai_image_explicit(topic_or_prompt: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         await ai_progress("🖼 Бот генерирует изображение…")
+        # ai_client.ai_generate_image должен возвращать (local_path, url) или словарь с 'path'/'url'
         res = ai_client.ai_generate_image(topic_or_prompt or "")
         warn_img: Optional[str] = None
         local_path: Optional[str] = None
         url: Optional[str] = None
 
-        if isinstance(res, tuple) or isinstance(res, list):
-            if len(res) == 2:
-                a, b = res
+        if isinstance(res, (tuple, list)):
+            if len(res) >= 2:
+                a, b = res[0], res[1]
                 if isinstance(a, str) and a.startswith(("http://", "https://")):
-                    url, warn_img = a, (b or None)
-                elif isinstance(b, str) and b.startswith(("http://", "https://")):
-                    local_path, url = (a or None), b
+                    url = a
                 else:
-                    local_path, warn_img = (a or None), (b or None)
-            elif len(res) >= 3:
-                candidates = [x for x in res if isinstance(x, str)]
-                url_cands = [x for x in candidates if x.startswith(("http://", "https://"))]
-                url = url_cands[0] if url_cands else None
-                others = [x for x in candidates if not (isinstance(x, str) and x.startswith(("http://", "https://")))]
-                if others:
-                    local_path = others[0]
-                nonstr = [x for x in res if not isinstance(x, str)]
-                if not warn_img and nonstr:
-                    try:
-                        warn_img = str(nonstr[0])
-                    except Exception:
-                        pass
+                    local_path = a
+                if isinstance(b, str) and b.startswith(("http://", "https://")):
+                    url = b
+                elif not local_path:
+                    local_path = b if isinstance(b, str) else None
         elif isinstance(res, dict):
             url = res.get("url") or res.get("gh_url") or res.get("raw_url")
             local_path = res.get("path") or res.get("local_path") or res.get("file")
@@ -850,7 +941,7 @@ async def _generate_ai_image_explicit(topic_or_prompt: str) -> Tuple[Optional[st
             log_ai.info("AI|image.fail | генерация не вернула путь/URL.")
             return (warn_img or "⚠️ Не удалось сгенерировать изображение ИИ."), None
 
-        if not url:
+        if not url and local_path:
             await ai_progress("📤 Загружаю изображение…")
             url = upload_image_to_github(local_path, filename=None)
             try:
@@ -878,8 +969,7 @@ def build_twitter_payload_text(base_text_en: str) -> str:
     if post_data.get("user_tags_override"):
         return build_tweet_user_hashtags_275(base_text_en, post_data.get("ai_hashtags") or [])
     return build_twitter_text(base_text_en, post_data.get("ai_hashtags") or [])
-
-# --- Общая публикация + сводка ---
+    # --- Общая публикация + сводка ---
 async def publish_flow(publish_tg: bool, publish_tw: bool):
     base_text_en = (post_data.get("text_en") or "").strip()
     twitter_final_text = build_twitter_payload_text(base_text_en)
@@ -926,6 +1016,7 @@ async def publish_flow(publish_tg: bool, publish_tw: bool):
             fmt("Twitter",  tw_status, tw_dup) if publish_tw else "Twitter: —",
         ])
         await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text=summary)
+
 # --- Обработка входящего от ИИ ---
 def wants_english(text: str) -> bool:
     t = (text or "").lower()
@@ -1006,7 +1097,6 @@ async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=msg, parse_mode="HTML",
         reply_markup=ai_text_confirm_keyboard()
     )
-
 # --- Ручной ввод ---
 async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global manual_expected_until
@@ -1029,8 +1119,12 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif getattr(update.message, "document", None):
         mime = (update.message.document.mime_type or "")
         fid  = update.message.document.file_id
-        if mime.startswith("video/"): media_kind = "video"; media_ref = fid; log_ai.info("SELF|recv doc.video | chat=%s", update.effective_chat.id)
-        elif mime.startswith("image/"): media_kind = "image"; media_ref = fid; log_ai.info("SELF|recv doc.image | chat=%s", update.effective_chat.id)
+        if mime.startswith("video/"):
+            media_kind = "video"; media_ref = fid
+            log_ai.info("SELF|recv doc.video | chat=%s", update.effective_chat.id)
+        elif mime.startswith("image/"):
+            media_kind = "image"; media_ref = fid
+            log_ai.info("SELF|recv doc.image | chat=%s", update.effective_chat.id)
     elif text and text.startswith("http"):
         url = text.split()[0]
         if any(url.lower().endswith(ext) for ext in (".mp4", ".mov", ".m4v", ".webm")):
@@ -1055,6 +1149,7 @@ async def handle_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await send_single_preview(post_data["text_en"], post_data.get("ai_hashtags") or [], header="Предпросмотр")
     manual_expected_until = None
+
 # --- Обработка кнопок/коллбэков ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1225,7 +1320,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_image_confirm_keyboard_for_state()
         )
         return
-
     # Быстрая генерация по последней теме (без явного промпта)
     if data == "ai_img_gen":
         topic = ai_get_last_topic() or (post_data.get("text_en") or "")[:200]
@@ -1292,7 +1386,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tomorrow = datetime.combine(datetime.now(TZ).date() + timedelta(days=1), dt_time(hour=9, tzinfo=TZ))
         await safe_send_message(
             approval_bot, chat_id=_approval_chat_id(),
-            text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%М %Z')}",
+            text=f"🔚 Работа завершена. Следующая публикация: {tomorrow.strftime('%Y-%m-%d %H:%M %Z')}",
             parse_mode="HTML", reply_markup=get_start_menu()
         )
         return
@@ -1306,6 +1400,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_send_message(approval_bot, chat_id=_approval_chat_id(), text="ℹ️ Planner не подключён.")
         return
+
 # --- Основной обработчик сообщений ---
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_approved_user(update):
@@ -1542,3 +1637,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
