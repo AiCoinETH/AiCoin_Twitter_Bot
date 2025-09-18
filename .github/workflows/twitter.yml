@@ -76,11 +76,11 @@ jobs:
           echo "VERTEX_PROJECT=${VERTEX_PROJECT}" >> $GITHUB_ENV
           echo "VERTEX_LOCATION=${VERTEX_LOCATION}" >> $GITHUB_ENV
 
-      # ✅ Тест: сначала Imagen 4, если нет доступа — пробуем Imagen 3
+      # ✅ Тест доступа к Imagen — без аргумента size=, с адаптивным aspect_ratio
       - name: Test Vertex AI Imagen access
         run: |
           python - <<'EOF'
-          import os, sys
+          import os, sys, io, inspect
           import vertexai
           from vertexai.preview.vision_models import ImageGenerationModel
 
@@ -89,23 +89,32 @@ jobs:
           vertexai.init(project=project, location=location)
           print(f"✅ vertexai.init OK | project={project} | location={location}")
 
+          def gen_adaptive(model, prompt):
+              fn = getattr(model, "generate_images")
+              sig = inspect.signature(fn)
+              kwargs = dict(prompt=prompt, number_of_images=1, safety_filter_level="block_few")
+              if "aspect_ratio" in sig.parameters:
+                  kwargs["aspect_ratio"] = "16:9"
+              return fn(**kwargs)
+
           tried = []
-          for model_id in ("imagen-4.0-generate-001", "imagen-3.0-generate-001"):
+          for model_id in ("imagen-4.0-fast-generate-001", "imagen-4.0-generate-001", "imagen-3.0-generate-001"):
               try:
                   tried.append(model_id)
                   print(f"→ Trying {model_id} …")
                   model = ImageGenerationModel.from_pretrained(model_id)
-                  imgs = model.generate_images(
-                      prompt="simple abstract gradient background, no text",
-                      number_of_images=1,
-                      size="512x384",
-                      safety_filter_level="block_few",
-                  )
+                  imgs = gen_adaptive(model, "simple abstract gradient background, no text; wide composition")
                   if not imgs:
-                      raise RuntimeError("Empty response from Imagen")
+                      raise RuntimeError("Empty response")
                   img0 = imgs[0]
                   got = getattr(img0, "image_bytes", None) or getattr(img0, "bytes", None)
-                  print(f"✅ {model_id} OK | bytes={len(got) if got else 'n/a'}")
+                  if not got:
+                      pil = getattr(img0, "_pil_image", None)
+                      if pil is not None:
+                          buf = io.BytesIO(); pil.save(buf, format="PNG"); got = buf.getvalue()
+                  if not got:
+                      raise RuntimeError("No bytes on first image")
+                  print(f"✅ {model_id} OK | bytes={len(got)}")
                   break
               except Exception as e:
                   print(f"⚠️ {model_id} failed: {e}")
