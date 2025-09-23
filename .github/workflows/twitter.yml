@@ -16,39 +16,28 @@ jobs:
       cancel-in-progress: true
 
     env:
-      # Telegram
       TELEGRAM_BOT_TOKEN_APPROVAL:  ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
       TELEGRAM_APPROVAL_CHAT_ID:    ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
       TELEGRAM_BOT_TOKEN_CHANNEL:   ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
       TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
-
-      # Twitter
       TWITTER_API_KEY:              ${{ secrets.TWITTER_API_KEY }}
       TWITTER_API_SECRET:           ${{ secrets.TWITTER_API_SECRET }}
       TWITTER_ACCESS_TOKEN:         ${{ secrets.TWITTER_ACCESS_TOKEN }}
       TWITTER_ACCESS_TOKEN_SECRET:  ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
       TWITTER_BEARER_TOKEN:         ${{ secrets.TWITTER_BEARER_TOKEN }}
-
-      # GitHub (аплоад медиа)
       ACTION_PAT_GITHUB:            ${{ secrets.ACTION_PAT_GITHUB }}
       ACTION_REPO_GITHUB:           ${{ secrets.ACTION_REPO_GITHUB }}
       ACTION_EVENT_GITHUB:          ${{ secrets.ACTION_EVENT_GITHUB }}
-      ACTION_BRANCH:                ${{ vars.ACTION_BRANCH }}
-      GH_IMAGES_DIR:                ${{ vars.GH_IMAGES_DIR }}
+      ACTION_BRANCH:                content
+      GH_IMAGES_DIR:                images_for_posts
       GH_VIDEOS_DIR:                ${{ vars.GH_VIDEOS_DIR }}
-
-      # LLM
       OPENAI_API_KEY:               ${{ secrets.OPENAI_API_KEY }}
       GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
-
-      # Google Vertex AI
-      VERTEX_PROJECT:               ${{ secrets.VERTEX_PROJECT }}   # api-project-756766452273
+      VERTEX_PROJECT:               ${{ secrets.VERTEX_PROJECT }}
       VERTEX_LOCATION:              us-central1
       GCP_KEY_JSON:                 ${{ secrets.GCP_KEY_JSON }}
-
-      # Логи
-      LOG_LEVEL: INFO
-      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL:                    INFO
+      PYTHONUNBUFFERED:             "1"
 
     steps:
       - name: Checkout repository
@@ -60,20 +49,35 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Validate requirements.txt
+        run: |
+          python -c "with open('requirements.txt', 'r') as f: [line.strip() for line in f if line.strip() and not line.startswith('#')]; print('✅ requirements.txt syntax OK')"
+        continue-on-error: false
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || { echo "Failed to install requirements.txt"; cat requirements.txt; exit 1; }
           pip install google-generativeai>=0.8.3 google-cloud-aiplatform>=1.67.1 tweepy>=4.14.0
 
       - name: Show installed packages
         run: pip freeze | sort
 
       - name: Check google-generativeai version
-        run: pip show google-generativeai
+        run: |
+          pip show google-generativeai || { echo "google-generativeai not installed"; exit 1; }
 
       - name: Test google.generativeai.images import
-        run: python -c "import google.generativeai.images; print('✅ Images module OK')"
+        run: |
+          python - <<'EOF'
+          import sys
+          try:
+              import google.generativeai.images
+              print('✅ Images module OK')
+          except ImportError as e:
+              print(f'❌ Failed to import google.generativeai.images: {e}')
+              sys.exit(1)
+          EOF
         continue-on-error: true
 
       - name: Test Gemini Images API
@@ -109,7 +113,7 @@ jobs:
           import vertexai
           from vertexai.preview.vision_models import ImageGenerationModel
 
-          project  = os.getenv("VERTEX_PROJECT")
+          project = os.getenv("VERTEX_PROJECT")
           location = os.getenv("VERTEX_LOCATION", "us-central1")
           vertexai.init(project=project, location=location)
           print(f"✅ vertexai.init OK | project={project} | location={location}")
@@ -188,8 +192,8 @@ jobs:
           ACTION_PAT_GITHUB:           ${{ secrets.ACTION_PAT_GITHUB }}
           ACTION_REPO_GITHUB:          ${{ secrets.ACTION_REPO_GITHUB }}
           ACTION_EVENT_GITHUB:         ${{ secrets.ACTION_EVENT_GITHUB }}
-          ACTION_BRANCH:               ${{ vars.ACTION_BRANCH }}
-          GH_IMAGES_DIR:               ${{ vars.GH_IMAGES_DIR }}
+          ACTION_BRANCH:               content
+          GH_IMAGES_DIR:               images_for_posts
           GH_VIDEOS_DIR:               ${{ vars.GH_VIDEOS_DIR }}
           OPENAI_API_KEY:              ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY:              ${{ secrets.GEMINI_API_KEY }}
