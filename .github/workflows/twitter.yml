@@ -64,11 +64,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install google-generativeai>=0.8.3 google-cloud-aiplatform>=1.67.1 tweepy>=4.14.0
 
       - name: Show installed packages
         run: pip freeze | sort
 
-      # 🔑 Кладём ключ и экспортим переменные
+      - name: Check google-generativeai version
+        run: pip show google-generativeai
+
+      - name: Test google.generativeai.images import
+        run: python -c "import google.generativeai.images; print('✅ Images module OK')"
+        continue-on-error: true
+
+      - name: Test Gemini Images API
+        run: |
+          python - <<'EOF'
+          import os, sys
+          import google.generativeai as genai
+          import google.generativeai.images as gen_images
+          genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+          prompt = "simple abstract gradient background, no text; wide composition"
+          try:
+              resp = gen_images.generate(model="imagen-3.0", prompt=prompt, size="1280x720")
+              print(f"✅ Gemini Images API OK | bytes={len(resp.image_bytes)}")
+          except Exception as e:
+              print(f"⚠️ Gemini Images API failed: {e}")
+              sys.exit(1)
+          EOF
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        continue-on-error: true
+
       - name: Set up Google credentials
         run: |
           printf '%s' "${GCP_KEY_JSON}" > "$HOME/gcp-key.json"
@@ -76,7 +102,6 @@ jobs:
           echo "VERTEX_PROJECT=${VERTEX_PROJECT}" >> $GITHUB_ENV
           echo "VERTEX_LOCATION=${VERTEX_LOCATION}" >> $GITHUB_ENV
 
-      # ✅ Тест доступа к Imagen — без аргумента size=, с адаптивным aspect_ratio
       - name: Test Vertex AI Imagen access
         run: |
           python - <<'EOF'
@@ -122,6 +147,54 @@ jobs:
               print(f"❌ No working Imagen models among: {tried}")
               sys.exit(1)
           EOF
+        env:
+          VERTEX_PROJECT: ${{ secrets.VERTEX_PROJECT }}
+          VERTEX_LOCATION: us-central1
+          GCP_KEY_JSON: ${{ secrets.GCP_KEY_JSON }}
+        continue-on-error: true
+
+      - name: Test Tweepy Twitter API
+        run: |
+          python - <<'EOF'
+          import tweepy
+          import os, sys
+          client = tweepy.Client(bearer_token=os.getenv("TWITTER_BEARER_TOKEN"))
+          query = "(AI OR crypto) lang:ru -is:retweet"
+          try:
+              tweets = client.search_recent_tweets(query=query, max_results=10, tweet_fields=["created_at", "lang"])
+              print(f"✅ Tweepy OK: Found {len(tweets.data)} tweets")
+              for tweet in tweets.data:
+                  print(f"→ Tweet: {tweet.text[:50]}…")
+          except Exception as e:
+              print(f"⚠️ Tweepy Error: {e}")
+              sys.exit(1)
+          EOF
+        env:
+          TWITTER_BEARER_TOKEN: ${{ secrets.TWITTER_BEARER_TOKEN }}
+        continue-on-error: true
 
       - name: Run Twitter Bot
         run: python twitter_bot.py
+        env:
+          TELEGRAM_BOT_TOKEN_APPROVAL: ${{ secrets.TELEGRAM_BOT_TOKEN_APPROVAL }}
+          TELEGRAM_APPROVAL_CHAT_ID:   ${{ secrets.TELEGRAM_APPROVAL_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN_CHANNEL:  ${{ secrets.TELEGRAM_BOT_TOKEN_CHANNEL }}
+          TELEGRAM_CHANNEL_USERNAME_ID: ${{ secrets.TELEGRAM_CHANNEL_USERNAME_ID }}
+          TWITTER_API_KEY:             ${{ secrets.TWITTER_API_KEY }}
+          TWITTER_API_SECRET:          ${{ secrets.TWITTER_API_SECRET }}
+          TWITTER_ACCESS_TOKEN:        ${{ secrets.TWITTER_ACCESS_TOKEN }}
+          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+          TWITTER_BEARER_TOKEN:        ${{ secrets.TWITTER_BEARER_TOKEN }}
+          ACTION_PAT_GITHUB:           ${{ secrets.ACTION_PAT_GITHUB }}
+          ACTION_REPO_GITHUB:          ${{ secrets.ACTION_REPO_GITHUB }}
+          ACTION_EVENT_GITHUB:         ${{ secrets.ACTION_EVENT_GITHUB }}
+          ACTION_BRANCH:               ${{ vars.ACTION_BRANCH }}
+          GH_IMAGES_DIR:               ${{ vars.GH_IMAGES_DIR }}
+          GH_VIDEOS_DIR:               ${{ vars.GH_VIDEOS_DIR }}
+          OPENAI_API_KEY:              ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY:              ${{ secrets.GEMINI_API_KEY }}
+          VERTEX_PROJECT:              ${{ secrets.VERTEX_PROJECT }}
+          VERTEX_LOCATION:             us-central1
+          GCP_KEY_JSON:                ${{ secrets.GCP_KEY_JSON }}
+          LOG_LEVEL:                   INFO
+          PYTHONUNBUFFERED:            "1"
