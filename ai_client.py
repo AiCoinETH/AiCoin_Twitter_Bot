@@ -803,12 +803,15 @@ def _draw_tokens(draw: ImageDraw.ImageDraw, w: int, h: int):
         draw.text((x, y), t, font=f, fill=fill)
 
 def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
+    log.info("IMG|Pillow|Start fallback | topic='%s' | size=%dx%d", (topic or "")[:160], size[0], size[1])
     w, h = size
     img = _neon_bg(w, h)
+    log.info("IMG|Pillow|Background generated")
     draw = ImageDraw.Draw(img)
     _draw_circuit(draw, w, h)
+    log.info("IMG|Pillow|Circuit drawn")
     _draw_tokens(draw, w, h)
-
+    log.info("IMG|Pillow|Tokens drawn")
     cx, cy = w//2, int(h*0.42)
     for r, col, wd in [
         (210, (255, 210, 60), 5),
@@ -816,23 +819,31 @@ def _cover_from_topic(topic: str, text: str, size=(1280, 960)) -> bytes:
         (120, (255, 255, 190), 2),
     ]:
         draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline=col, width=wd)
-
+    log.info("IMG|Pillow|Ellipses drawn")
     head = re.sub(r"\s+", " ", topic).strip()[:64]
     title_font = _load_font(72)
+    log.info("IMG|Pillow|Font loaded | size=72")
     tw, _ = _measure_text(draw, head, title_font)
     draw.text((cx - tw//2, cy + 220), head, font=title_font, fill=(240, 255, 255))
-
+    log.info("IMG|Pillow|Text drawn | text='%s'", head)
     img = img.filter(ImageFilter.GaussianBlur(0.6))
+    log.info("IMG|Pillow|Blur applied")
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     out = buf.getvalue()
-    log.info("IMG|fallback cover built | size=%dx%d | bytes=%d", w, h, len(out))
+    log.info("IMG|Pillow|Success | bytes=%d | sha=%s", len(out), _sha_short(out))
     return out
+
+def _log_access_info(logger, service: str, key: str, project: str = "", location: str = "") -> None:
+    logger.info(f"{service}|Access check | key_present={bool(key)} | project={project} | location={location}")
 
 def _gemini_image_bytes(topic: str) -> Optional[bytes]:
     """Пробуем получить картинку через **официальный Gemini Images API**; при неуспехе — None."""
+    log.info("IMG|Gemini|Start attempt")
+    _log_access_info(log, "Gemini", GEMINI_API_KEY, GEMINI_IMAGE_MODEL)
     if not (_genai_images_ok and GEMINI_API_KEY and GEMINI_IMAGE_MODEL):
-        log.info("IMG|gemini skip (images sdk/key/model missing)")
+        log.info("IMG|Gemini|Skip: images_sdk=%s, key=%s, model=%s", 
+                 _genai_images_ok, bool(GEMINI_API_KEY), GEMINI_IMAGE_MODEL)
         return None
     try:
         prompt = (
@@ -840,54 +851,35 @@ def _gemini_image_bytes(topic: str) -> Optional[bytes]:
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
         size = "1280x960"
-        log.info("IMG|gemini start | model=%s | size=%s | topic='%s'", GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
+        log.info("IMG|Gemini|Generating | model=%s | size=%s | topic='%s'", 
+                 GEMINI_IMAGE_MODEL, size, (topic or "")[:160])
         resp = gen_images.generate(model=GEMINI_IMAGE_MODEL, prompt=prompt, size=size)  # type: ignore
+        log.info("IMG|Gemini|Response received | type=%s", type(resp))
         if hasattr(resp, "images") and resp.images:
             img = resp.images[0]
             data = getattr(img, "bytes", None) or getattr(img, "data", None)
             if isinstance(data, (bytes, bytearray)):
-                log.info("IMG|gemini ok | bytes=%d", len(data))
+                log.info("IMG|Gemini|Success | bytes=%d | sha=%s", len(data), _sha_short(data))
                 return bytes(data)
         # Альтернативные поля на всякий случай
         for key in ("image", "bytes", "data"):
             data = getattr(resp, key, None)
             if isinstance(data, (bytes, bytearray)):
-                log.info("IMG|gemini ok (alt %s) | bytes=%d", key, len(data))
+                log.info("IMG|Gemini|Success (alt %s) | bytes=%d | sha=%s", key, len(data), _sha_short(data))
                 return bytes(data)
-        log.warning("IMG|gemini returned no image bytes")
+        log.warning("IMG|Gemini|No image bytes in response")
     except Exception as e:
-        log.warning("IMG|gemini.generate error: %s", e)
+        log.error("IMG|Gemini|Error: %s", str(e))
+        if any(x in str(e).lower() for x in ("permission", "unauth", "forbidden", "quota")):
+            log.error("IMG|Gemini|Access issue detected: %s", str(e))
     return None
-
-def _imagen_generate_adaptive(model, prompt: str, number_of_images: int, safety_filter_level: str):
-    """
-    Адаптивный вызов Imagen:
-    - Без size=
-    - Если SDK поддерживает aspect_ratio — прокинем VERTEX_IMAGEN_AR
-    """
-    try:
-        fn = getattr(model, "generate_images")
-    except Exception:
-        raise RuntimeError("vertex model does not expose generate_images")
-    try:
-        sig = inspect.signature(fn)
-        kwargs = dict(
-            prompt=prompt,
-            number_of_images=number_of_images,
-            safety_filter_level=safety_filter_level,
-        )
-        if "aspect_ratio" in sig.parameters:
-            kwargs["aspect_ratio"] = VERTEX_IMAGEN_AR
-        return fn(**kwargs)
-    except Exception:
-        # последний шанс — прямой вызов без kwargs
-        return model.generate_images(prompt=prompt, number_of_images=number_of_images, safety_filter_level=safety_filter_level)
 
 def _vertex_image_bytes(topic: str) -> Optional[bytes]:
     """Генерация через Vertex **Imagen 4** (Fast по умолчанию)."""
+    log.info("IMG|Vertex|Start attempt")
+    _log_access_info(log, "Vertex", GCP_KEY_JSON, VERTEX_PROJECT, VERTEX_LOCATION)
     if not _init_vertex_ai_once():
-        if _vertex_err:
-            log.info("IMG|vertex skip: %s", _vertex_err)
+        log.error("IMG|Vertex|Skip: initialization failed | error=%s", _vertex_err)
         return None
     try:
         model_name = os.getenv("VERTEX_IMAGEN_MODEL", VERTEX_IMAGEN_MODEL_DEFAULT)
@@ -896,42 +888,37 @@ def _vertex_image_bytes(topic: str) -> Optional[bytes]:
             "subtle AI/crypto vibe, clean composition, 3D lighting. Topic: " + (topic or "").strip()
         )
         safety = os.getenv("VERTEX_SAFETY_LEVEL", "block_few")
-
-        log.info("IMG|vertex start | model=%s | topic='%s'", model_name, (topic or "")[:160])
+        log.info("IMG|Vertex|Generating | model=%s | safety=%s | topic='%s'", 
+                 model_name, safety, (topic or "")[:160])
         model = ImageGenerationModel.from_pretrained(model_name)
-
         images = _imagen_generate_adaptive(
             model,
             prompt=prompt,
             number_of_images=1,
             safety_filter_level=safety
         )
-
+        log.info("IMG|Vertex|Response received | image_count=%d", len(images) if images else 0)
         if not images:
-            log.warning("IMG|vertex got empty response")
+            log.warning("IMG|Vertex|Empty response")
             return None
-
         first = images[0]
         data = getattr(first, "image_bytes", None) or getattr(first, "bytes", None)
         if isinstance(data, (bytes, bytearray)):
-            log.info("IMG|vertex ok | bytes=%d", len(data))
+            log.info("IMG|Vertex|Success | bytes=%d | sha=%s", len(data), _sha_short(data))
             return bytes(data)
-
         # Некоторые версии SDK возвращают PIL-объект
         pil = getattr(first, "_pil_image", None)
         if pil is not None:
-            buf = io.BytesIO(); pil.save(buf, format="PNG")
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
             out = buf.getvalue()
-            log.info("IMG|vertex ok (PIL) | bytes=%d", len(out))
+            log.info("IMG|Vertex|Success (PIL) | bytes=%d | sha=%s", len(out), _sha_short(out))
             return out
-
-        log.warning("IMG|vertex returned unknown structure: %s", type(first))
+        log.warning("IMG|Vertex|Unknown response structure: %s", type(first))
     except Exception as e:
-        msg = str(e)
-        if any(x in msg.lower() for x in ("permission", "unauth", "forbidden", "quota", "authenticate")):
-            log.warning("IMG|vertex auth/perm error: %s", msg)
-        else:
-            log.warning("IMG|vertex error: %s", msg)
+        log.error("IMG|Vertex|Error: %s", str(e))
+        if any(x in str(e).lower() for x in ("permission", "unauth", "forbidden", "quota")):
+            log.error("IMG|Vertex|Access issue detected: %s", str(e))
     return None
 
 def generate_image(topic: str, text: str) -> Dict[str, Optional[str]]:
@@ -1295,83 +1282,98 @@ def ai_generate_image(topic: str, progress: ProgressFn = None) -> Tuple[Optional
       'upload_photo:image_ready' -> убрать индикацию
     """
     try:
+        log.info("IMG|Main|Start | topic='%s'", (topic or "")[:160])
         _report(progress, "upload_photo:start_image")
-        log.info("IMG|make start | topic='%s'", (topic or "")[:160])
-
+        
         warn = None
+        log.info("IMG|Main|Checking dependencies | genai_images=%s | vertex=%s | pillow=available", 
+                 _genai_images_ok, _vertex_ok)
 
         # 1) Gemini Images (приоритет)
+        log.info("IMG|Main|Trying Gemini")
         img_bytes = _gemini_image_bytes(topic)
+        if img_bytes:
+            log.info("IMG|Main|Gemini succeeded")
+        else:
+            log.info("IMG|Main|Gemini failed or skipped")
 
         # 2) Vertex (Imagen 4) — если Gemini недоступен/вернул None
         if not img_bytes:
+            log.info("IMG|Main|Trying Vertex")
             vb = _vertex_image_bytes(topic)
             if vb:
                 img_bytes = vb
+                log.info("IMG|Main|Vertex succeeded")
+            else:
+                log.info("IMG|Main|Vertex failed or skipped")
 
         # 3) Фолбэк (Pillow)
         if not img_bytes:
-            log.info("IMG|gemini/vertex none -> fallback")
+            log.info("IMG|Main|Fallback to Pillow")
+            warn = "fallback (Pillow)"
             text_for_cover = _clamp_to_len(_clean_bracket_hints(topic), 72, 8)
             img_bytes = _cover_from_topic(topic, text_for_cover)
-            warn = "fallback (Pillow)"
+            log.info("IMG|Main|Pillow succeeded")
 
         if not img_bytes:
+            log.error("IMG|Main|All methods failed")
             _report(progress, "upload_photo:image_ready")
             return None, None, "image generation failed"
 
-        log.info("IMG|bytes ready | %d", len(img_bytes))
+        log.info("IMG|Main|Image bytes ready | bytes=%d | sha=%s", len(img_bytes), _sha_short(img_bytes))
 
-        # дедуп-запись по картинке (и теме как текстовому ключу)
+        # Дедуп-запись по картинке (и теме как текстовому ключу)
         try:
+            log.info("IMG|Main|Recording to dedup | topic='%s'", (topic or "")[:160])
             DEDUP.record(topic or "", img_bytes)
+            log.info("IMG|Main|Dedup recorded")
         except Exception as e:
-            log.warning("Dedup record (image) failed: %s", e)
+            log.warning("IMG|Main|Dedup record failed: %s", e)
 
+        # Сохранение и загрузка в GitHub
+        log.info("IMG|Main|Saving and uploading | auto_upload=%s", AUTO_UPLOAD_IMAGE_TO_GH)
         path, gh_url = _tmp_write_and_maybe_upload_media(
             img_bytes, "image", LOCAL_MEDIA_DIR, AUTO_UPLOAD_IMAGE_TO_GH
         )
+        log.info("IMG|Main|Saved | path=%s | gh_url=%s", path, gh_url)
         _log_file_info(path, log)
         if gh_url:
-            log.info("IMG|gh_url=%s", gh_url)
+            log.info("IMG|Main|GitHub upload success | url=%s", gh_url)
         else:
-            log.warning("IMG|gh_url is None (auto_upload=%s)", AUTO_UPLOAD_IMAGE_TO_GH)
+            log.warning("IMG|Main|GitHub upload skipped or failed | auto_upload=%s", AUTO_UPLOAD_IMAGE_TO_GH)
 
         _report(progress, "upload_photo:image_ready")
         return path, gh_url, warn
     except Exception as e:
-        log.warning("Image gen error: %s", e)
+        log.error("IMG|Main|Fatal error: %s", str(e))
+        if any(x in str(e).lower() for x in ("permission", "unauth", "forbidden", "quota")):
+            log.error("IMG|Main|Access issue detected: %s", str(e))
         _report(progress, "upload_photo:image_ready")
         return None, None, "image generation failed"
 
-def ai_generate_video(topic: str, seconds: int = 6, progress: ProgressFn = None) -> Tuple[Optional[str], Optional[str]]:
+def _imagen_generate_adaptive(model, prompt: str, number_of_images: int, safety_filter_level: str):
     """
-    Returns: (local_mp4_path, warn_or_none)
-    progress(msg):
-      'upload_photo:start_image' -> показать "отправляет медиа..."
-      'upload_photo:image_ready' -> убрать индикацию
+    Адаптивный вызов Imagen:
+    - Без size=
+    - Если SDK поддерживает aspect_ratio — прокинем VERTEX_IMAGEN_AR
     """
     try:
-        _report(progress, "upload_photo:start_image")
-        vid_bytes = _gemini_video_bytes(topic, seconds=seconds)
-        warn = None
-        if not vid_bytes:
-            # фолбэк: берём обложку и строим MP4 пан-зум
-            cover = _gemini_image_bytes(topic) or _vertex_image_bytes(topic) or _cover_from_topic(topic, _clamp_to_len(_clean_bracket_hints(topic), 72, 8))
-            vid_bytes = _build_panzoom_from_image(cover, seconds=seconds) if cover else None
-            warn = "fallback (pan-zoom MP4)"
-        if not vid_bytes:
-            _report(progress, "upload_photo:image_ready")
-            return None, "video generation failed"
-        path, _ = _tmp_write_and_maybe_upload_media(
-            vid_bytes, "video", LOCAL_VIDEO_DIR, AUTO_UPLOAD_VIDEO_TO_GH
+        fn = getattr(model, "generate_images")
+    except Exception:
+        raise RuntimeError("vertex model does not expose generate_images")
+    try:
+        sig = inspect.signature(fn)
+        kwargs = dict(
+            prompt=prompt,
+            number_of_images=number_of_images,
+            safety_filter_level=safety_filter_level,
         )
-        _report(progress, "upload_photo:image_ready")
-        return path, warn
-    except Exception as e:
-        log.warning("Video gen error: %s", e)
-        _report(progress, "upload_photo:image_ready")
-        return None, "video generation failed"
+        if "aspect_ratio" in sig.parameters:
+            kwargs["aspect_ratio"] = VERTEX_IMAGEN_AR
+        return fn(**kwargs)
+    except Exception:
+        # последний шанс — прямой вызов без kwargs
+        return model.generate_images(prompt=prompt, number_of_images=number_of_images, safety_filter_level=safety_filter_level)
 
 # --- alias for twitter_bot backward-compat ---
 def suggest_hashtags(text: str) -> List[str]:
